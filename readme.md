@@ -25,6 +25,11 @@ A Bilibili video / multi-part / collection downloader — DASH streams fetched s
 - **SESSDATA is asked for once** and stored in a Windows user environment variable (never in the source).
 - **Tidy output tree** — sanitized names, Windows-reserved-name handling, and MAX_PATH protection via shortening + hash suffix.
 - `--dry-run` preview, meaningful exit codes (`0` ok / `1` failure / `2` bad args / `130` interrupted).
+- **Genuinely non-interactive** — with `-y` or redirected output it never stops to ask, **even on a fresh
+  machine that has no credential** (the old code called `getpass`, which opens `/dev/tty` directly, so
+  redirecting stdin did not help and CI/batch jobs hung forever).
+- **Cross-platform** — one source tree for Windows / Linux / macOS; the credential is stored in a Windows
+  user environment variable there and in `~/.config/bilibili-downloader/sessdata` (mode 600) elsewhere.
 
 ## Requirements
 
@@ -34,17 +39,24 @@ A Bilibili video / multi-part / collection downloader — DASH streams fetched s
 | Dependencies | `pip install -r requirements.txt` (requests, tqdm) |
 | ffmpeg | must be on `PATH` — `choco install ffmpeg`, `scoop install ffmpeg`, `brew install ffmpeg`, `sudo apt install ffmpeg` |
 
-### Prebuilt exe (no Python needed)
+### Option 1: installer (Windows, recommended)
 
-Pick one from [Releases](https://github.com/zyq1223334444/bilibili-downloader/releases):
+Download **`bilibili_downloader_setup_1.0.0.exe`** from
+[Releases](https://github.com/zyq1223334444/bilibili-downloader/releases) and run it:
+
+- installs to `C:\Program Files\bilibili-downloader` with Start Menu shortcuts and a **proper uninstaller**
+  (it also shows up in Settings -> Apps)
+- optionally adds the install folder to the system `PATH` (checked by default) so `bilibili_downloader`
+  works from any terminal; the uninstaller **restores `PATH` byte-for-byte** (the original value is
+  backed up in the registry before the edit)
+- checks for ffmpeg on `PATH` when it finishes and tells you how to install it if it is missing
+
+### Option 2: no installation (Windows single file / zip)
 
 | Download | Shape | Startup (measured) | Exit code on Ctrl+C |
 |---|---|---|---|
 | `bilibili_downloader.exe` | single file (~11 MB) | ≈0.9 s (unpacks on every run) | `0xC000013A` (see below) |
 | `bilibili_downloader_standalone_win64.zip` | unzip into a folder | ≈0.3 s | **130**, same as the script |
-
-Both are produced by compiling the Python to C and linking it with Nuitka, so the Python runtime and
-`requests` / `tqdm` are bundled — **ffmpeg is still required** and must be on `PATH`.
 
 ```powershell
 .\bilibili_downloader.exe BV1xx411c7mD -q 720p --no-mp3
@@ -57,10 +69,34 @@ Both are produced by compiling the Python to C and linking it with Nuitka, so th
 > `[中断]`, keeps the `.part` resume data, leaves no stray process and cleans up its temp folder — only the
 > exit code differs. Use the standalone build if a script has to test for 130.
 
-Options, output layout and credential lookup order are identical to the script version (for the exe,
-"`sessdata.txt` next to the program" means next to the exe). To rebuild it yourself, install MSVC 14.3+,
-run `pip install nuitka`, and double-click `build_exe.bat` (single file) or
-`build_exe_standalone.bat` (folder + zip).
+### Option 3: Linux / macOS
+
+| Platform | Single file | Folder build (keeps the exec bit, recommended) |
+|---|---|---|
+| Linux x86_64 | `bilibili_downloader_linux_x86_64` | `bilibili_downloader_linux_x86_64.tar.gz` |
+| macOS Intel | `bilibili_downloader_macos_x86_64` | `bilibili_downloader_macos_x86_64.tar.gz` |
+| macOS Apple Silicon | `bilibili_downloader_macos_arm64` | `bilibili_downloader_macos_arm64.tar.gz` |
+
+```bash
+tar -xzf bilibili_downloader_linux_x86_64.tar.gz
+./bilibili_downloader_standalone/bilibili_downloader BV1xx411c7mD --single -q 720p
+```
+
+> The macOS binaries are **unsigned**, so Gatekeeper may block the first run:
+> `xattr -d com.apple.quarantine <file>`, or right-click -> Open.
+> The Linux and macOS binaries are built on **real machines** by GitHub Actions
+> (see `.github/workflows/build.yml`), because Nuitka compiles Python to C and then calls the target
+> platform's own linker — there is no cross-compiling. To build them yourself: `bash build_unix.sh`
+> (needs gcc / patchelf on Linux).
+
+All three shapes are produced by compiling the Python to C and linking it with Nuitka, so the Python
+runtime and `requests` / `tqdm` are bundled — **ffmpeg is still required** and must be on `PATH`
+(`choco install ffmpeg` / `brew install ffmpeg` / `sudo apt install ffmpeg`).
+
+Options, output layout and credential lookup order are identical to the script version (for the binaries,
+"`sessdata.txt` next to the program" means next to the executable). To rebuild: `build_exe.bat`
+(single file) or `build_exe_standalone.bat` (folder + zip) on Windows, then `build_installer.bat` for the
+installer (needs Inno Setup 6.5+).
 
 ## Quick start
 

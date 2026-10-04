@@ -1,15 +1,18 @@
-# ---- 编译产物（由 build_exe.bat / build_exe_standalone.bat 生成，可用脚本重建）----
+# ---- 编译产物（由 build_exe*.bat / build_unix.sh / build_installer.bat 生成，都可用脚本重建）----
 bilibili_downloader.exe
 bilibili_downloader_standalone_win64.zip
 build/
 build_standalone/
 dist/
+dist_installer/
+dist_unix/
 *.build/
 *.dist/
 *.onefile-build/
 bilibili_downloader.build/
 bilibili_downloader.dist/
 bilibili_downloader.onefile-build/
+bilibili_downloader_standalone_win64/
 
 # ---- 凭证：绝对不要提交 ----
 sessdata.txt

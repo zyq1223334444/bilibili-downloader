@@ -21,6 +21,10 @@ B 站视频 / 分P / 合集下载器 —— DASH 音视频分流下载，再用 
 - **SESSDATA 只问一次**：存进 Windows 用户环境变量，源码里永远不留凭证。
 - **目录自动整理**：文件名清洗、Windows 保留名避让、超长路径自动缩短（补短哈希防重名）。
 - `--dry-run` 先看计划；退出码规范（`0` 成功 / `1` 有失败 / `2` 参数错误 / `130` 中断）。
+- **真正可非交互**：加 `-y` 或把输出重定向后，**即使在一台没有凭证的新机器上也不会停下提问**
+  （旧版这里会用 `getpass` 直接打开 `/dev/tty`，把 stdin 重定向也拦不住，CI/批处理会永久挂住）。
+- **跨平台**：Windows / Linux / macOS 同一份源码；凭证在 Windows 存用户环境变量，其他平台存
+  `~/.config/bilibili-downloader/sessdata`（权限 600）。
 
 ## 环境要求
 
@@ -30,17 +34,22 @@ B 站视频 / 分P / 合集下载器 —— DASH 音视频分流下载，再用 
 | 依赖库 | `pip install -r requirements.txt`（requests、tqdm） |
 | ffmpeg | 必须在 `PATH` 中：`choco install ffmpeg` / `scoop install ffmpeg` / `brew install ffmpeg` / `sudo apt install ffmpeg` |
 
-### 直接用编译好的 exe（免装 Python）
+### 方式一：安装包（Windows，推荐）
 
-到 [Releases](https://github.com/zyq1223334444/bilibili-downloader/releases) 挑一个：
+到 [Releases](https://github.com/zyq1223334444/bilibili-downloader/releases) 下载
+**`bilibili_downloader_setup_1.0.0.exe`** 双击安装：
+
+- 装到 `C:\Program Files\bilibili-downloader`，带开始菜单快捷方式、**卸载程序**（"设置 → 应用"里也能卸载）
+- 可选把安装目录加入系统 `PATH`（默认勾选），之后任意终端直接敲 `bilibili_downloader`；
+  卸载时会把 `PATH` **逐字节还原**（安装前会先把原值备份进注册表）
+- 安装结束会检查 `PATH` 里有没有 ffmpeg，没有就提示安装命令
+
+### 方式二：免安装（Windows 单文件 / 压缩包）
 
 | 下载 | 形态 | 实测启动 | Ctrl+C 退出码 |
 |---|---|---|---|
 | `bilibili_downloader.exe` | 单文件（约 11 MB） | ≈0.9 s（每次要自解压） | `0xC000013A`（见下方说明） |
-| `bilibili_downloader_standalone_win64.zip` | 解压成一个文件夹 | ≈0.3 s | **130**，与源码版一致 |
-
-两者都由 Nuitka 把 Python **编译成 C 再链接**而成，已内置 Python 运行时与 `requests` / `tqdm`，
-**唯一还需要的外部程序是 ffmpeg**（必须在 `PATH` 中）。
+| `bilibili_downloader_standalone_win64.zip` | 解压出一个文件夹 | ≈0.3 s | **130**，与源码版一致 |
 
 ```powershell
 .\bilibili_downloader.exe BV1xx411c7mD -q 720p --no-mp3
@@ -52,9 +61,32 @@ B 站视频 / 分P / 合集下载器 —— DASH 音视频分流下载，再用 
 > 程序本身依然正常收尾：打印 `[中断]`、保留 `.part` 断点、不留残余进程、临时目录清理干净——**只有退出码不同**。
 > 脚本里要判断 130 的话请用 standalone 版，或把 `0xC000013A` 一并当作"已中断"。
 
-参数、保存结构、凭证读取顺序都与源码版一致（其中"程序目录下的 `sessdata.txt`"对 exe 而言就是 **exe 旁边**那个文件）。
-想自己重新编译：装好 MSVC 14.3+ 与 `pip install nuitka`，然后双击 `build_exe.bat`（单文件）
-或 `build_exe_standalone.bat`（文件夹，并自动打包成 zip）。
+### 方式三：Linux / macOS
+
+| 平台 | 单文件 | 文件夹版（含可执行权限，推荐） |
+|---|---|---|
+| Linux x86_64 | `bilibili_downloader_linux_x86_64` | `bilibili_downloader_linux_x86_64.tar.gz` |
+| macOS Intel | `bilibili_downloader_macos_x86_64` | `bilibili_downloader_macos_x86_64.tar.gz` |
+| macOS Apple Silicon | `bilibili_downloader_macos_arm64` | `bilibili_downloader_macos_arm64.tar.gz` |
+
+```bash
+tar -xzf bilibili_downloader_linux_x86_64.tar.gz
+./bilibili_downloader_standalone/bilibili_downloader BV1xx411c7mD --single -q 720p
+```
+
+> macOS 上是**未签名**的二进制，首次运行可能被 Gatekeeper 拦下：
+> `xattr -d com.apple.quarantine <文件>`，或右键 → 打开。
+> Linux / macOS 的二进制由 GitHub Actions 在**真机**上构建（见 `.github/workflows/build.yml`），
+> 因为 Nuitka 把 Python 编译成 C 后要调用目标平台自己的链接器，**不支持交叉编译**。
+> 想自己构建：Linux `bash build_unix.sh`（需要 gcc / patchelf），macOS 同样。
+
+三种形态都由 Nuitka 把 Python **编译成 C 再链接**而成，已内置 Python 运行时与 `requests` / `tqdm`，
+**唯一还需要的外部程序是 ffmpeg**（必须在 `PATH` 中：`choco install ffmpeg` / `brew install ffmpeg` /
+`sudo apt install ffmpeg`）。
+
+参数、保存结构、凭证读取顺序都与源码版一致（其中"程序目录下的 `sessdata.txt`"对二进制而言就是**它旁边**那个文件）。
+想自己重新编译：Windows 用 `build_exe.bat`（单文件）或 `build_exe_standalone.bat`（文件夹 + zip），
+再 `build_installer.bat` 打安装包（需要 Inno Setup 6.5+）。
 
 ## 快速开始
 

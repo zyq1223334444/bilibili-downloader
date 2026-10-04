@@ -525,7 +525,12 @@ def prompt_sessdata(session: requests.Session, timeout: float, *,
     try:
         value = getpass.getpass(label).strip()
     except Exception:
-        value = input(label).strip()
+        # getpass 在非终端上可能直接抛异常（它优先打开 /dev/tty）；退回普通 input
+        try:
+            value = input(label).strip()
+        except EOFError:
+            print("\n（当前没有可用的输入来源，改用游客模式）")
+            return ""
 
     if not value:
         print("已跳过，使用游客模式。\n")
@@ -584,7 +589,15 @@ def ensure_credential(session: requests.Session,
             print("[凭证] 网络不可用，跳过校验")
 
     if not sessdata:
-        sessdata = prompt_sessdata(session, args.timeout)
+        # 非交互场景（-y、输出被重定向、CI/批处理）绝不能在这里提问：
+        # getpass 会直接打开 /dev/tty，重定向 stdin 也拦不住，进程会永久挂住。
+        if _is_interactive(args):
+            sessdata = prompt_sessdata(session, args.timeout)
+        else:
+            print("[提示] 未检测到 SESSDATA；当前是非交互模式（-y 或输出被重定向），"
+                  "不提问，直接以游客身份下载（通常最高 480P/720P，也没有无损音频）。")
+            print("    想要更高画质：先设好凭证（环境变量 BILI_SESSDATA，"
+                  "或程序目录下的 sessdata.txt）再重跑。")
 
     headers = build_headers(sessdata)
     if not sessdata:
@@ -1486,6 +1499,11 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
 
     inputs = [x for x in (args.inputs or []) if x.strip()]
     if not inputs:
+        if not _is_interactive(args):
+            print("[失败] 没有给出要下载的链接/BV 号，且当前是非交互模式（-y 或输出被重定向）。")
+            print("    用法：bilibili_downloader <链接或BV号> [选项]，"
+                  "例如 bilibili_downloader BV1xx411c7mD --single")
+            return 2
         try:
             raw = input("请输入 B 站视频链接 / BV 号（多个用空格分隔）：")
         except EOFError:
