@@ -52,14 +52,22 @@ if errorlevel 1 goto build_failed
 
 if not exist "%DIST%\bilibili_downloader.exe" goto no_dist
 
+rem Stage a properly named top-level folder, otherwise unzipping would scatter
+rem 26 loose files (exe + DLLs + pyd) straight into the user's current folder.
+set "STAGE=%OUTDIR%\bilibili_downloader_standalone_win64"
+if exist "%STAGE%" rmdir /s /q "%STAGE%"
+mkdir "%STAGE%"
+xcopy /e /i /y /q "%DIST%\*" "%STAGE%\" >nul
+if errorlevel 1 goto stage_failed
+
 if exist "%ZIP%" del /f /q "%ZIP%"
-echo [*] Zipping "%DIST%" ...
-powershell -NoProfile -Command "Compress-Archive -Path '%DIST%\*' -DestinationPath '%ZIP%' -CompressionLevel Optimal -Force"
+echo [*] Zipping "%STAGE%" ...
+powershell -NoProfile -Command "Compress-Archive -Path '%STAGE%' -DestinationPath '%ZIP%' -CompressionLevel Optimal -Force"
 if errorlevel 1 goto zip_failed
 
 echo.
-echo [OK] standalone exe : "%DIST%\bilibili_downloader.exe"
-echo [OK] zip for release: "%ZIP%"
+echo [OK] standalone exe : "%STAGE%\bilibili_downloader.exe"
+echo [OK] zip for release: "%ZIP%"  (contains the folder "%STAGE%" as its root)
 exit /b 0
 
 :no_python
@@ -85,6 +93,10 @@ exit /b 1
 
 :no_dist
 echo [ERR] Build reported success but "%DIST%\bilibili_downloader.exe" is missing.
+exit /b 1
+
+:stage_failed
+echo [ERR] Could not copy the dist folder into "%STAGE%".
 exit /b 1
 
 :zip_failed
