@@ -1,0 +1,39 @@
+# ---- 编译产物（由 build_exe.bat / build_exe_standalone.bat 生成，可用脚本重建）----
+bilibili_downloader.exe
+bilibili_downloader_standalone_win64.zip
+build/
+build_standalone/
+dist/
+*.build/
+*.dist/
+*.onefile-build/
+bilibili_downloader.build/
+bilibili_downloader.dist/
+bilibili_downloader.onefile-build/
+
+# ---- 凭证：绝对不要提交 ----
+sessdata.txt
+sessdata
+.env
+
+# ---- 下载产物与断点临时文件 ----
+bili_downloads/
+*.part
+*.m4s
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- 编辑器 / 系统 ----
+.vs/
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
