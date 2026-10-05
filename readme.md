@@ -2,7 +2,7 @@
 
 # bilibili-downloader
 
-A Bilibili video / multi-part / collection downloader — DASH streams fetched separately, then merged with ffmpeg.
+A Bilibili video / multi-part / collection downloader — DASH streams are fetched separately, then merged with ffmpeg.
 
 ---
 
@@ -86,17 +86,15 @@ tar -xzf bilibili_downloader_linux_x86_64.tar.gz
 > `xattr -d com.apple.quarantine <file>`, or right-click -> Open.
 > The Linux and macOS binaries are built on **real machines** by GitHub Actions
 > (see `.github/workflows/build.yml`), because Nuitka compiles Python to C and then calls the target
-> platform's own linker — there is no cross-compiling. To build them yourself: `bash build_unix.sh`
+> platform's own linker — there is no cross-compiling. To build them yourself: `bash build/build_unix.sh`
 > (needs gcc / patchelf on Linux).
 
 All three shapes are produced by compiling the Python to C and linking it with Nuitka, so the Python
 runtime and `requests` / `tqdm` are bundled — **ffmpeg is still required** and must be on `PATH`
 (`choco install ffmpeg` / `brew install ffmpeg` / `sudo apt install ffmpeg`).
 
-Options, output layout and credential lookup order are identical to the script version (for the binaries,
-"`sessdata.txt` next to the program" means next to the executable). To rebuild: `build_exe.bat`
-(single file) or `build_exe_standalone.bat` (folder + zip) on Windows, then `build_installer.bat` for the
-installer (needs Inno Setup 6.5+).
+Options, output layout and credential lookup order are identical to the script version; for the binaries,
+"`sessdata.txt` next to the program" means next to the executable.
 
 ## Quick start
 
@@ -271,6 +269,66 @@ Network errors are collapsed into one readable line instead of the raw nested-ex
 | `code=62002/62004` | Video invisible / under review |
 | `《…》是付费合集` | Paid collections cannot be downloaded |
 | Download looks stalled | Nodes can be slow; probing, retries and backoff are handling it — check the per-node lines |
+
+## Repository layout
+
+The repository holds the program and the means to build it. Everything a build *produces* lives in one
+ignored folder, so a checkout stays clean:
+
+```
+bilibili_downloader.py      the whole program (single file)
+requirements.txt            runtime dependencies (requests, tqdm)
+readme.md / readme.zh.md    these documents
+LICENSE
+.github/workflows/build.yml CI: Linux + both macOS architectures
+build/                      build tooling - part of the repository
+├── build_exe.bat             Windows single-file exe
+├── build_exe_standalone.bat  Windows folder build + zip
+├── build_installer.bat       Windows installer (calls installer.iss)
+├── build_unix.sh             Linux / macOS binaries
+├── installer.iss             Inno Setup script
+├── ChineseSimplified.isl     Simplified Chinese texts for the installer
+└── out/                      ignored: every artefact and Nuitka intermediate
+```
+
+`build/out/` is the only thing `.gitignore` excludes here. The scripts themselves are tracked, so anyone
+can rebuild the binaries from a checkout.
+
+## Building from source (Nuitka)
+
+| What you want | Where to build it | Command |
+|---|---|---|
+| Windows single-file exe | Windows | `build\build_exe.bat` → `build\out\bilibili_downloader.exe` |
+| Windows folder build | Windows | `build\build_exe_standalone.bat` → folder + zip in `build\out\` |
+| Windows installer | Windows | `build\build_installer.bat` (needs Inno Setup 6.5+) |
+| Linux / macOS binaries | **the target platform** (WSL / Mac / CI) | `bash build/build_unix.sh` → `build/out/dist_unix/` |
+
+The scripts resolve the repository root themselves, so they can be started from any working directory.
+They only ever write inside `build/out/`.
+
+Requirements: `pip install -r requirements.txt nuitka zstandard`, plus **MSVC 14.3+** on Windows
+(Visual Studio 2022 Build Tools or newer) — Nuitka **cannot use MinGW with Python 3.13+**.
+The three flags worth knowing about, all measured rather than guessed (the scripts carry the full story):
+
+- `VSLANG=1033` — Nuitka's Scons backend decodes `cl.exe` output with the `mbcs` code page, so a
+  localized (Chinese) Visual Studio aborts the build with `UnicodeDecodeError`.
+- `--include-package-data=certifi` — `requests` verifies TLS against certifi's `cacert.pem`, which is a
+  data file. Without it the exe starts fine but every HTTPS call dies with
+  *"Could not find a suitable TLS CA certificate bundle"*.
+- `--windows-console-mode=force` — this is a console tool; without the flag the exe would be a
+  GUI-subsystem binary with no usable stdout.
+
+The installer is compiled with **Inno Setup 6.5+**: `winget install --id JRSoftware.InnoSetup -e`.
+Its `[Code]` section backs the original system `PATH` up in the registry before editing it and restores
+it byte-for-byte on uninstall, and it warns you at the end of the installation when ffmpeg is missing
+from `PATH`.
+
+**ffmpeg is never bundled** — it is a ~100 MB external program, found at runtime through
+`shutil.which("ffmpeg")`, so it has to be installed separately on every platform.
+
+> **Why Linux/macOS cannot be built on Windows**: Nuitka compiles Python to C and then calls the
+> **target platform's own** compiler and linker — there is no cross-compiling. GitHub Actions builds
+> Linux and both macOS architectures on real machines; see `.github/workflows/build.yml`.
 
 ## Implementation notes
 

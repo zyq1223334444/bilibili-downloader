@@ -8,7 +8,7 @@ B 站视频 / 分P / 合集下载器 —— DASH 音视频分流下载，再用 
 
 ## 功能特性
 
-- **单视频 / 多P（分P）/ 合集（合集=UP 主创建的系列）一次下全** —— 给一个链接就够，自动展开。
+- **单视频 / 多P（分P）/ 合集一次下全** —— 给一个链接就够，自动展开。
 - **默认取最高可用画质**（8K / 4K / HDR / 杜比视界，以账号权限为准），可用 `-q` 限制上限。
 - **音频优先无损**：`dash.flac`（Hi-Res）→ 杜比全景声 → 最高码率，再导出 MP3。
 - **同时产出 MP4 与 MP3**：MP4 用 `-c copy -movflags +faststart` 合并（不重新编码、秒级完成、可在线拖进度）。
@@ -78,15 +78,13 @@ tar -xzf bilibili_downloader_linux_x86_64.tar.gz
 > `xattr -d com.apple.quarantine <文件>`，或右键 → 打开。
 > Linux / macOS 的二进制由 GitHub Actions 在**真机**上构建（见 `.github/workflows/build.yml`），
 > 因为 Nuitka 把 Python 编译成 C 后要调用目标平台自己的链接器，**不支持交叉编译**。
-> 想自己构建：Linux `bash build_unix.sh`（需要 gcc / patchelf），macOS 同样。
+> 想自己构建：`bash build/build_unix.sh`（Linux 需要 gcc / patchelf）。
 
 三种形态都由 Nuitka 把 Python **编译成 C 再链接**而成，已内置 Python 运行时与 `requests` / `tqdm`，
 **唯一还需要的外部程序是 ffmpeg**（必须在 `PATH` 中：`choco install ffmpeg` / `brew install ffmpeg` /
 `sudo apt install ffmpeg`）。
 
 参数、保存结构、凭证读取顺序都与源码版一致（其中"程序目录下的 `sessdata.txt`"对二进制而言就是**它旁边**那个文件）。
-想自己重新编译：Windows 用 `build_exe.bat`（单文件）或 `build_exe_standalone.bat`（文件夹 + zip），
-再 `build_installer.bat` 打安装包（需要 Inno Setup 6.5+）。
 
 ## 快速开始
 
@@ -257,6 +255,63 @@ Remove-ItemProperty -Path 'HKCU:\Environment' -Name 'BILI_SESSDATA'   # 删除
 | `code=62002 / 62004` | 稿件不可见 / 审核中 |
 | `《…》是付费合集` | 付费合集无法下载 |
 | 进度长时间不动 | 换节点中；脚本正在重试+退避，看那一行"节点 x/y 第 n 次失败"即可 |
+
+## 仓库结构
+
+仓库里放的是**程序本身**和**构建它的手段**；构建**产出**的东西全部集中在一个被忽略的目录里，
+所以 clone 下来永远是干净的：
+
+```
+bilibili_downloader.py      整个程序（单文件）
+requirements.txt            运行时依赖（requests、tqdm）
+readme.md / readme.zh.md    本文档
+LICENSE
+.github/workflows/build.yml CI：Linux + 两个 macOS 架构
+build/                      构建工具（属于仓库内容）
+├── build_exe.bat             Windows 单文件 exe
+├── build_exe_standalone.bat  Windows 文件夹版 + zip
+├── build_installer.bat       Windows 安装包（调用 installer.iss）
+├── build_unix.sh             Linux / macOS 二进制
+├── installer.iss             Inno Setup 脚本
+├── ChineseSimplified.isl     安装包的中文文案
+└── out/                      被忽略：全部产物与 Nuitka 中间目录
+```
+
+本仓库的 `.gitignore` 在这里只排除 `build/out/` 一项。脚本本身是提交进仓库的，
+所以任何人 clone 之后都能自己重新编译出这些二进制。
+
+## 从源码构建（Nuitka）
+
+| 想要什么 | 在哪构建 | 命令 |
+|---|---|---|
+| Windows 单文件 exe | Windows | `build\build_exe.bat` → `build\out\bilibili_downloader.exe` |
+| Windows 文件夹版 | Windows | `build\build_exe_standalone.bat` → 文件夹 + zip，都在 `build\out\` |
+| Windows 安装包 | Windows | `build\build_installer.bat`（需要 Inno Setup 6.5+） |
+| Linux / macOS 二进制 | **对应平台**（WSL / Mac / CI） | `bash build/build_unix.sh` → `build/out/dist_unix/` |
+
+脚本会自己算出仓库根目录，因此在任何工作目录下都能直接运行，且只往 `build/out/` 里写东西。
+
+环境要求：`pip install -r requirements.txt nuitka zstandard`，Windows 上还需要 **MSVC 14.3+**
+（Visual Studio 2022 Build Tools 或更新版本）——Nuitka 在 Python 3.13 及以上**不能用 MinGW**。
+三个值得知道的参数（都是实测踩出来的，完整说明在脚本注释里）：
+
+- `VSLANG=1033` —— Nuitka 的 Scons 后端用 `mbcs` 代码页解码 `cl.exe` 输出，中文版 Visual Studio
+  会让构建抛 `UnicodeDecodeError`，强制英文消息即可绕过。
+- `--include-package-data=certifi` —— `requests` 用 certifi 的 `cacert.pem` 校验 TLS，那是数据文件而非代码。
+  没有它 exe 能启动，但每次 HTTPS 请求都会报
+  *"Could not find a suitable TLS CA certificate bundle"*。
+- `--windows-console-mode=force` —— 这是个控制台工具，不加这个参数会变成没有 stdout 的 GUI 子系统程序。
+
+安装包用 **Inno Setup 6.5+** 编译：`winget install --id JRSoftware.InnoSetup -e`。
+它在 `[Code]` 里先把系统 `PATH` 原值备份进注册表再修改，卸载时逐字节还原；
+安装结束时若 `PATH` 里没有 ffmpeg 会给出提示。
+
+**ffmpeg 从不打包进去** —— 它是约 100 MB 的外部程序，运行时通过 `shutil.which("ffmpeg")` 查找，
+所以每个平台都得单独安装。
+
+> **为什么 Linux/macOS 不能在 Windows 上编**：Nuitka 把 Python 编译成 C，然后调用**目标平台自己的**
+> 编译器/链接器，没有交叉编译。本仓库用 GitHub Actions 在真机上构建 Linux 与两个 macOS 架构，
+> 见 `.github/workflows/build.yml`。
 
 ## 实现要点（给想读代码的人）
 
