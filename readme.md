@@ -83,7 +83,7 @@ Download the latest `bilibili_downloader_setup_<version>.exe` from
 
 | Download | Form | Ctrl+C exit code |
 |---|---|---|
-| `bilibili_downloader.exe` | single file (~13 MB, self-extracting at start) | `0xC000013A` (see below) |
+| `bilibili_downloader.exe` | single file (~14 MB, self-extracting at start) | `0xC000013A` (see below) |
 | `bilibili_downloader_standalone_win64.zip` | extracts to a folder (starts faster) | **130**, same as the source build |
 
 ```powershell
@@ -116,10 +116,13 @@ tar -xzf bilibili_downloader_linux_x86_64.tar.gz
 > Linux / macOS binaries are built on **real machines** by GitHub Actions (`.github/workflows/build.yml`),
 > because Nuitka compiles Python to C and calls the target platform's own linker — there is no cross-compiling.
 > To build yourself: `bash build/build_unix.sh` (Linux needs gcc / patchelf).
-> Neither platform has the GUI; they are command-line only.
+> The Linux / macOS packages from CI are **command-line only**: the runners have no Tk, and `build_unix.sh`
+> silently skips the GUI plugin when `import tkinter` fails so the pipeline does not break. Build it yourself
+> on a machine with `python3-tk` and the GUI is included (it uses only portable tkinter widgets).
 
 All binaries are Nuitka builds (Python compiled to C and linked), bundling the Python runtime plus
-`requests` / `tqdm` / tkinter. **The only external program still needed is ffmpeg**: on Windows the binary looks
+`requests` / `tqdm` (the Windows build also carries tkinter; whether a Linux / macOS build has the GUI depends on
+whether tcl/tk was present when it was built). **The only external program still needed is ffmpeg**: on Windows the binary looks
 in `PATH` first and offers to install to `~\ffmpeg` if missing (`--install-ffmpeg` skips the question);
 on Linux / macOS install it with your package manager (`brew install ffmpeg` / `sudo apt install ffmpeg`).
 

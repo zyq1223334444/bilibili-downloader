@@ -70,7 +70,7 @@ B 站视频 / 分P / 合集下载器：把 DASH 的音、视频分流分别下�
 
 | 下载 | 形态 | Ctrl+C 退出码 |
 |---|---|---|
-| `bilibili_downloader.exe` | 单文件（约 13 MB，运行时自解压） | `0xC000013A`（见下方说明） |
+| `bilibili_downloader.exe` | 单文件（约 14 MB，运行时自解压） | `0xC000013A`（见下方说明） |
 | `bilibili_downloader_standalone_win64.zip` | 解压出一个文件夹（启动更快） | **130**，与源码版一致 |
 
 ```powershell
@@ -101,9 +101,12 @@ tar -xzf bilibili_downloader_linux_x86_64.tar.gz
 > Linux / macOS 的二进制由 GitHub Actions 在**真机**上构建（见 `.github/workflows/build.yml`），
 > 因为 Nuitka 把 Python 编译成 C 后要调用目标平台自己的链接器，**不支持交叉编译**。
 > 想自己构建：`bash build/build_unix.sh`（Linux 需要 gcc / patchelf）。
-> 这两个平台没有图形界面，只有命令行。
+> 从 CI 下来的 Linux / macOS 包是**纯命令行**的：构建机没装 Tk，`build_unix.sh` 在 `import tkinter`
+> 失败时会静默跳过图形插件，免得整条流水线挂掉。想在这些平台上用图形界面，自己在装了 `python3-tk`
+> 的机器上构建即可（界面只用了跨平台的 tkinter 控件）。
 
-三种二进制都由 Nuitka 把 Python **编译成 C 再链接**而成，已内置 Python 运行时与 `requests` / `tqdm` / tkinter，
+三种二进制都由 Nuitka 把 Python **编译成 C 再链接**而成，已内置 Python 运行时与 `requests` / `tqdm`
+（Windows 构建还带 tkinter，Linux / macOS 构建是否有界面取决于构建机有没有 tcl/tk），
 **唯一还需要的外部程序是 ffmpeg**。Windows 上会先找 `PATH`，找不到就问你要不要自动装到 `~\ffmpeg`
 （也可以直接 `--install-ffmpeg`）；Linux / macOS 用包管理器装：`brew install ffmpeg` / `sudo apt install ffmpeg`。
 
