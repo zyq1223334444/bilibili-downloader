@@ -25,12 +25,13 @@
 ;
 ;  ffmpeg is NOT bundled inside the setup (the archive is ~110-200 MB and
 ;  changes with every upstream release). Instead the [Code] section:
-;    1. checks PATH *and* %USERPROFILE%\ffmpeg\bin after installing;
+;    1. checks PATH *and* %USERPROFILE%\ffmpeg\bin before installing;
 ;    2. when it is missing, asks whether to download it, showing the size
 ;       that ffmpeg_setup.ps1 just read from the live URL (not a guess);
-;    3. on "yes", downloads the official build into %USERPROFILE%\ffmpeg,
-;       adds that bin folder to the machine PATH and remembers the entry
-;       so the uninstaller can remove exactly what was added.
+;    3. on "yes", downloads it through a TDownloadWizardPage - a real
+;       progress page with speed and a stop button - then unpacks it into
+;       %USERPROFILE%\ffmpeg, adds that bin folder to the machine PATH and
+;       remembers the entry so the uninstaller removes exactly what it added.
 ;  Declining is allowed - the app then runs in a degraded mode (it can still
 ;  download raw streams, but cannot merge/export MP3/embed danmaku).
 ;
@@ -85,7 +86,9 @@ chinesesimplified.ModifyPath=把安装目录加入系统 PATH（可在任意终�
 chinesesimplified.PathGroup=环境变量：
 chinesesimplified.HelpShortcut=命令行帮助
 chinesesimplified.FfmpegMissingAsk=没有检测到 ffmpeg。%n%n缺少 ffmpeg 会导致无法使用完整功能：不能合并音视频、导出 MP3，也不能把弹幕放进视频。%n%n是否现在下载并安装到：%n%1%n%n下载大小：%2
-chinesesimplified.FfmpegDownloading=正在下载 ffmpeg（大小：%1）…%n%n安装期间窗口可能没有响应，请不要关闭，下载完成后会自动继续。
+chinesesimplified.FfmpegPageTitle=正在下载 ffmpeg
+chinesesimplified.FfmpegPageDesc=缺少 ffmpeg，正在从官方源下载。下载完成后会自动解压并加入 PATH，可随时点“停止下载”。
+chinesesimplified.FfmpegFailDetail=ffmpeg 下载或安装失败：%1%n%n也可以稍后运行 bilibili_downloader --install-ffmpeg 重试。
 chinesesimplified.FfmpegDone=ffmpeg 已安装到：%n%1%n%n该目录已加入系统 PATH，新开的命令行窗口里可以直接使用 ffmpeg。
 chinesesimplified.FfmpegFailed=ffmpeg 自动安装失败（可能是网络不通）。%n%n可以稍后运行 bilibili_downloader --install-ffmpeg 重试，%n或用 winget install Gyan.FFmpeg / choco install ffmpeg 手动安装。
 chinesesimplified.FfmpegSkip=已跳过 ffmpeg 安装。%n%n注意：没有 ffmpeg 时只能下载分离的音视频流，无法生成 MP4/MP3、也无法嵌入弹幕。%n稍后可以运行 bilibili_downloader --install-ffmpeg 补装。
@@ -95,7 +98,9 @@ english.ModifyPath=Add the install folder to the system PATH (run bilibili_downl
 english.PathGroup=Environment:
 english.HelpShortcut=Command-line help
 english.FfmpegMissingAsk=ffmpeg was not found.%n%nWithout it the app cannot merge audio/video, export MP3 or embed danmaku.%n%nDownload and install it to:%n%1%n%nDownload size: %2
-english.FfmpegDownloading=Downloading ffmpeg (%1) …%n%nSetup may appear frozen while it works. Please do not close the window.
+english.FfmpegPageTitle=Downloading ffmpeg
+english.FfmpegPageDesc=ffmpeg is missing, so it is being downloaded from the official source. It will be unpacked and added to PATH automatically; you can stop the download at any time.
+english.FfmpegFailDetail=ffmpeg download or installation failed: %1%n%nYou can also run bilibili_downloader --install-ffmpeg later.
 english.FfmpegDone=ffmpeg installed to:%n%1%n%nThat folder was added to the system PATH; a new terminal can run ffmpeg directly.
 english.FfmpegFailed=Automatic ffmpeg installation failed (probably no network).%n%nRun bilibili_downloader --install-ffmpeg later, or install manually with winget install Gyan.FFmpeg / choco install ffmpeg.
 english.FfmpegSkip=ffmpeg installation skipped.%n%nWithout ffmpeg only separate audio/video streams can be downloaded - no MP4/MP3 and no danmaku.%nYou can run bilibili_downloader --install-ffmpeg later.
@@ -111,7 +116,7 @@ Source: "..\readme.zh.md"; DestDir: "{app}"; DestName: "readme.zh.md"; Flags: ig
 Source: "..\CHANGELOG.md"; DestDir: "{app}"; DestName: "CHANGELOG.md"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE"; Flags: ignoreversion
 ; 只在安装期间用一次，装完删掉，不留在用户的临时目录里
-Source: "ffmpeg_setup.ps1"; DestDir: "{tmp}"; Flags: deleteafterinstall
+Source: "ffmpeg_setup.ps1"; Flags: dontcopy
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#ExeName}"
@@ -127,6 +132,18 @@ const
   EnvironmentKey = 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment';
   BackupKey      = 'SOFTWARE\{#AppShortName}';
   BackupValue    = 'OriginalPath';
+
+var
+  DownloadPage: TDownloadWizardPage;
+
+{ 下载页用 Inno 6.2+ 自带的 TDownloadWizardPage：它有原生进度条、速度和
+  停止按钮，比之前"后台脚本静默下载 + 一个假进度提示框"可靠得多。 }
+procedure InitializeWizard;
+begin
+  DownloadPage := CreateDownloadPage(ExpandConstant('{cm:FfmpegPageTitle}'),
+                                     ExpandConstant('{cm:FfmpegPageDesc}'), nil);
+  DownloadPage.ShowBaseNameInsteadOfUrl := True;
+end;
 
 { 把安装目录加进系统 PATH。加之前先把原始值备份进注册表：
   用户的 PATH 可能以 ';' 结尾、也可能含空项（;;），这些退化写法下
@@ -265,7 +282,22 @@ begin
   DeleteFile(SizeFile);
 end;
 
-function InstallFfmpeg(): Boolean;
+{ 解析当前版本的下载地址（版本号在文件名里，不能写死） }
+function ResolveFfmpegUrl(): string;
+var
+  UrlFile: string;
+begin
+  Result := '';
+  UrlFile := ExpandConstant('{tmp}\ffmpeg_url.txt');
+  DeleteFile(UrlFile);
+  if RunSetupScript('-Mode Url -OutFile "' + UrlFile + '"') <> 0 then
+    exit;
+  Result := ReadFirstLine(UrlFile);
+  DeleteFile(UrlFile);
+end;
+
+{ 只解压已经下载好的 zip，不再联网 —— 联网那一步交给下载页，用户能看到进度 }
+function ExtractFfmpeg(const ZipFile: string): Boolean;
 var
   Code: Integer;
   StatusFile, Dest: string;
@@ -274,24 +306,21 @@ begin
   Dest := ExpandConstant('{userprofile}\ffmpeg');
   StatusFile := ExpandConstant('{tmp}\ffmpeg_install.txt');
   DeleteFile(StatusFile);
-  Code := RunSetupScript('-Mode Install -Dest "' + Dest + '" -OutFile "' + StatusFile + '"');
+  Code := RunSetupScript('-Mode Extract -Zip "' + ZipFile + '" -Dest "' + Dest + '" -OutFile "' + StatusFile + '"');
   if Code = 0 then
     Result := FileExists(Dest + '\bin\ffmpeg.exe');
   DeleteFile(StatusFile);
 end;
 
-procedure CurStepChanged(CurStep: TSetupStep);
+{ 在"准备安装"页之前处理 ffmpeg：
+  · 检测到就直接走；
+  · 没检测到先弹窗告知缺失后果、真实大小，问是否安装；
+  · 同意后展示下载页（进度条 + 速度 + 停止），下完解压到 ~\ffmpeg，再写 PATH。 }
+procedure TryInstallFfmpeg();
 var
   Size: Int64;
-  SizeText, BinPath, DefaultDir: string;
+  SizeText, Url, Zip, BinPath: string;
 begin
-  if CurStep <> ssPostInstall then
-    exit;
-
-  { 先把自己加到 PATH，再处理 ffmpeg：两件事互不依赖，但顺序固定便于卸载还原 }
-  if WizardIsTaskSelected('modifypath') then
-    EnvAddPath(ExpandConstant('{app}'));
-
   if FfmpegOnPath() then
     exit;
 
@@ -302,24 +331,47 @@ begin
     exit;
   end;
 
+  { [Files] 里的 dontcopy 文件不会自动落到临时目录，用之前先手动解出来 }
+  ExtractTemporaryFile('ffmpeg_setup.ps1');
+
   Size := QueryFfmpegSize();
   if Size > 0 then
     SizeText := FormatSize(Size)
   else
     SizeText := '约 114 MB';
 
-  DefaultDir := ExpandConstant('{userprofile}\ffmpeg');
-  if MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegMissingAsk'), [DefaultDir, SizeText]),
+  if MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegMissingAsk}'), [ExpandConstant('{userprofile}\ffmpeg'), SizeText]),
             mbConfirmation, MB_YESNO) = IDNO then
   begin
     MsgBox(ExpandConstant('{cm:FfmpegSkip}'), mbInformation, MB_OK);
     exit;
   end;
 
-  MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegDownloading'), [SizeText]),
-         mbInformation, MB_OK);
+  Url := ResolveFfmpegUrl();
+  if Url = '' then
+  begin
+    MsgBox(ExpandConstant('{cm:FfmpegFailed}'), mbError, MB_OK);
+    exit;
+  end;
 
-  if not InstallFfmpeg() then
+  Zip := ExpandConstant('{tmp}\ffmpeg-essentials.zip');
+  DownloadPage.Clear;
+  { 第三个参数是期望的 SHA256（空串则只校验长度/不校验），不是大小 }
+  DownloadPage.Add(Url, 'ffmpeg-essentials.zip', '');
+  DownloadPage.Show;
+  try
+    try
+      DownloadPage.Download;                       { 异常即失败，进度页自己处理联网错误 }
+    except
+      MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegFailDetail}'), [GetExceptionMessage]),
+             mbError, MB_OK);
+      exit;
+    end;
+  finally
+    DownloadPage.Hide;
+  end;
+
+  if not ExtractFfmpeg(Zip) then
   begin
     MsgBox(ExpandConstant('{cm:FfmpegFailed}'), mbError, MB_OK);
     exit;
@@ -329,7 +381,31 @@ begin
   EnvAddPath(BinPath);
   { 只记下我们自己加的这一条：用户可能本来就有别的 ffmpeg，卸载不能乱删 }
   RegWriteStringValue(HKEY_CURRENT_USER, 'SOFTWARE\{#AppShortName}', 'FfmpegBin', BinPath);
-  MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegDone'), [BinPath]), mbInformation, MB_OK);
+  MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegDone}'), [BinPath]), mbInformation, MB_OK);
+end;
+
+{ 点"安装"（Ready 页的下一步）时先把 ffmpeg 处理掉，再进入正式复制文件。
+  外层 try 兜底：任何意外都变成一条出错提示，而不是 Inno 的 "Runtime error"。 }
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  if CurPageID <> wpReady then
+    exit;
+  try
+    TryInstallFfmpeg();
+  except
+    MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegFailDetail}'), [GetExceptionMessage]),
+           mbError, MB_OK);
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep <> ssPostInstall then
+    exit;
+
+  if WizardIsTaskSelected('modifypath') then
+    EnvAddPath(ExpandConstant('{app}'));
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
@@ -347,3 +423,5 @@ begin
     RegDeleteValue(HKEY_CURRENT_USER, 'SOFTWARE\{#AppShortName}', 'FfmpegBin');
   end;
 end;
+
+

@@ -1,11 +1,15 @@
 # =====================================================================
-#  ffmpeg_setup.ps1 -- download / extract ffmpeg for bilibili-downloader
+#  ffmpeg_setup.ps1 -- resolve / extract ffmpeg for bilibili-downloader
 #
-#  Called by installer.iss during setup; the program's own
-#  --install-ffmpeg does the same thing in Python. Two modes:
+#  Called by installer.iss while the setup is running. The actual download
+#  is done by Inno Setup itself (TDownloadWizardPage) so the user sees a
+#  real progress bar and can stop it; this script only does the small,
+#  non-blocking jobs around it:
 #
-#      -Mode Size     write the archive's Content-Length into -OutFile
-#      -Mode Install  download + extract into <Dest>\bin, verify the exe
+#      -Mode Url      write the resolved archive URL into -OutFile
+#      -Mode Size     write the archive's real size into -OutFile
+#      -Mode Extract  unpack the already downloaded -Zip into <Dest>\bin
+#      -Mode Install  download + extract in one go (standalone use)
 #
 #  Size must query the live URL (the installer shows that number before
 #  asking), never a hardcoded guess.
@@ -14,9 +18,10 @@
 #  unless it carries a BOM, so non-ASCII text would arrive garbled.
 # =====================================================================
 param(
-    [ValidateSet('Size', 'Install')]
+    [ValidateSet('Url', 'Size', 'Extract', 'Install')]
     [string]$Mode = 'Size',
     [string]$Url = '',
+    [string]$Zip = '',
     [string]$Dest = '',
     [string]$OutFile = ''
 )
@@ -51,11 +56,30 @@ function Resolve-Url {
     return $FallbackUrl
 }
 
+# Copy the archive's bin\ folder into <Dest>\bin, then make sure the copy starts.
+function Install-Bin([string]$SrcRoot, [string]$Target) {
+    $exe = Get-ChildItem -LiteralPath $SrcRoot -Recurse -Filter 'ffmpeg.exe' |
+           Where-Object { $_.Directory.Name -eq 'bin' } |
+           Select-Object -First 1
+    if (-not $exe) { throw 'ffmpeg.exe not found inside the archive' }
+
+    $bin = Join-Path $Target 'bin'
+    New-Item -ItemType Directory -Path $bin -Force | Out-Null
+    Copy-Item -Path (Join-Path $exe.DirectoryName '*') -Destination $bin -Force
+
+    $installed = Join-Path $bin 'ffmpeg.exe'
+    & $installed -version | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'installed ffmpeg does not start' }
+}
+
 try {
     if (-not $Dest) { $Dest = Join-Path $env:USERPROFILE 'ffmpeg' }
-    $target = Resolve-Url
 
-    if ($Mode -eq 'Size') {
+    if ($Mode -eq 'Url') {
+        Write-Out (Resolve-Url)
+    }
+    elseif ($Mode -eq 'Size') {
+        $target = Resolve-Url
         # A HEAD request is rejected by the GitHub asset host, so ask for the
         # first byte and read the total out of Content-Range (bytes 0-0/119467219).
         $request = [System.Net.HttpWebRequest]::Create($target)
@@ -73,29 +97,30 @@ try {
         if ($length -le 0) { throw 'server did not report a size' }
         Write-Out ([string]$length)
     }
-    else {
+    elseif ($Mode -eq 'Extract') {
+        if (-not $Zip) { throw 'no -Zip given' }
+        if (-not (Test-Path -LiteralPath $Zip)) { throw "archive not found: $Zip" }
         $tmp = Join-Path $env:TEMP ('bili_ffmpeg_' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $tmp -Force | Out-Null
         try {
-            $zip = Join-Path $tmp 'ffmpeg.zip'
-            (New-Object System.Net.WebClient).DownloadFile($target, $zip)
-
+            Expand-Archive -LiteralPath $Zip -DestinationPath $tmp -Force
+            Install-Bin $tmp $Dest
+        }
+        finally {
+            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Write-Out 'OK'
+    }
+    else {
+        $target = Resolve-Url
+        $tmp = Join-Path $env:TEMP ('bili_ffmpeg_' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+        try {
+            $zipFile = Join-Path $tmp 'ffmpeg.zip'
+            (New-Object System.Net.WebClient).DownloadFile($target, $zipFile)
             $unzip = Join-Path $tmp 'unzip'
-            Expand-Archive -LiteralPath $zip -DestinationPath $unzip -Force
-
-            $exe = Get-ChildItem -LiteralPath $unzip -Recurse -Filter 'ffmpeg.exe' |
-                   Where-Object { $_.Directory.Name -eq 'bin' } |
-                   Select-Object -First 1
-            if (-not $exe) { throw 'ffmpeg.exe not found inside the archive' }
-
-            $bin = Join-Path $Dest 'bin'
-            New-Item -ItemType Directory -Path $bin -Force | Out-Null
-            Copy-Item -Path (Join-Path $exe.DirectoryName '*') -Destination $bin -Force
-
-            $installed = Join-Path $bin 'ffmpeg.exe'
-            & $installed -version | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw 'installed ffmpeg does not start' }
-
+            Expand-Archive -LiteralPath $zipFile -DestinationPath $unzip -Force
+            Install-Bin $unzip $Dest
             Write-Out 'OK'
         }
         finally {

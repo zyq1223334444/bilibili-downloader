@@ -2529,11 +2529,38 @@ def run_gui() -> int:
 
     global _SELECTION_CALLBACK
 
-    body_font = ("Microsoft YaHei UI", 10)
-    small_font = ("Microsoft YaHei UI", 9)
-    bold_font = ("Microsoft YaHei UI", 10, "bold")
-    title_font = ("Microsoft YaHei UI", 16, "bold")
-    mono_font = ("Consolas", 9)
+    # ---- 缩放 ----
+    # Tk 的字体按“点”算，会跟着系统缩放变大，但控件的宽高、间距全是像素，
+    # 于是 150% 下文字变大、盒子没变，按钮上的字就被切掉。这里把界面尺寸
+    # 统一折算成“逻辑像素”：字体改用负值（负数=像素），几何数字全部过 px()，
+    # 这样任何缩放比例下“字 / 盒子 / 间距”都按同一比例放大。
+    root = tk.Tk()
+    SCALE = root.winfo_fpixels("1i") / 96.0
+
+    def px(value: float) -> int:
+        """96 dpi 下的逻辑尺寸 → 当前缩放下的物理像素。"""
+        return max(1, int(round(value * SCALE)))
+
+    def make_combo(parent, variable, values):
+        """按最长选项的实际像素宽度做下拉框。
+
+        ttk.Combobox 的 width 单位是"字符"（一个汉字算两个），而且放进 grid
+        里会被列宽挤压成"只剩一个箭头"。这里把它装进一个固定宽度的容器里，
+        再让下拉框填满容器，宽度就完全由文字实测值决定，不受列宽影响。
+        """
+        measure = tkfont.Font(root=root, font=body_font)
+        width = max(measure.measure(str(v)) for v in values) + px(34)
+        holder = tk.Frame(parent, bg=GUI_CARD, width=width, height=px(34))
+        holder.grid_propagate(False)
+        box = ttk.Combobox(holder, textvariable=variable, values=values, state="readonly")
+        box.pack(fill="both", expand=True)
+        return holder
+
+    body_font = ("Microsoft YaHei UI", -px(14))
+    small_font = ("Microsoft YaHei UI", -px(12))
+    bold_font = ("Microsoft YaHei UI", -px(14), "bold")
+    title_font = ("Microsoft YaHei UI", -px(24), "bold")
+    mono_font = ("Consolas", -px(12))
 
     # ---- Win11 风格的小部件：tkinter 没有圆角，这里自己画 ----
 
@@ -2572,11 +2599,17 @@ def run_gui() -> int:
         def __init__(self, master, text, command=None, kind="secondary", width=None,
                      height=32, radius=6, font=None, enabled=True):
             fill, hover, press, disabled, fg, outline = self.KINDS[kind]
-            self._font = font or ("Microsoft YaHei UI", 9)
+            self._font = font or small_font
             import tkinter.font as tkfont
             measure = tkfont.Font(font=self._font)
-            w = width or (measure.measure(text) + 30)
-            super().__init__(master, width=w, height=height, bg=master["bg"],
+            # 宽度按文字实测值算（中文字符比等宽估算宽得多，写死会切字），
+            # 显式给的 width 也当作最小宽度，缩放后仍保证文字完整。
+            need = measure.measure(text) + px(30)
+            h = px(height)
+            # 竖向也要留够行高，否则高 DPI 下上下被切
+            h = max(h, measure.metrics("linespace") + px(12))
+            w = max(px(width) if width else need, need) if width else need
+            super().__init__(master, width=w, height=h, bg=master["bg"],
                              highlightthickness=0, bd=0, takefocus=0)
             self._colors = (fill, hover, press, disabled, fg, outline)
             self._command = command
@@ -2584,7 +2617,7 @@ def run_gui() -> int:
             self._hover = False
             self._press = False
             self._text = text
-            self._radius = radius
+            self._radius = px(radius)
             self._redraw()
             self.bind("<Enter>", self._on_enter)
             self.bind("<Leave>", self._on_leave)
@@ -2643,21 +2676,25 @@ def run_gui() -> int:
         """白色圆角卡片，内容放在 .body 里（body 就是普通的 tk.Frame）。"""
 
         def __init__(self, master, height=150, radius=10, padding=14):
-            super().__init__(master, height=height, bg=master["bg"],
+            super().__init__(master, height=px(height), bg=master["bg"],
                              highlightthickness=0, bd=0)
-            self._radius = radius
-            self._padding = padding
+            self._radius = px(radius)
+            self._padding = px(padding)
             self.body = tk.Frame(self, bg=GUI_CARD)
-            self._window = self.create_window(padding, padding, anchor="nw", window=self.body)
+            self._window = self.create_window(self._padding, self._padding,
+                                              anchor="nw", window=self.body)
             self.bind("<Configure>", self._on_resize)
 
         def fit(self):
-            """把画布尺寸收到内容实际需要的大小（tk 画布默认宽度会撑爆布局）。"""
+            """把画布尺寸收到内容实际需要的大小（tk 画布默认宽度会撑爆布局）。
+
+            高度只保留内容需要的部分：多出来的空白交给 grid 的行权重去分配，
+            否则高缩放下几张卡片的最小高度相加就会超过屏幕，底部按钮被切掉。
+            """
             self.body.update_idletasks()
             width = self.body.winfo_reqwidth() + self._padding * 2
             height = self.body.winfo_reqheight() + self._padding * 2
-            self.configure(width=max(width, 240),
-                           height=max(int(self["height"]), height))
+            self.configure(width=max(width, px(240)), height=height)
 
         def _on_resize(self, _event=None):
             w = max(2, self.winfo_width())
@@ -2670,13 +2707,12 @@ def run_gui() -> int:
             self.itemconfigure(self._window, width=max(1, w - pad * 2),
                                height=max(1, h - pad * 2))
 
-    root = tk.Tk()
     root.title("B 站视频下载器")
     root.configure(bg=GUI_BG)
-    root.minsize(1040, 700)
+    root.minsize(px(980), px(660))
     screen_w, screen_h = root.winfo_screenwidth(), root.winfo_screenheight()
-    width = min(1240, max(1040, screen_w - 160))
-    height = min(900, max(720, screen_h - 120))
+    width = min(px(1240), max(px(980), screen_w - px(160)))
+    height = min(px(900), max(px(700), screen_h - px(120)))
     root.geometry(f"{width}x{height}+{(screen_w - width) // 2}+{max(24, (screen_h - height) // 3)}")
     try:
         root.option_add("*Font", body_font)
@@ -2691,7 +2727,7 @@ def run_gui() -> int:
     style.configure(".", background=GUI_BG, foreground=GUI_TEXT, font=body_font)
     style.configure("TCombobox", fieldbackground="#FFFFFF", background="#FFFFFF",
                     foreground=GUI_TEXT, bordercolor=GUI_BORDER, arrowcolor=GUI_TEXT,
-                    padding=(8, 5 ))
+                    padding=(px(8), px(5)))
     style.map("TCombobox", fieldbackground=[("readonly", "#FFFFFF")],
               bordercolor=[("focus", GUI_ACCENT)])
     style.configure("TCheckbutton", background=GUI_CARD, foreground=GUI_TEXT,
@@ -2701,41 +2737,83 @@ def run_gui() -> int:
                     focuscolor=GUI_BG, font=small_font)
     style.map("Adv.TCheckbutton", background=[("active", GUI_BG)])
     style.configure("TRadiobutton", background=GUI_CARD, foreground=GUI_TEXT,
-                    focuscolor=GUI_CARD)
+                    focuscolor=GUI_CARD, font=small_font)
     style.map("TRadiobutton", background=[("active", GUI_CARD)])
     style.configure("TSpinbox", fieldbackground="#FFFFFF", background="#FFFFFF",
                     foreground=GUI_TEXT, bordercolor=GUI_BORDER, arrowcolor=GUI_TEXT,
-                    padding=(6, 3))
+                    padding=(px(6), px(3)))
     style.configure("Win.Treeview", background="#FFFFFF", fieldbackground="#FFFFFF",
-                    foreground=GUI_TEXT, borderwidth=0, rowheight=30,
-                    font=("Microsoft YaHei UI", 9))
+                    foreground=GUI_TEXT, borderwidth=0, rowheight=px(32),
+                    font=small_font)
     style.configure("Win.Treeview.Heading", background="#FFFFFF", foreground=GUI_SUB,
-                    relief="flat", font=("Microsoft YaHei UI", 9, "bold"), padding=(6, 5))
+                    relief="flat", font=("Microsoft YaHei UI", -px(12), "bold"),
+                    padding=(px(6), px(5)))
     style.map("Win.Treeview", background=[("selected", GUI_SELECT)],
               foreground=[("selected", GUI_TEXT)])
     style.configure("Win.Horizontal.TProgressbar", troughcolor="#E9E9E9",
                     background=GUI_ACCENT, bordercolor="#E9E9E9",
-                    lightcolor=GUI_ACCENT, darkcolor=GUI_ACCENT, thickness=4)
+                    lightcolor=GUI_ACCENT, darkcolor=GUI_ACCENT, thickness=px(5))
     style.configure("Win.Vertical.TScrollbar", background="#F0F0F0",
-                    troughcolor="#FFFFFF", bordercolor="#FFFFFF", arrowcolor=GUI_SUB)
+                    troughcolor="#FFFFFF", bordercolor="#FFFFFF", arrowcolor=GUI_SUB,
+                    width=px(14))
 
     # ---------------- 顶部标题 ----------------
     header = tk.Frame(root, bg=GUI_BG)
-    header.pack(fill="x", padx=18, pady=(12, 6))
+    header.pack(fill="x", padx=px(18), pady=(px(12), px(6)))
     tk.Label(header, text="B 站视频下载器", font=title_font, bg=GUI_BG,
              fg=GUI_TEXT).pack(side="left")
     tk.Label(header, text="DASH 音视频 · 弹幕 · MKV 软字幕 / 烧录", font=small_font,
-             bg=GUI_BG, fg=GUI_SUB).pack(side="left", padx=(12, 0), pady=(7, 0))
+             bg=GUI_BG, fg=GUI_SUB).pack(side="left", padx=(px(12), 0), pady=(px(7), 0))
 
     # ---------------- 主体两栏 ----------------
     main = tk.Frame(root, bg=GUI_BG)
-    main.pack(fill="both", expand=True, padx=18)
+    main.pack(fill="both", expand=True, padx=px(18))
     main.columnconfigure(0, weight=5)
     main.columnconfigure(1, weight=4)
     main.rowconfigure(0, weight=1)
 
-    left = tk.Frame(main, bg=GUI_BG)
-    left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+    left_wrap = tk.Frame(main, bg=GUI_BG)
+    left_wrap.grid(row=0, column=0, sticky="nsew", padx=(0, px(10)))
+    left_wrap.rowconfigure(0, weight=1)
+    left_wrap.columnconfigure(0, weight=1)
+    left_canvas = tk.Canvas(left_wrap, bg=GUI_BG, highlightthickness=0, bd=0, height=1)
+    left_bar = ttk.Scrollbar(left_wrap, orient="vertical", command=left_canvas.yview,
+                             style="Win.Vertical.TScrollbar")
+    left_canvas.configure(yscrollcommand=left_bar.set)
+    left_canvas.grid(row=0, column=0, sticky="nsew")
+    left = tk.Frame(left_canvas, bg=GUI_BG)
+    left_window = left_canvas.create_window(0, 0, anchor="nw", window=left)
+    left_canvas.bind("<Configure>", lambda event: left_canvas.itemconfigure(left_window, width=event.width))
+
+    def auto_left_bar() -> None:
+        """左栏内容比视口高时才出现滚动条（高缩放下高级选项展开就是这种情况）。"""
+        try:
+            if left.winfo_reqheight() > left_canvas.winfo_height() + 1:
+                left_bar.grid(row=0, column=1, sticky="ns")
+            else:
+                left_bar.grid_remove()
+                left_canvas.yview_moveto(0)
+        except tk.TclError:
+            pass
+
+    left.bind("<Configure>", lambda event: (left_canvas.configure(scrollregion=left_canvas.bbox("all")),
+                                            auto_left_bar()))
+
+    def left_wheel(event):
+        """滚轮落在左栏任意控件上时滚动左栏（高缩放下需要滑动才能看到凭证卡片）。"""
+        widget = root.winfo_containing(event.x_root, event.y_root)
+        inside = False
+        while widget is not None:
+            if widget is left or widget is left_canvas:
+                inside = True
+                break
+            widget = getattr(widget, "master", None)
+        if not inside:
+            return None
+        left_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
+
+    root.bind_all("<MouseWheel>", left_wheel, add="+")
     right = tk.Frame(main, bg=GUI_BG)
     right.grid(row=0, column=1, sticky="nsew")
 
@@ -2748,14 +2826,14 @@ def run_gui() -> int:
     left.rowconfigure(4, weight=0)
 
     link_card = _Card(left, height=168)
-    link_card.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
+    link_card.grid(row=0, column=0, sticky="nsew", pady=(0, px(10)))
     lb = link_card.body
     lb_head = tk.Frame(lb, bg=GUI_CARD)
-    lb_head.pack(fill="x", pady=(0, 6))
+    lb_head.pack(fill="x", pady=(0, px(6)))
     tk.Label(lb_head, text="视频链接 / BV 号 / av 号", font=bold_font, bg=GUI_CARD,
              fg=GUI_TEXT).pack(side="left")
     tk.Label(lb_head, text="普通投稿 / 多 P / 合集",
-             font=small_font, bg=GUI_CARD, fg=GUI_SUB).pack(side="left", padx=(8, 0), pady=(3, 0))
+             font=small_font, bg=GUI_CARD, fg=GUI_SUB).pack(side="left", padx=(px(8), 0), pady=(px(3), 0))
     url_text = tk.Text(lb, width=1, height=2, wrap="word", font=mono_font, relief="flat",
                        bg="#FAFAFA", fg=GUI_TEXT, insertbackground=GUI_TEXT,
                        highlightthickness=1, highlightbackground=GUI_BORDER,
@@ -2763,86 +2841,86 @@ def run_gui() -> int:
     url_text.pack(fill="both", expand=True)
 
     link_row = tk.Frame(lb, bg=GUI_CARD)
-    link_row.pack(fill="x", pady=(10, 0))
+    link_row.pack(fill="x", pady=(px(10), 0))
     read_btn = _RoundedButton(link_row, "读取分集", kind="accent", command=lambda: read_plan())
     read_btn.pack(side="left")
     _RoundedButton(link_row, "粘贴", kind="ghost", width=64,
-                   command=lambda: paste_link()).pack(side="left", padx=(6, 0))
+                   command=lambda: paste_link()).pack(side="left", padx=(px(6), 0))
     _RoundedButton(link_row, "清空", kind="ghost", width=64,
-                   command=lambda: url_text.delete("1.0", "end")).pack(side="left", padx=(6, 0))
+                   command=lambda: url_text.delete("1.0", "end")).pack(side="left", padx=(px(6), 0))
     tk.Label(link_row, text="先读清单再勾选", font=small_font,
-             bg=GUI_CARD, fg=GUI_SUB).pack(side="left", padx=(10, 0))
+             bg=GUI_CARD, fg=GUI_SUB).pack(side="left", padx=(px(10), 0))
 
     # ---------------- 下载选项 ----------------
     opt_card = _Card(left, height=210)
-    opt_card.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
+    opt_card.grid(row=1, column=0, sticky="nsew", pady=(0, px(10)))
     ob = opt_card.body
     ob.columnconfigure(1, weight=1)
 
     tk.Label(ob, text="保存到", font=bold_font, bg=GUI_CARD, fg=GUI_TEXT).grid(
-        row=0, column=0, sticky="w", pady=(0, 8))
+        row=0, column=0, sticky="w", pady=(0, px(8)))
     out_var = tk.StringVar(value=str(default_output()))
-    tk.Entry(ob, textvariable=out_var, font=small_font, relief="flat",
+    out_row = tk.Frame(ob, bg=GUI_CARD)
+    out_row.grid(row=0, column=1, columnspan=5, sticky="ew", pady=(0, px(8)))
+    tk.Entry(out_row, textvariable=out_var, font=small_font, relief="flat",
              bg="#FAFAFA", fg=GUI_TEXT, insertbackground=GUI_TEXT,
              highlightthickness=1, highlightbackground=GUI_BORDER,
-             highlightcolor=GUI_ACCENT).grid(row=0, column=1, columnspan=3, sticky="ew",
-                                             padx=(8, 8), pady=(0, 8))
-    _RoundedButton(ob, "浏览", kind="ghost", width=58, height=28,
-                   command=lambda: browse_dir()).grid(row=0, column=4, sticky="w")
-    _RoundedButton(ob, "打开", kind="ghost", width=58, height=28,
-                   command=lambda: open_folder(out_var.get())).grid(row=0, column=5,
-                                                                    sticky="w", padx=(6, 0))
+             highlightcolor=GUI_ACCENT).pack(side="left", fill="x", expand=True, padx=(px(8), px(8)))
+    _RoundedButton(out_row, "打开", kind="ghost", width=58, height=28,
+                   command=lambda: open_folder(out_var.get())).pack(side="right")
+    _RoundedButton(out_row, "浏览", kind="ghost", width=58, height=28,
+                   command=lambda: browse_dir()).pack(side="right", padx=(0, px(6)))
 
     tk.Label(ob, text="画质", font=bold_font, bg=GUI_CARD, fg=GUI_TEXT).grid(
         row=1, column=0, sticky="w")
     quality_var = tk.StringVar(value="最高（跟随账号权限）")
-    ttk.Combobox(ob, textvariable=quality_var, values=list(GUI_QUALITY),
-                 state="readonly", width=13).grid(row=1, column=1, sticky="ew",
-                                                  padx=(8, 12))
+    # 下拉框不再"拉伸填满"：列被挤压时它连自己需要的宽度都保不住，
+    # 于是只显示一个箭头、文字被切掉。改成按内容宽度、左对齐。
+    quality_box = make_combo(ob, quality_var, list(GUI_QUALITY))
+    quality_box.grid(row=1, column=1, columnspan=5, sticky="w",
+                     padx=(px(8), 0), pady=(px(8), 0))
     tk.Label(ob, text="MP3 码率", font=bold_font, bg=GUI_CARD, fg=GUI_TEXT).grid(
-        row=1, column=2, sticky="w")
+        row=2, column=0, sticky="w", pady=(px(8), 0))
     bitrate_var = tk.StringVar(value="320")
-    ttk.Combobox(ob, textvariable=bitrate_var, values=["128", "192", "256", "320"],
-                 state="readonly", width=6).grid(row=1, column=3, sticky="w", padx=(8, 0))
+    make_combo(ob, bitrate_var, ["128", "192", "256", "320"]).grid(
+        row=2, column=1, columnspan=5, sticky="w", padx=(px(8), 0), pady=(px(8), 0))
 
     tk.Label(ob, text="输出", font=bold_font, bg=GUI_CARD, fg=GUI_TEXT).grid(
-        row=2, column=0, sticky="w", pady=(10, 0))
+        row=3, column=0, sticky="w", pady=(px(10), 0))
     mode_var = tk.StringVar(value="both")
     mode_row = tk.Frame(ob, bg=GUI_CARD)
-    mode_row.grid(row=2, column=1, columnspan=5, sticky="w", pady=(10, 0))
+    mode_row.grid(row=3, column=1, columnspan=5, sticky="w", pady=(px(10), 0))
     for text, value in (("视频 + MP3", "both"), ("仅视频", "video"), ("仅 MP3", "audio")):
         ttk.Radiobutton(mode_row, text=text, value=value, variable=mode_var,
-                        style="TRadiobutton").pack(side="left", padx=(0, 16))
+                        style="TRadiobutton").pack(side="left", padx=(0, px(16)))
 
     tk.Label(ob, text="弹幕", font=bold_font, bg=GUI_CARD, fg=GUI_TEXT).grid(
-        row=3, column=0, sticky="w", pady=(10, 0))
+        row=4, column=0, sticky="w", pady=(px(10), 0))
     danmaku_var = tk.StringVar(value="精简（去重限流，推荐）")
-    ttk.Combobox(ob, textvariable=danmaku_var, values=list(GUI_DANMAKU),
-                 state="readonly", width=12).grid(row=3, column=1, sticky="w",
-                                                  padx=(8, 12), pady=(10, 0))
+    make_combo(ob, danmaku_var, list(GUI_DANMAKU)).grid(
+        row=4, column=1, columnspan=5, sticky="w", padx=(px(8), 0), pady=(px(10), 0))
     tk.Label(ob, text="放进视频", font=bold_font, bg=GUI_CARD, fg=GUI_TEXT).grid(
-        row=3, column=2, sticky="w", pady=(10, 0))
+        row=5, column=0, sticky="w", pady=(px(10), 0))
     embed_var = tk.StringVar(value="不嵌入")
-    ttk.Combobox(ob, textvariable=embed_var, values=list(GUI_EMBED),
-                 state="readonly", width=11).grid(row=3, column=3, columnspan=3,
-                                                  sticky="w", padx=(8, 0), pady=(10, 0))
+    make_combo(ob, embed_var, list(GUI_EMBED)).grid(
+        row=5, column=1, columnspan=5, sticky="w", padx=(px(8), 0), pady=(px(10), 0))
 
     # ---------------- 凭证（终端风格，按状态切换界面） ----------------
     cred_card = _Card(left, height=104)
-    cred_card.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
+    cred_card.grid(row=2, column=0, sticky="nsew", pady=(0, px(10)))
     cb = cred_card.body
     cb.columnconfigure(0, weight=1)
 
     cb_head = tk.Frame(cb, bg=GUI_CARD)
-    cb_head.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+    cb_head.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, px(6)))
     tk.Label(cb_head, text="登录凭证 SESSDATA（可选）", font=bold_font, bg=GUI_CARD,
              fg=GUI_TEXT).pack(side="left")
     tk.Label(cb_head, text="只影响画质上限，与速度无关",
-             font=small_font, bg=GUI_CARD, fg=GUI_SUB).pack(side="left", padx=(8, 0), pady=(3, 0))
+             font=small_font, bg=GUI_CARD, fg=GUI_SUB).pack(side="left", padx=(px(8), 0), pady=(px(3), 0))
 
     # 像终端一样的状态窗：未读取 / 待校验 / 有效 / 已失效 各显示不同内容
     console = tk.Text(cb, height=2, width=1, wrap="word", relief="flat", font=mono_font,
-                      bg="#1E1E1E", fg="#D4D4D4", padx=10, pady=6,
+                      bg="#1E1E1E", fg="#D4D4D4", padx=px(10), pady=px(6),
                       highlightthickness=0, bd=0, state="disabled")
     console.grid(row=1, column=0, columnspan=2, sticky="ew")
     console.tag_configure("ok", foreground="#6DD58C")
@@ -2853,7 +2931,7 @@ def run_gui() -> int:
     cred = {"value": "", "state": "none", "source": ""}
 
     input_row = tk.Frame(cb, bg=GUI_CARD)
-    input_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+    input_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(px(8), 0))
     input_row.columnconfigure(0, weight=1)
     sess_var = tk.StringVar()
     sess_entry = tk.Entry(input_row, textvariable=sess_var, show="•", font=small_font,
@@ -2862,7 +2940,7 @@ def run_gui() -> int:
                           highlightcolor=GUI_ACCENT)
     sess_entry.grid(row=0, column=0, sticky="ew")
     _RoundedButton(input_row, "保存并校验", kind="ghost", width=86, height=28,
-                   command=lambda: save_cred()).grid(row=0, column=1, padx=(8, 0))
+                   command=lambda: save_cred()).grid(row=0, column=1, padx=(px(8), 0))
 
     manage_row = tk.Frame(cb, bg=GUI_CARD)
     manage_row.columnconfigure(0, weight=1)
@@ -2870,16 +2948,16 @@ def run_gui() -> int:
                           fg=GUI_TEXT, anchor="w")
     mask_label.grid(row=0, column=0, sticky="w")
     _RoundedButton(manage_row, "更换", kind="ghost", width=58, height=28,
-                   command=lambda: show_entry()).grid(row=0, column=1, padx=(8, 0))
+                   command=lambda: show_entry()).grid(row=0, column=1, padx=(px(8), 0))
     _RoundedButton(manage_row, "清除", kind="ghost", width=58, height=28,
-                   command=lambda: clear_cred()).grid(row=0, column=2, padx=(8, 0))
+                   command=lambda: clear_cred()).grid(row=0, column=2, padx=(px(8), 0))
 
     # ---------------- 高级选项（默认收起） ----------------
     adv_state = tk.BooleanVar(value=False)
     adv_toggle = ttk.Checkbutton(left, text="高级选项（并发、重试、超时、探测、强制重下…）",
                                  variable=adv_state, style="Adv.TCheckbutton",
                                  command=lambda: toggle_adv())
-    adv_toggle.grid(row=3, column=0, sticky="w", pady=(0, 6))
+    adv_toggle.grid(row=3, column=0, sticky="w", pady=(0, px(6)))
     adv_card = _Card(left, height=150)
     # 先不显示，勾上才 grid（见 toggle_adv）
 
@@ -2894,20 +2972,20 @@ def run_gui() -> int:
     tk.Label(ab, text="并发线程", font=bold_font, bg=GUI_CARD, fg=GUI_TEXT).grid(
         row=0, column=0, sticky="w")
     ttk.Spinbox(ab, from_=1, to=4, textvariable=jobs_var, width=5).grid(
-        row=0, column=1, sticky="w", padx=(8, 16))
+        row=0, column=1, sticky="w", padx=(px(8), px(16)))
     tk.Label(ab, text="节点重试", font=bold_font, bg=GUI_CARD, fg=GUI_TEXT).grid(
         row=0, column=2, sticky="w")
     ttk.Spinbox(ab, from_=1, to=10, textvariable=retries_var, width=5).grid(
-        row=0, column=3, sticky="w", padx=(8, 0))
+        row=0, column=3, sticky="w", padx=(px(8), 0))
 
     tk.Label(ab, text="超时（秒）", font=bold_font, bg=GUI_CARD, fg=GUI_TEXT).grid(
-        row=1, column=0, sticky="w", pady=(8, 0))
+        row=1, column=0, sticky="w", pady=(px(8), 0))
     ttk.Spinbox(ab, from_=1, to=180, increment=1, textvariable=timeout_var, width=5).grid(
-        row=1, column=1, sticky="w", padx=(8, 16), pady=(8, 0))
+        row=1, column=1, sticky="w", padx=(px(8), px(16)), pady=(px(8), 0))
     tk.Label(ab, text="重连上限", font=bold_font, bg=GUI_CARD, fg=GUI_TEXT).grid(
-        row=1, column=2, sticky="w", pady=(8, 0))
+        row=1, column=2, sticky="w", pady=(px(8), 0))
     ttk.Spinbox(ab, from_=0, to=30, textvariable=reconn_var, width=5).grid(
-        row=1, column=3, sticky="w", padx=(8, 0), pady=(8, 0))
+        row=1, column=3, sticky="w", padx=(px(8), 0), pady=(px(8), 0))
 
     single_var = tk.BooleanVar(value=False)
     force_var = tk.BooleanVar(value=False)
@@ -2916,7 +2994,7 @@ def run_gui() -> int:
     reset_var = tk.BooleanVar(value=False)
 
     checks = tk.Frame(ab, bg=GUI_CARD)
-    checks.grid(row=2, column=0, columnspan=4, sticky="w", pady=(10, 0))
+    checks.grid(row=2, column=0, columnspan=4, sticky="w", pady=(px(10), 0))
     for index, (text, variable) in enumerate((
         ("只下当前视频 / 分P", single_var),
         ("已存在也重新下载", force_var),
@@ -2926,11 +3004,11 @@ def run_gui() -> int:
     )):
         ttk.Checkbutton(checks, text=text, variable=variable,
                         style="TCheckbutton").grid(row=index // 3, column=index % 3,
-                                                   sticky="w", padx=(0, 16), pady=1)
+                                                   sticky="w", padx=(0, px(16)), pady=px(1))
 
     def toggle_adv() -> None:
         if adv_state.get():
-            adv_card.grid(row=4, column=0, sticky="nsew", pady=(0, 10))
+            adv_card.grid(row=4, column=0, sticky="nsew", pady=(0, px(10)))
         else:
             adv_card.grid_remove()
 
@@ -2940,33 +3018,33 @@ def run_gui() -> int:
     right.rowconfigure(1, weight=2)
 
     preview_card = _Card(right, height=250)
-    preview_card.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
+    preview_card.grid(row=0, column=0, sticky="nsew", pady=(0, px(10)))
     pb = preview_card.body
     pb.rowconfigure(2, weight=1)
     pb.columnconfigure(0, weight=1)
 
     head = tk.Frame(pb, bg=GUI_CARD)
-    head.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+    head.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, px(8)))
     tk.Label(head, text="分集预览", font=bold_font, bg=GUI_CARD, fg=GUI_TEXT).pack(side="left")
     count_var = tk.StringVar(value="还没有读取清单")
     tk.Label(head, textvariable=count_var, font=small_font, bg=GUI_CARD,
-             fg=GUI_SUB).pack(side="left", padx=(10, 0))
+             fg=GUI_SUB).pack(side="left", padx=(px(10), 0))
     _RoundedButton(head, "全不选", kind="secondary", width=64, height=26,
-                   command=lambda: set_all(False)).pack(side="right", padx=(6, 0))
+                   command=lambda: set_all(False)).pack(side="right", padx=(px(6), 0))
     _RoundedButton(head, "全选", kind="secondary", width=58, height=26,
                    command=lambda: set_all(True)).pack(side="right")
     _RoundedButton(head, "应用序号", kind="secondary", width=76, height=26,
-                   command=lambda: apply_pick_text()).pack(side="right", padx=(0, 8))
+                   command=lambda: apply_pick_text()).pack(side="right", padx=(0, px(8)))
 
     pick_row = tk.Frame(pb, bg=GUI_CARD)
-    pick_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+    pick_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, px(8)))
     tk.Label(pick_row, text="序号", font=bold_font, bg=GUI_CARD, fg=GUI_TEXT).pack(side="left")
     pick_var = tk.StringVar()
     pick_entry = tk.Entry(pick_row, textvariable=pick_var, font=mono_font, relief="flat",
                           bg="#FAFAFA", fg=GUI_TEXT, insertbackground=GUI_TEXT,
                           highlightthickness=1, highlightbackground=GUI_BORDER,
                           highlightcolor=GUI_ACCENT)
-    pick_entry.pack(side="left", fill="x", expand=True, padx=(8, 8))
+    pick_entry.pack(side="left", fill="x", expand=True, padx=(px(8), px(8)))
     tk.Label(pick_row, text="1,3-5", font=small_font,
              bg=GUI_CARD, fg=GUI_SUB).pack(side="right")
 
@@ -2977,10 +3055,10 @@ def run_gui() -> int:
     tree.heading("index", text="#")
     tree.heading("title", text="标题")
     tree.heading("duration", text="时长")
-    tree.column("chosen", width=38, anchor="center", stretch=False)
-    tree.column("index", width=46, anchor="center", stretch=False)
-    tree.column("title", width=300, anchor="w", stretch=True)
-    tree.column("duration", width=70, anchor="center", stretch=False)
+    tree.column("chosen", width=px(38), anchor="center", stretch=False)
+    tree.column("index", width=px(46), anchor="center", stretch=False)
+    tree.column("title", width=px(300), anchor="w", stretch=True)
+    tree.column("duration", width=px(70), anchor="center", stretch=False)
     tree.grid(row=2, column=0, sticky="nsew")
     tree_bar = ttk.Scrollbar(pb, orient="vertical", command=tree.yview,
                              style="Win.Vertical.TScrollbar")
@@ -2994,7 +3072,7 @@ def run_gui() -> int:
     logb.rowconfigure(1, weight=1)
     logb.columnconfigure(0, weight=1)
     tk.Label(logb, text="运行日志", font=bold_font, bg=GUI_CARD, fg=GUI_TEXT).grid(
-        row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        row=0, column=0, columnspan=2, sticky="w", pady=(0, px(6)))
     log_text = tk.Text(logb, width=1, height=6, wrap="word", state="disabled", relief="flat",
                        font=mono_font, bg="#FAFAFA", fg="#333333",
                        highlightthickness=1, highlightbackground=GUI_BORDER)
@@ -3006,10 +3084,10 @@ def run_gui() -> int:
 
     # ---------------- 底部 ----------------
     bottom = tk.Frame(root, bg=GUI_BG)
-    bottom.pack(fill="x", padx=18, pady=(8, 12))
+    bottom.pack(fill="x", padx=px(18), pady=(px(8), px(12)))
     progress = ttk.Progressbar(bottom, mode="indeterminate",
                                style="Win.Horizontal.TProgressbar")
-    progress.pack(fill="x", pady=(0, 6))
+    progress.pack(fill="x", pady=(0, px(6)))
 
     info_row = tk.Frame(bottom, bg=GUI_BG)
     info_row.pack(fill="x")
@@ -3020,15 +3098,15 @@ def run_gui() -> int:
              bg=GUI_BG, fg=GUI_SUB).pack(side="right")
 
     foot = tk.Frame(bottom, bg=GUI_BG)
-    foot.pack(fill="x", pady=(8, 0))
+    foot.pack(fill="x", pady=(px(8), 0))
     start_btn = _RoundedButton(foot, "开始下载", kind="accent", width=112, height=34,
                                font=("Microsoft YaHei UI", 10, "bold"), command=lambda: start())
     start_btn.pack(side="right")
     cancel_btn = _RoundedButton(foot, "取消", kind="secondary", width=76, height=34,
                                 enabled=False, command=lambda: cancel())
-    cancel_btn.pack(side="right", padx=(0, 8))
+    cancel_btn.pack(side="right", padx=(0, px(8)))
     _RoundedButton(foot, "打开目录", kind="ghost", width=86, height=34,
-                   command=lambda: open_folder(out_var.get())).pack(side="right", padx=(0, 8))
+                   command=lambda: open_folder(out_var.get())).pack(side="right", padx=(0, px(8)))
     _RoundedButton(foot, "帮助", kind="ghost", width=70, height=34,
                    command=lambda: show_help()).pack(side="right")
 
@@ -3092,7 +3170,7 @@ def run_gui() -> int:
         state = cred["state"]
         if state == "valid":
             input_row.grid_remove()
-            manage_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+            manage_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(px(8), 0))
             mask_label.configure(text=f"SESSDATA {mask_value(cred['value'])}")
             cred_log(("> 已登录 · 凭证有效", "ok"),
                      ("  可用 1080P+ / 4K / 无损音频；与下载速度无关", "dim"))
@@ -3182,7 +3260,7 @@ def run_gui() -> int:
 
     # ---------------- ffmpeg ----------------
     ff_label = tk.Label(info_row, text="", font=small_font, bg=GUI_BG, fg=GUI_SUB)
-    ff_label.pack(side="left", padx=(14, 0))
+    ff_label.pack(side="left", padx=(px(14), 0))
 
     def refresh_ffmpeg() -> None:
         exe = ffmpeg_available()
@@ -3191,7 +3269,7 @@ def run_gui() -> int:
             ff_install_btn.pack_forget()          # 已经能用就别占地方
         else:
             ff_label.configure(text="未检测到 ffmpeg：合并、MP3、弹幕封装都用不了", fg="#C0392B")
-            ff_install_btn.pack(side="left", padx=(10, 0))
+            ff_install_btn.pack(side="left", padx=(px(10), 0))
 
     def install_clicked() -> None:
         _, size = resolve_ffmpeg_archive()
@@ -3219,7 +3297,7 @@ def run_gui() -> int:
 
     ff_install_btn = _RoundedButton(info_row, "安装 ffmpeg", kind="ghost", width=104, height=24,
                                     command=lambda: install_clicked())
-    ff_install_btn.pack(side="left", padx=(10, 0))
+    ff_install_btn.pack(side="left", padx=(px(10), 0))
 
     # ---------------- 分集预览 ----------------
     def chosen_count() -> int:
@@ -3385,23 +3463,23 @@ def run_gui() -> int:
         top.title("选择要下载的项目")
         top.configure(bg=GUI_BG)
         top.transient(root)
-        top.geometry(f"640x{min(600, 260 + 22 * min(total, 14))}")
-        frame = tk.Frame(top, bg=GUI_BG, padx=12, pady=10)
+        top.geometry(f"{px(640)}x{px(min(600, 260 + 22 * min(total, 14)))}")
+        frame = tk.Frame(top, bg=GUI_BG, padx=px(12), pady=px(10))
         frame.pack(fill="both", expand=True)
 
         tk.Label(frame, text=f"共 {total} 项。可以直接全下，也可以只下部分（如 1,3,5,6-20）。",
                  font=small_font, bg=GUI_BG, fg=GUI_TEXT).pack(anchor="w")
         list_row = tk.Frame(frame, bg=GUI_CARD)
-        list_row.pack(fill="both", expand=True, pady=8)
+        list_row.pack(fill="both", expand=True, pady=px(8))
         listing = tk.Listbox(list_row, width=1, height=min(14, max(6, total)), activestyle="none",
                              relief="flat", bg="#FAFAFA", fg=GUI_TEXT,
                              highlightthickness=1, highlightbackground=GUI_BORDER,
-                             font=("Microsoft YaHei UI", 9))
+                             font=small_font)
         bar = ttk.Scrollbar(list_row, orient="vertical", command=listing.yview,
                             style="Win.Vertical.TScrollbar")
         listing.configure(yscrollcommand=bar.set)
-        listing.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
-        bar.pack(side="right", fill="y", pady=6, padx=(0, 6))
+        listing.pack(side="left", fill="both", expand=True, padx=(px(6), 0), pady=px(6))
+        bar.pack(side="right", fill="y", pady=px(6), padx=(0, px(6)))
         for index, item in enumerate(items, 1):
             listing.insert("end", f"{index:>3}. {item.label}")
 
@@ -3412,7 +3490,7 @@ def run_gui() -> int:
         entry = tk.Entry(pick_row, textvariable=pick_var, font=small_font, relief="flat",
                          bg="#FFFFFF", fg=GUI_TEXT, highlightthickness=1,
                          highlightbackground=GUI_BORDER, highlightcolor=GUI_ACCENT)
-        entry.pack(side="left", fill="x", expand=True, padx=8)
+        entry.pack(side="left", fill="x", expand=True, padx=px(8))
         entry.focus_set()
 
         def finish(value: list[int] | None) -> None:
@@ -3436,11 +3514,11 @@ def run_gui() -> int:
             finish(picked)
 
         buttons = tk.Frame(frame, bg=GUI_BG)
-        buttons.pack(fill="x", pady=(10, 0))
+        buttons.pack(fill="x", pady=(px(10), 0))
         _RoundedButton(buttons, "全部下载", kind="accent", width=92, height=32,
                        command=lambda: finish(list(range(1, total + 1)))).pack(side="right")
         _RoundedButton(buttons, "只下选中的", kind="secondary", width=104, height=32,
-                       command=pick_part).pack(side="right", padx=8)
+                       command=pick_part).pack(side="right", padx=px(8))
         _RoundedButton(buttons, "取消", kind="ghost", width=70, height=32,
                        command=lambda: finish(None)).pack(side="right")
         top.protocol("WM_DELETE_WINDOW", lambda: finish(None))
@@ -3463,9 +3541,9 @@ def run_gui() -> int:
         win = tk.Toplevel(root)
         win.title("帮助（图形界面）")
         win.configure(bg=GUI_BG)
-        win.geometry("840x680")
+        win.geometry(f"{px(840)}x{px(680)}")
         win.transient(root)
-        wrap = tk.Frame(win, bg=GUI_BG, padx=12, pady=10)
+        wrap = tk.Frame(win, bg=GUI_BG, padx=px(12), pady=px(10))
         wrap.pack(fill="both", expand=True)
         card = _Card(wrap, height=560)
         card.pack(fill="both", expand=True)
@@ -3473,7 +3551,7 @@ def run_gui() -> int:
         hb.rowconfigure(0, weight=1)
         hb.columnconfigure(0, weight=1)
         body = tk.Text(hb, width=1, wrap="word", relief="flat", font=body_font, bg="#FAFAFA",
-                       fg="#222222", padx=12, pady=10, highlightthickness=1,
+                       fg="#222222", padx=px(12), pady=px(10), highlightthickness=1,
                        highlightbackground=GUI_BORDER)
         bar = ttk.Scrollbar(hb, orient="vertical", command=body.yview,
                             style="Win.Vertical.TScrollbar")
@@ -3483,7 +3561,7 @@ def run_gui() -> int:
         body.insert("1.0", GUI_HELP_TEXT)
         body.configure(state="disabled")
         _RoundedButton(wrap, "关闭", kind="secondary", width=80, height=32,
-                       command=win.destroy).pack(side="right", pady=(10, 0))
+                       command=win.destroy).pack(side="right", pady=(px(10), 0))
 
     # ---------------- 参数与运行 ----------------
     def build_argv() -> list[str] | None:
@@ -3633,13 +3711,13 @@ def run_gui() -> int:
     root.update_idletasks()
     need_w = root.winfo_reqwidth()
     need_h = root.winfo_reqheight()
-    # 控件请求尺寸是物理像素，geometry 的宽高却按 DPI 缩放后的单位算，
-    # 两者不一致就会把右栏挤出窗口，所以先按缩换算一遍再定窗口大小。
-    want_w = min(screen_w - 80, max(need_w + 16, int(screen_w * 0.68)))
-    want_h = min(screen_h - 100, max(need_h + 16, int(screen_h * 0.72)))
-    root.minsize(min(1040, want_w), min(700, want_h))
+    # 控件、字体、间距都按 SCALE 折算过了，请求尺寸就是物理像素，
+    # 窗口只需要在"内容需要"和"屏幕可用"之间取一个合适的值。
+    want_w = min(screen_w - px(60), max(need_w + px(16), int(screen_w * 0.68)))
+    want_h = min(screen_h - px(60), max(need_h + px(16), int(screen_h * 0.72)))
+    root.minsize(min(px(980), want_w), min(px(660), want_h))
     root.geometry(f"{want_w}x{want_h}+{max(0, (screen_w - want_w) // 2)}+"
-                  f"{max(24, (screen_h - want_h) // 3)}")
+                  f"{max(px(20), (screen_h - want_h) // 3)}")
 
     refresh_ffmpeg()
     append_log("1) 把视频链接粘到上面的输入框\n"
