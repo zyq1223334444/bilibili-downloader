@@ -71,11 +71,12 @@ Download the latest `bilibili_downloader_setup_<version>.exe` from
 - **The installer also takes care of ffmpeg**: it checks the process `PATH`, the system `PATH`, the user `PATH`
   and `%USERPROFILE%\ffmpeg\bin`; if none has it, a dialog explains that "without ffmpeg the full feature set is
   unavailable (no muxing, no MP3, no danmaku embedding)", **shows the real download size** (queried live from the
-  official essentials archive, about 114 MB) and asks whether to install it, defaulting to "Yes". On approval it
-  downloads and extracts to `%USERPROFILE%\ffmpeg` (keeping only the files in `bin`), then appends
-  `%USERPROFILE%\ffmpeg\bin` to the **system** `PATH` (the installer already runs as administrator) and remembers
-  that one entry in `HKCU\SOFTWARE\bilibili-downloader`. A silent install (`/VERYSILENT`, `/SILENT`) never
-  prompts — it only writes a log line, so unattended deployment cannot hang on a dialog.
+  official essentials archive, about 114 MB) and asks whether to install it, defaulting to "Yes". On approval a
+  **download page** appears with a progress bar, speed and a "Stop" button, so the download can be cancelled at any
+  time; once it finishes the archive is extracted to `%USERPROFILE%\ffmpeg` (keeping only the files in `bin`), then
+  `%USERPROFILE%\ffmpeg\bin` is appended to the **system** `PATH` (the installer already runs as administrator) and
+  that one entry is remembered in `HKCU\SOFTWARE\bilibili-downloader`. A silent install (`/VERYSILENT`, `/SILENT`)
+  never prompts — it only writes a log line, so unattended deployment cannot hang on a dialog.
 - Uninstalling removes only the `PATH` entry it added and **keeps the files in `~\ffmpeg`** (other tools may use
   them, and a reinstall can reuse them).
 

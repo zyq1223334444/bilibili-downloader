@@ -60,7 +60,8 @@ B 站视频 / 分P / 合集下载器：把 DASH 的音、视频分流分别下�
 - **安装过程会顺手把 ffmpeg 也装上**：先检查（进程 `PATH`、系统 `PATH`、用户 `PATH`、`%USERPROFILE%\ffmpeg\bin` 都看一遍），
   没找到就弹窗说明"缺少 ffmpeg 会导致无法使用完整功能（不能合并、导出 MP3、嵌弹幕）"，
   并**显示这次要下载的真实大小**（官方 essentials 包当场查出来的字节数，约 114 MB）再问你是否安装，默认"是"。
-  同意后自动下载解压到 `%USERPROFILE%\ffmpeg`（只留 `bin` 里的 `ffmpeg.exe` 等文件），
+  同意后先出现一个**下载页**：有进度条、速度和"停止"按钮，可以随时中止；
+  下载完成再解压到 `%USERPROFILE%\ffmpeg`（只留 `bin` 里的 `ffmpeg.exe` 等文件），
   并把 `%USERPROFILE%\ffmpeg\bin` 追加到 `PATH`（安装包本身以管理员身份运行，写的是系统 `PATH`），
   同时在 `HKCU\SOFTWARE\bilibili-downloader` 里只记住自己加的这一条。
   静默安装（`/VERYSILENT`、`/SILENT`）不弹窗，只在日志里记一行，免得无人值守部署永远停在对话框上。

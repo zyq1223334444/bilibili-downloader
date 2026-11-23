@@ -4,6 +4,36 @@
 
 ---
 
+## 2.0.2 — 2026-11-23
+
+150% 缩放下界面与安装包的两处硬伤，外加一个只在安装器里出现的崩溃。
+
+### 修复
+
+- **高 DPI 下界面整体变形**：改成先设 DPI 感知再建窗口，按 `winfo_fpixels("1i")/96` 算出缩放比，
+  所有字号、间距、行高、列宽、滚动条宽度统一走 `px()`。字体改用**负值像素字号**，不再出现
+  "文字按点放大、控件按像素不变"的错配——这正是按钮文字被截断的根因。
+- **按钮太小、文字显示不全**：按钮宽度取 `max(指定值, 实测文字宽 + 内边距)`，高度至少容纳一行；
+  卡片高度改为内容驱动，"下载选项"卡片改成一行一个控件（保存到 / 画质 / MP3 码率 / 输出 / 弹幕 / 放进视频），
+  下拉框改成定宽容器内嵌 Combobox，不再被 grid 挤成只剩箭头。左栏放不下时出现滚动条，滚轮只在左栏内生效。
+- **安装包下载 ffmpeg 没有进度**：改用 Inno Setup 自带的 `TDownloadWizardPage`，
+  有原生进度条、速度和"停止"，下载完再解压，不再是"后台静默下载 + 一个假提示框"。
+- **安装时报 `Runtime error (…): 内部错误：Unclosed constant`**：`ExpandConstant('{cm:FfmpegMissingAsk')`
+  等 5 处漏写了右花括号 `}`，Inno 解析常量时报错。全部补齐，弹窗与完成提示恢复正常。
+- **安装包取不到 `ffmpeg_setup.ps1`**：脚本原来靠 `[Files]` 拷进临时目录，但那次拷贝发生在安装阶段，
+  而弹窗下载发生在"准备安装"页之前。改为 `Flags: dontcopy` + `ExtractTemporaryFile`，用的时候再解出来。
+- **安装包报 `内部错误：Unknown constant "userprofile"`**：Inno Setup 没有 `{userprofile}` 这个常量
+  （只有 `{%USERPROFILE}` 环境变量形式），`ExpandConstant` 一调用就抛异常，弹到"ffmpeg 下载或安装失败"里。
+  4 处全部改成 `{%USERPROFILE}`。
+
+### 变更
+
+- `ffmpeg_setup.ps1` 拆成 `-Mode Url`（只解析下载地址）/ `-Mode Size`（查真实体积）/
+  `-Mode Extract`（解压已下好的 zip 并自检）/ `-Mode Install`（独立使用时一条龙）。
+- 版本号 `2.0.0` → `2.0.2`（`installer.iss` 宏、三个构建脚本的 `--file-version/--product-version`）。
+
+---
+
 ## 2.0.0 — 2026-11-23
 
 弹幕、ffmpeg 自举、桌面默认目录，以及一次彻底的图形界面重写。

@@ -41,7 +41,7 @@
 
 #define AppName        "Bilibili Downloader"
 #define AppShortName   "bilibili-downloader"
-#define AppVersion     "2.0.0"
+#define AppVersion     "2.0.2"
 #define AppPublisher   "zyq1223334444"
 #define AppURL         "https://github.com/zyq1223334444/bilibili-downloader"
 #define ExeName        "bilibili_downloader.exe"
@@ -232,7 +232,7 @@ begin
     Paths := Paths + ';' + UserPaths;
   { 当前进程的 PATH 是启动那一刻的快照，装完 ffmpeg 后要新开进程才更新；
     再直接拼上约定的安装目录，避免"刚装完却检测不到" }
-  Paths := Paths + ';' + GetEnv('PATH') + ';' + ExpandConstant('{userprofile}\ffmpeg\bin');
+  Paths := Paths + ';' + GetEnv('PATH') + ';' + ExpandConstant('{%USERPROFILE}\ffmpeg\bin');
   Result := FileSearch('ffmpeg.exe', Paths) <> '';
 end;
 
@@ -303,7 +303,7 @@ var
   StatusFile, Dest: string;
 begin
   Result := False;
-  Dest := ExpandConstant('{userprofile}\ffmpeg');
+  Dest := ExpandConstant('{%USERPROFILE}\ffmpeg');
   StatusFile := ExpandConstant('{tmp}\ffmpeg_install.txt');
   DeleteFile(StatusFile);
   Code := RunSetupScript('-Mode Extract -Zip "' + ZipFile + '" -Dest "' + Dest + '" -OutFile "' + StatusFile + '"');
@@ -340,7 +340,7 @@ begin
   else
     SizeText := '约 114 MB';
 
-  if MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegMissingAsk}'), [ExpandConstant('{userprofile}\ffmpeg'), SizeText]),
+  if MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegMissingAsk}'), [ExpandConstant('{%USERPROFILE}\ffmpeg'), SizeText]),
             mbConfirmation, MB_YESNO) = IDNO then
   begin
     MsgBox(ExpandConstant('{cm:FfmpegSkip}'), mbInformation, MB_OK);
@@ -377,7 +377,7 @@ begin
     exit;
   end;
 
-  BinPath := ExpandConstant('{userprofile}\ffmpeg\bin');
+  BinPath := ExpandConstant('{%USERPROFILE}\ffmpeg\bin');
   EnvAddPath(BinPath);
   { 只记下我们自己加的这一条：用户可能本来就有别的 ffmpeg，卸载不能乱删 }
   RegWriteStringValue(HKEY_CURRENT_USER, 'SOFTWARE\{#AppShortName}', 'FfmpegBin', BinPath);
