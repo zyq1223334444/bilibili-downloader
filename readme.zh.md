@@ -57,14 +57,16 @@ B 站视频 / 分P / 合集下载器：把 DASH 的音、视频分流分别下�
 - 可选把安装目录加入系统 `PATH`（默认勾选），之后任意终端直接敲 `bilibili_downloader`；
   改动之前先把系统 `PATH` 的原值备份进注册表，卸载时**按原值还原**（这期间别人也改过 `PATH` 时
   退化成只摘掉自己那一项，所以原值末尾的 `;`、中间的空项 `;;` 都不会被改坏）
-- **安装过程会顺手把 ffmpeg 也装上**：先检查（进程 `PATH`、系统 `PATH`、用户 `PATH`、`%USERPROFILE%\ffmpeg\bin` 都看一遍），
-  没找到就弹窗说明"缺少 ffmpeg 会导致无法使用完整功能（不能合并、导出 MP3、嵌弹幕）"，
-  并**显示这次要下载的真实大小**（官方 essentials 包当场查出来的字节数，约 114 MB）再问你是否安装，默认"是"。
-  同意后先出现一个**下载页**：有进度条、速度和"停止"按钮，可以随时中止；
+- **安装过程会顺手把 ffmpeg 也装上**：先检查（进程 `PATH`、系统 `PATH`、用户 `PATH`、`%USERPROFILE%\ffmpeg\bin` 都看一遍）。
+  没找到的话，向导里会先出现一页**"ffmpeg 下载源"**（官方源 GitHub 发布页 / 镜像源 `ghfast.top`，国内通常更快；
+  已有 ffmpeg 时这页自动跳过）；点最后一页的"安装"时再弹窗说明"缺少 ffmpeg 会导致无法使用完整功能
+  （不能合并、导出 MP3、嵌弹幕）"，**显示当场查出的真实大小**（约 114 MB）和所选源，默认"是"。
+  同意后出现一个**下载页**：有进度条、速度和"停止"，可以随时中止。**下载途中点"停止"会问要不要换另一个源重下**，
+  下载失败也会问同样一句，换源后从头重来，不会把半截文件当成功。
   下载完成再解压到 `%USERPROFILE%\ffmpeg`（只留 `bin` 里的 `ffmpeg.exe` 等文件），
   并把 `%USERPROFILE%\ffmpeg\bin` 追加到 `PATH`（安装包本身以管理员身份运行，写的是系统 `PATH`），
   同时在 `HKCU\SOFTWARE\bilibili-downloader` 里只记住自己加的这一条。
-  静默安装（`/VERYSILENT`、`/SILENT`）不弹窗，只在日志里记一行，免得无人值守部署永远停在对话框上。
+  静默安装（`/VERYSILENT`、`/SILENT`）不弹窗、也不下载，只在日志里记一行，免得无人值守部署永远停在对话框上。
 - 卸载时只删掉自己加的 `PATH` 条目，**`~\ffmpeg` 里的文件保留**（别的工具可能也在用，重装可直接复用）
 
 ### 方式二：免安装（Windows 单文件 / 压缩包）
@@ -149,8 +151,11 @@ python bilibili_downloader.py BV1xx411c7mD -q 720p --no-mp3 -o D:\videos
 # 只要音频，码率 192k
 python bilibili_downloader.py BV1xx411c7mD --audio-only --mp3-bitrate 192
 
-# 没装 ffmpeg？让它下载官方 Windows 包并装到 ~\ffmpeg（约 114 MB）
+# 没装 ffmpeg？让它下载 Windows 包并装到 ~\ffmpeg（约 114 MB）
 python bilibili_downloader.py --install-ffmpeg
+
+# 国内慢的话指定镜像源（ghfast.top 转发 GitHub 发布页）
+python bilibili_downloader.py --install-ffmpeg --ffmpeg-source mirror
 ```
 
 **首次运行**若没检测到凭证，脚本会打印获取方法并询问一次 `SESSDATA`（输入不回显），
@@ -272,6 +277,7 @@ python bilibili_downloader.py --install-ffmpeg
 | `--reset-sessdata` | 关 | 忽略已保存凭证，重新输入（换号或过期时用） |
 | `--dry-run` | 关 | 只列出计划，不下载 |
 | `--install-ffmpeg` | 关 | 下载 ffmpeg（约 114 MB）到 `~\ffmpeg` 并加入用户 `PATH`（仅 Windows） |
+| `--ffmpeg-source` | `auto` | ffmpeg 下载源：`auto`=官方→镜像→gyan 依次回退，`official`=GitHub 官方，`mirror`=ghfast.top 镜像；指定源连不上仍会退到下一个可用地址 |
 | `--gui` | 关 | 打开图形界面；不带任何参数运行时默认就是它 |
 | `-y, --yes` | 关 | 不询问，直接全部下载（跳过范围选择与凭证重输） |
 
@@ -450,13 +456,16 @@ build/                      构建工具（属于仓库内容）
 安装包用 **Inno Setup 6.5+** 编译：`winget install --id JRSoftware.InnoSetup -e`。
 它在 `[Code]` 里先把系统 `PATH` 原值备份进注册表再修改，卸载时按原值还原（别人改过就只摘掉自己的条目）；
 ffmpeg 部分由 `build/ffmpeg_setup.ps1` 完成（`-Mode Size` 只用 `GET + Range: 0-0` 读 `Content-Range` 拿真实大小，
-`-Mode Install` 下载 + 解压 + 自检）。该脚本刻意保持 ASCII-only（PowerShell 5.1 按 ANSI 读文件）。
+`-Mode Url` 按 `-Source` 返回官方或镜像地址，`-Mode Install` 下载 + 解压 + 自检）。该脚本刻意保持 ASCII-only
+（PowerShell 5.1 按 ANSI 读文件）。
 
 **ffmpeg 从不打包进去** —— 它是约 114 MB 的外部程序，运行时按 `PATH` → `%USERPROFILE%\ffmpeg\bin` 查找。
 Windows 上程序自己会问要不要装（`--install-ffmpeg` 可跳过询问直接装），安装包也会替用户装一次；
 Linux / macOS 得用包管理器单独装。下载地址不是写死的：先用 GitHub API 找到当前版本的同一个
-`*essentials_build.zip`（gyan.dev 官方站在国内实测只有 ~30 KB/s，GitHub 上能到 1 MB/s），
-连不上再自动退回 gyan.dev；提示里显示的大小也是当场查出来的真实字节数。
+`*essentials_build.zip`（gyan.dev 官方站在国内实测只有 ~30 KB/s，GitHub 上能到 1 MB/s，套 `ghfast.top`
+镜像实测 2～3 MB/s）。源可选：`official` 走 GitHub，`mirror` 给地址加 `https://ghfast.top/` 前缀，
+`auto` 依次尝试；哪个连不上就换下一个，安装包下载途中点"停止"也会问要不要换源重来。
+提示里显示的大小也是当场查出来的真实字节数。
 
 > **为什么 Linux/macOS 不能在 Windows 上编**：Nuitka 把 Python 编译成 C，然后调用**目标平台自己的**
 > 编译器/链接器，没有交叉编译。本仓库用 GitHub Actions 在真机上构建 Linux 与两个 macOS 架构，
@@ -492,8 +501,9 @@ Linux / macOS 得用包管理器单独装。下载地址不是写死的：先用
 
 ## 更新日志
 
-见 [CHANGELOG.md](CHANGELOG.md)。当前版本新增了弹幕下载/封装、ffmpeg 自动安装、
-默认保存到桌面，以及 Win11 风格图形界面（分集预览 + 序号输入 + 凭证状态区）。
+见 [CHANGELOG.md](CHANGELOG.md)。2.0.3 新增 ffmpeg 下载源可选（官方 / `ghfast.top` 镜像，装的时候选、
+下载途中可换）；更早的版本带来了弹幕下载/封装、ffmpeg 自动安装、默认保存到桌面，
+以及 Win11 风格图形界面（分集预览 + 序号输入 + 凭证状态区）。
 
 ## 合规声明
 

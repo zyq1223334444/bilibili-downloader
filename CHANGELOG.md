@@ -4,6 +4,29 @@
 
 ---
 
+## 2.0.3 — 2026-11-23
+
+ffmpeg 下载源可选：官方源和 GitHub 镜像源，装的时候能选，下载途中还能换。
+
+### 新增
+
+- **ffmpeg 下载源可选（官方 / 镜像）**：官方源是 GitHub 发布页（Gyan 的 essentials 包），
+  镜像源走 `https://ghfast.top/` 加速（国内实测 2～3 MB/s，官方源约 1.4s 内能连上但容易在中途超时）。
+- **安装包里可以换源**：新增"ffmpeg 下载源"选择页（只在需要装 ffmpeg 时出现）；下载途中点"停止"
+  会问要不要换另一个源重新下，下载失败也会问，换源后从头重下，不会把半截文件当成功。
+- 命令行 `--ffmpeg-source {auto,official,mirror}`：`auto`（默认）依次尝试 官方 → 镜像 → gyan.dev，
+  `official` / `mirror` 以指定源为主，连不上仍会退到下一个可用地址。
+- 图形界面的"安装 ffmpeg"也会先问一句用哪个源，选完再下，失败自动换源。
+
+### 变更
+
+- `ffmpeg_setup.ps1` 新增 `-Source auto|official|mirror`，`Resolve-Url` 按源决定是否套镜像前缀；
+  镜像只对 `https://github.com/` 地址生效，gyan.dev 的兜底地址原样使用。
+- 把"查体积"和"下地址"两条路径统一到按源解析，体积仍是发 `Range: 0-0` 现查，不用猜。
+- 版本号 `2.0.2` → `2.0.3`（`installer.iss` 宏、三个构建脚本的 `--file-version/--product-version`）。
+
+---
+
 ## 2.0.2 — 2026-11-23
 
 150% 缩放下界面与安装包的两处硬伤，外加一个只在安装器里出现的崩溃。

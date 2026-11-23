@@ -69,14 +69,18 @@ Download the latest `bilibili_downloader_setup_<version>.exe` from
   **restores it exactly** (if something else modified `PATH` in the meantime, it degrades to removing only its own
   entry, so a `;;` or trailing `;` in the original value is never mangled).
 - **The installer also takes care of ffmpeg**: it checks the process `PATH`, the system `PATH`, the user `PATH`
-  and `%USERPROFILE%\ffmpeg\bin`; if none has it, a dialog explains that "without ffmpeg the full feature set is
-  unavailable (no muxing, no MP3, no danmaku embedding)", **shows the real download size** (queried live from the
-  official essentials archive, about 114 MB) and asks whether to install it, defaulting to "Yes". On approval a
-  **download page** appears with a progress bar, speed and a "Stop" button, so the download can be cancelled at any
-  time; once it finishes the archive is extracted to `%USERPROFILE%\ffmpeg` (keeping only the files in `bin`), then
+  and `%USERPROFILE%\ffmpeg\bin`. If none has it, a **"ffmpeg download source" page** appears earlier in the wizard
+  (official GitHub release or the `ghfast.top` mirror, usually much faster in mainland China; the page is skipped
+  when ffmpeg is already present); pressing "Install" on the last page then shows a dialog explaining that "without
+  ffmpeg the full feature set is unavailable (no muxing, no MP3, no danmaku embedding)", **the real download size**
+  (queried live, about 114 MB) and the chosen source, defaulting to "Yes". On approval a **download page** appears
+  with a progress bar, speed and a "Stop" button. **Pressing "Stop" during the transfer asks whether to restart
+  from the other source**, and so does a failed download — a switch always restarts from scratch, so a truncated
+  file is never treated as success. Once it finishes the
+  archive is extracted to `%USERPROFILE%\ffmpeg` (keeping only the files in `bin`), then
   `%USERPROFILE%\ffmpeg\bin` is appended to the **system** `PATH` (the installer already runs as administrator) and
   that one entry is remembered in `HKCU\SOFTWARE\bilibili-downloader`. A silent install (`/VERYSILENT`, `/SILENT`)
-  never prompts — it only writes a log line, so unattended deployment cannot hang on a dialog.
+  never prompts and never downloads — it only writes a log line, so unattended deployment cannot hang on a dialog.
 - Uninstalling removes only the `PATH` entry it added and **keeps the files in `~\ffmpeg`** (other tools may use
   them, and a reinstall can reuse them).
 
@@ -166,8 +170,11 @@ python bilibili_downloader.py BV1xx411c7mD -q 720p --no-mp3 -o D:\videos
 # audio only, 192k
 python bilibili_downloader.py BV1xx411c7mD --audio-only --mp3-bitrate 192
 
-# no ffmpeg? download the official Windows build to ~\ffmpeg (about 114 MB)
+# no ffmpeg? download the Windows build to ~\ffmpeg (about 114 MB)
 python bilibili_downloader.py --install-ffmpeg
+
+# slow from GitHub? use the mirror (ghfast.top proxies the same release)
+python bilibili_downloader.py --install-ffmpeg --ffmpeg-source mirror
 ```
 
 **On the first run**, if no credential is found, the script prints how to get one and asks for `SESSDATA` once
@@ -296,6 +303,7 @@ from the decimal RGB in Bilibili's `p` field to ASS `&HBBGGRR&`.
 | `--reset-sessdata` | off | Ignore the stored credential and ask again (new account or expired) |
 | `--dry-run` | off | List the plan only |
 | `--install-ffmpeg` | off | Download ffmpeg (~114 MB) to `~\ffmpeg` and add it to the user `PATH` (Windows only) |
+| `--ffmpeg-source` | `auto` | Where to fetch ffmpeg from: `auto` = official → mirror → gyan.dev, `official` = GitHub release, `mirror` = the `ghfast.top` proxy; a chosen source still falls back to the next reachable address |
 | `--gui` | off | Open the GUI; running with no arguments does the same |
 | `-y, --yes` | off | Never ask: download everything (skips range selection and credential prompts) |
 
@@ -484,15 +492,18 @@ Four flags worth knowing (all learned the hard way; the scripts explain them):
 The installer is compiled with **Inno Setup 6.5+**: `winget install --id JRSoftware.InnoSetup -e`.
 Its `[Code]` section backs up the original system `PATH` into the registry before modifying it and restores it
 byte-for-byte on uninstall; the ffmpeg part is done by `build/ffmpeg_setup.ps1`
-(`-Mode Size` reads the real size via `GET + Range: 0-0` and `Content-Range`, `-Mode Install` downloads, extracts
-and self-tests). That script is deliberately ASCII-only (PowerShell 5.1 reads it as ANSI).
+(`-Mode Size` reads the real size via `GET + Range: 0-0` and `Content-Range`, `-Mode Url` returns the official or
+mirrored address for `-Source`, `-Mode Install` downloads, extracts and self-tests). That script is deliberately
+ASCII-only (PowerShell 5.1 reads it as ANSI).
 
 **ffmpeg is never bundled** — it is an external ~114 MB program, looked up in `PATH` then
 `%USERPROFILE%\ffmpeg\bin`. On Windows the program itself offers to install it (`--install-ffmpeg` skips the
 question) and the installer does it once for the user; on Linux / macOS install it from your package manager.
 The download URL is not hard-coded: the GitHub API is used to find the current `*essentials_build.zip`
-(gyan.dev measured ~30 KB/s from China, GitHub 1 MB/s+), falling back to gyan.dev, and the size shown in the
-prompt is the real byte count queried at that moment.
+(gyan.dev measured ~30 KB/s from China, GitHub 1 MB/s+, the `ghfast.top` mirror 2–3 MB/s). The source is
+selectable: `official` goes to GitHub, `mirror` prefixes `https://ghfast.top/`, `auto` tries them in turn,
+and any unreachable address simply hands over to the next one — pressing "Stop" in the installer offers the
+same switch. The size shown in the prompt is the real byte count queried at that moment.
 
 > **Why Linux/macOS cannot be built on Windows**: Nuitka compiles Python to C and then invokes the **target
 > platform's** compiler and linker — there is no cross-compiling. GitHub Actions builds Linux and both macOS
@@ -536,9 +547,10 @@ prompt is the real byte count queried at that moment.
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). The current release adds danmaku download and embedding, automatic ffmpeg
-installation, Desktop as the default output root, and the Win11-style GUI (episode preview, index input and
-credential status block).
+See [CHANGELOG.md](CHANGELOG.md). 2.0.3 adds a selectable ffmpeg download source (official GitHub release or the
+`ghfast.top` mirror, chosen during setup and switchable mid-download); earlier releases brought danmaku download
+and embedding, automatic ffmpeg installation, Desktop as the default output root, and the Win11-style GUI
+(episode preview, index input and credential status block).
 
 ## Legal
 

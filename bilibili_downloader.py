@@ -39,6 +39,8 @@ B 站视频 / 分P / 合集 下载器（DASH 分流下载 + ffmpeg 合并）
     python bilibili_downloader.py BV1xx411c7mD -j 1                # 串行，显示实时进度条
     python bilibili_downloader.py BV1xx411c7mD --danmaku full --danmaku-video soft
     python bilibili_downloader.py --install-ffmpeg                 # 下载 ffmpeg 到 ~\ffmpeg 并加进 PATH
+    python bilibili_downloader.py --install-ffmpeg --ffmpeg-source mirror   # 走 ghfast.top 镜像
+      源可选 auto（默认，官方→镜像→gyan 依次回退）/ official / mirror
 """
 
 from __future__ import annotations
@@ -153,7 +155,10 @@ DANMAKU_FIXED_SECONDS = 5.0       # 顶部/底部弹幕停留时间
 # ---- ffmpeg 自动安装（只用于 Windows）----
 FFMPEG_ZIP_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 FFMPEG_RELEASE_API = "https://api.github.com/repos/GyanD/codexffmpeg/releases/latest"
+FFMPEG_MIRROR_PREFIX = "https://ghfast.top/"   # GitHub 加速镜像（国内实测最快）
 FFMPEG_FALLBACK_MB = 114          # 查不到远端大小时的兜底提示值（essentials 约 114 MB）
+FFMPEG_SOURCES = ("auto", "official", "mirror")
+FFMPEG_SOURCE = "auto"            # 由 --ffmpeg-source / GUI 设置；auto = 官方 → 镜像 → gyan.dev
 
 
 def _app_dir() -> Path:
@@ -1349,14 +1354,8 @@ def _add_user_path(directory: Path) -> bool:
     return True
 
 
-@lru_cache(maxsize=1)
-def resolve_ffmpeg_archive(timeout: float = 20.0) -> tuple[str, int]:
-    """返回 (下载地址, 字节数)。
-
-    gyan.dev 是官方发布页，但国内实测只有 ~30 KB/s（114 MB 要一个多小时）；同一个包放在
-    GitHub Releases 上能跑到 1 MB/s 以上。所以先用 GitHub API 解析出当前的
-    `*essentials_build.zip`（名字带版本号，不能写死），失败再退回 gyan.dev 的固定地址。
-    """
+def _github_asset(timeout: float = 20.0) -> tuple[str, int]:
+    """通过 GitHub API 拿到当前 essentials 包地址和字节数，失败返回空串。"""
     try:
         resp = requests.get(FFMPEG_RELEASE_API, headers={"User-Agent": USER_AGENT},
                             timeout=timeout)
@@ -1364,47 +1363,98 @@ def resolve_ffmpeg_archive(timeout: float = 20.0) -> tuple[str, int]:
         for asset in (resp.json().get("assets") or []):
             name = str(asset.get("name") or "")
             url = str(asset.get("browser_download_url") or "")
-            size = int(asset.get("size") or 0)
             if url and name.endswith("essentials_build.zip"):
-                return url, size
+                return url, int(asset.get("size") or 0)
     except Exception:
         pass
+    return "", 0
+
+
+def _mirror_url(url: str) -> str:
+    """GitHub 地址套一层镜像；非 GitHub 地址原样返回。"""
+    if url.startswith("https://github.com/"):
+        return FFMPEG_MIRROR_PREFIX + url
+    return url
+
+
+@lru_cache(maxsize=8)
+def resolve_ffmpeg_archive(source: str = "auto", timeout: float = 20.0) -> tuple[str, int]:
+    """返回 (下载地址, 字节数)。
+
+    gyan.dev 是官方发布页，但国内实测只有 ~30 KB/s（114 MB 要一个多小时）；同一个包放在
+    GitHub Releases 上能跑到 1 MB/s 以上，走 ghfast.top 镜像还能到 2～3 MB/s。所以先用
+    GitHub API 解析出当前的 `*essentials_build.zip`（名字带版本号，不能写死），
+    source=mirror 时给地址套镜像，API 失败再退回 gyan.dev 的固定地址。
+    """
+    url, size = _github_asset(timeout)
+    if url:
+        if source == "mirror":
+            url = _mirror_url(url)
+        return url, size
     return FFMPEG_ZIP_URL, remote_file_size(FFMPEG_ZIP_URL)
 
 
-def _download_ffmpeg_archive(dest: Path, size: int) -> None:
-    """先试 GitHub 上的同一份包（国内快得多），失败再退回 gyan.dev 官方站点。
+def ffmpeg_archive_candidates(source: str) -> list[tuple[str, int]]:
+    """按所选源排出候选地址：auto 官方 → 镜像 → gyan.dev，其余只走指定源再兜底。"""
+    official, size = _github_asset()
+    if not official:                      # API 不通：只剩 gyan.dev，镜像无从谈起
+        official = FFMPEG_ZIP_URL
+        size = 0
+    mirror = _mirror_url(official)
+    if source == "mirror":
+        order = [mirror, official]
+    elif source == "official":
+        order = [official]
+    else:
+        order = [official, mirror]
+    urls = [(url, size if url in (official, mirror) else 0) for url in order]
+    if FFMPEG_ZIP_URL not in [url for url, _ in urls]:
+        urls.append((FFMPEG_ZIP_URL, 0))
+    seen, out = set(), []
+    for url, length in urls:
+        if url not in seen:
+            seen.add(url)
+            out.append((url, length))
+    return out
 
-    GitHub 在国内时通时不通（实测跑一会儿就会 connect timeout），所以两条路都要留。
+
+def _download_ffmpeg_archive(dest: Path, size: int, source: str | None = None) -> None:
+    """按所选源依次尝试；一个地址没连上就换下一个（auto 会把官方、镜像、gyan 都试一遍）。
+
+    下载途中用户点"停止"（GUI/CLI 的 Aborted）不算地址问题，直接抛出去，不再试别的源。
     """
-    primary, _ = resolve_ffmpeg_archive()
-    urls = [primary] + ([FFMPEG_ZIP_URL] if primary != FFMPEG_ZIP_URL else [])
+    source = source or FFMPEG_SOURCE
+    candidates = ffmpeg_archive_candidates(source)
+    labels = {"auto": "自动", "official": "官方源", "mirror": "镜像源"}
     last: Exception | None = None
-    for index, url in enumerate(urls):
+    for index, (url, length) in enumerate(candidates):
         try:
             _download_with_progress(url, dest, label="ffmpeg",
-                                    total=size if index == 0 else 0)
+                                    total=length or (size if index == 0 else 0))
             return
         except Aborted:
             raise
         except Exception as exc:
             last = exc
-            if index + 1 < len(urls):
-                emit(f"[ffmpeg] 这个地址没连上（{short_error(exc, 120)}），"
-                     "换官方站点再试一次")
+            if index + 1 < len(candidates):
+                emit(f"[ffmpeg] {labels.get(source, source)}：这个地址没连上"
+                     f"（{short_error(exc, 120)}），换下一个再试")
     raise DownloadError(f"ffmpeg 下载失败：{short_error(last)}")
 
 
-def install_ffmpeg(target: Path | None = None) -> str:
+def install_ffmpeg(target: Path | None = None, source: str | None = None) -> str:
     """下载 ffmpeg 到 ~\ffmpeg 并加入用户 PATH（Windows）。
 
     用 gyan.dev 的 essentials 构建：libmp3lame / libx264 / libass 都在里面，
-    体积又比 gpl 全家桶小一半；安装包的 [Code] 走同一个包，两边行为一致。
+    体积又比 gpl 全家桶小一半。下载源由 source 决定（auto/official/mirror），
+    和安装包里的选择页走同一份包，两边行为一致。
     """
     if os.name != "nt":
         raise DownloadError("自动安装只支持 Windows；"
                             "Linux 用 sudo apt install ffmpeg，macOS 用 brew install ffmpeg")
 
+    source = source or FFMPEG_SOURCE
+    source_label = {"auto": "自动选择", "official": "官方源", "mirror": "镜像源"}.get(source, source)
     root = (target or Path.home() / "ffmpeg").expanduser()
     bin_dir = root / "bin"
     exe_path = bin_dir / "ffmpeg.exe"
@@ -1413,14 +1463,14 @@ def install_ffmpeg(target: Path | None = None) -> str:
         find_ffmpeg.cache_clear()
         return f"已存在：{exe_path}（已确保在用户 PATH 中）"
 
-    _, size = resolve_ffmpeg_archive()
+    _, size = resolve_ffmpeg_archive("official" if source != "mirror" else "mirror")
     shown = human_size(size) if size else f"约 {FFMPEG_FALLBACK_MB} MB"
-    emit(f"[ffmpeg] 开始下载（{shown}）→ {bin_dir}")
+    emit(f"[ffmpeg] 开始下载（{shown}，{source_label}）→ {bin_dir}")
 
     work = Path(tempfile.mkdtemp(prefix="bili_ffmpeg_"))
     try:
         archive = work / "ffmpeg.zip"
-        _download_ffmpeg_archive(archive, size)
+        _download_ffmpeg_archive(archive, size, source)
 
         extract = work / "unzip"
         with zipfile.ZipFile(archive) as zf:
@@ -2104,6 +2154,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="只列出计划，不下载")
     parser.add_argument("--install-ffmpeg", action="store_true",
                         help="下载 ffmpeg 到 ~\\ffmpeg 并加入用户 PATH（仅 Windows）")
+    parser.add_argument("--ffmpeg-source", choices=FFMPEG_SOURCES, default="auto",
+                        help="ffmpeg 下载源：auto=官方→镜像→gyan 依次回退（默认），"
+                             "official=只走 GitHub 官方，mirror=走 ghfast.top 镜像")
     parser.add_argument("--gui", action="store_true",
                         help="打开图形界面（不带任何参数运行时默认就是图形界面）")
     parser.add_argument("-y", "--yes", action="store_true", help="不询问，直接开始")
@@ -2181,8 +2234,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _main_impl(argv: Sequence[str] | None = None) -> int:
+    global FFMPEG_SOURCE
     _setup_console()
     args = parse_args(argv)
+    FFMPEG_SOURCE = args.ffmpeg_source      # 命令行选定的 ffmpeg 源，后续安装都用它
 
     if args.install_ffmpeg:              # 独立动作：装完就结束，不进入下载流程
         try:
@@ -2456,8 +2511,9 @@ GUI_HELP_TEXT = """B 站视频下载器 · 图形界面帮助
 
 【ffmpeg】
 合并音视频、导出 MP3、给视频加弹幕都依赖 ffmpeg。窗口里会显示是否已找到；
-没有时点"安装 ffmpeg"，会下载官方构建到 ~\\ffmpeg 并加入用户 PATH（会先告诉你实际大小）。
-也可以命令行运行 bilibili_downloader --install-ffmpeg。
+没有时点"安装 ffmpeg"，会先把实际大小告诉你，再让你选下载源（官方源 / ghfast.top 镜像源），
+装到 ~\\ffmpeg 并加入用户 PATH。首选源连不上会自动换另一个，不会白等。
+也可以命令行运行 bilibili_downloader --install-ffmpeg [--ffmpeg-source mirror]。
 
 【保存结构】
 默认保存到桌面：桌面\\<视频标题>\\<视频标题>.mp4（软字幕模式则是 .mkv）、.mp3、
@@ -3272,14 +3328,22 @@ def run_gui() -> int:
             ff_install_btn.pack(side="left", padx=(px(10), 0))
 
     def install_clicked() -> None:
+        global FFMPEG_SOURCE
         _, size = resolve_ffmpeg_archive()
         shown = human_size(size) if size else f"约 {FFMPEG_FALLBACK_MB} MB"
-        if not messagebox.askyesno(
-                "安装 ffmpeg",
-                "没有 ffmpeg 会导致无法使用完整功能（不能合并音视频、导出 MP3、嵌入弹幕）。\n\n"
-                f"大小：{shown}\n安装到：{Path.home() / 'ffmpeg'}\n"
-                "并自动加入用户 PATH。\n\n现在开始下载安装？"):
+        # 三态：是=镜像源，否=官方源，取消=不装（auto 会在失败时自动换源，这里先给个倾向）
+        choice = messagebox.askyesnocancel(
+            "安装 ffmpeg",
+            "没有 ffmpeg 会导致无法使用完整功能（不能合并音视频、导出 MP3、嵌入弹幕）。\n\n"
+            f"大小：{shown}\n安装到：{Path.home() / 'ffmpeg'}\n"
+            "并自动加入用户 PATH。\n\n下载源：\n"
+            "    是 → 镜像源（ghfast.top，国内通常更快）\n"
+            "    否 → 官方源（GitHub 发布页）\n"
+            "    取消 → 不安装\n\n"
+            "（首选源连不上会自动换另一个，不会白等）")
+        if choice is None:
             return
+        FFMPEG_SOURCE = "mirror" if choice else "official"
         status_var.set("正在下载 ffmpeg…（可在日志里看进度）")
 
         def job() -> None:

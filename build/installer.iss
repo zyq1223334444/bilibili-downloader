@@ -41,7 +41,7 @@
 
 #define AppName        "Bilibili Downloader"
 #define AppShortName   "bilibili-downloader"
-#define AppVersion     "2.0.2"
+#define AppVersion     "2.0.3"
 #define AppPublisher   "zyq1223334444"
 #define AppURL         "https://github.com/zyq1223334444/bilibili-downloader"
 #define ExeName        "bilibili_downloader.exe"
@@ -85,7 +85,14 @@ chinesesimplified.AdditionalIcons=附加图标：
 chinesesimplified.ModifyPath=把安装目录加入系统 PATH（可在任意终端直接运行 bilibili_downloader）
 chinesesimplified.PathGroup=环境变量：
 chinesesimplified.HelpShortcut=命令行帮助
-chinesesimplified.FfmpegMissingAsk=没有检测到 ffmpeg。%n%n缺少 ffmpeg 会导致无法使用完整功能：不能合并音视频、导出 MP3，也不能把弹幕放进视频。%n%n是否现在下载并安装到：%n%1%n%n下载大小：%2
+chinesesimplified.FfmpegMissingAsk=没有检测到 ffmpeg。%n%n缺少 ffmpeg 会导致无法使用完整功能：不能合并音视频、导出 MP3，也不能把弹幕放进视频。%n%n是否现在下载并安装到：%n%1%n%n下载大小：%2%n下载源：%3
+chinesesimplified.FfmpegSourceTitle=ffmpeg 下载源
+chinesesimplified.FfmpegSourceDesc=装好 ffmpeg 才能合并音视频、导出 MP3、把弹幕封进视频。请选择从哪下载。
+chinesesimplified.FfmpegSourceSub=（下载途中点“停止”，会再问你要不要换另一个源重新下）
+chinesesimplified.FfmpegSourceOfficial=官方源（GitHub 发布页，速度取决于网络）
+chinesesimplified.FfmpegSourceMirror=镜像源（ghfast.top 加速，国内通常更快）
+chinesesimplified.FfmpegSwitchAsk=已停止下载。改用%1重新开始吗？
+chinesesimplified.FfmpegRetryAsk=从%1下载失败：%2%n%n改用%3重试吗？
 chinesesimplified.FfmpegPageTitle=正在下载 ffmpeg
 chinesesimplified.FfmpegPageDesc=缺少 ffmpeg，正在从官方源下载。下载完成后会自动解压并加入 PATH，可随时点“停止下载”。
 chinesesimplified.FfmpegFailDetail=ffmpeg 下载或安装失败：%1%n%n也可以稍后运行 bilibili_downloader --install-ffmpeg 重试。
@@ -97,7 +104,14 @@ english.AdditionalIcons=Additional icons:
 english.ModifyPath=Add the install folder to the system PATH (run bilibili_downloader from any terminal)
 english.PathGroup=Environment:
 english.HelpShortcut=Command-line help
-english.FfmpegMissingAsk=ffmpeg was not found.%n%nWithout it the app cannot merge audio/video, export MP3 or embed danmaku.%n%nDownload and install it to:%n%1%n%nDownload size: %2
+english.FfmpegMissingAsk=ffmpeg was not found.%n%nWithout it the app cannot merge audio/video, export MP3 or embed danmaku.%n%nDownload and install it to:%n%1%n%nDownload size: %2%nSource: %3
+english.FfmpegSourceTitle=ffmpeg download source
+english.FfmpegSourceDesc=ffmpeg is needed to merge audio/video, export MP3 and embed danmaku. Choose where to download it from.
+english.FfmpegSourceSub=(Pressing "Stop" during the download asks whether to retry from the other source.)
+english.FfmpegSourceOfficial=Official (GitHub release page; speed depends on your network)
+english.FfmpegSourceMirror=Mirror (ghfast.top proxy; usually faster in mainland China)
+english.FfmpegSwitchAsk=Download stopped. Restart from %1?
+english.FfmpegRetryAsk=Download from %1 failed: %2%n%nRetry from %3?
 english.FfmpegPageTitle=Downloading ffmpeg
 english.FfmpegPageDesc=ffmpeg is missing, so it is being downloaded from the official source. It will be unpacked and added to PATH automatically; you can stop the download at any time.
 english.FfmpegFailDetail=ffmpeg download or installation failed: %1%n%nYou can also run bilibili_downloader --install-ffmpeg later.
@@ -135,14 +149,27 @@ const
 
 var
   DownloadPage: TDownloadWizardPage;
+  FfmpegSourcePage: TInputOptionWizardPage;
+  FfmpegSource: string;
 
 { 下载页用 Inno 6.2+ 自带的 TDownloadWizardPage：它有原生进度条、速度和
-  停止按钮，比之前"后台脚本静默下载 + 一个假进度提示框"可靠得多。 }
+  停止按钮，比"后台脚本静默下载 + 一个假进度提示框"可靠得多。
+  源选择单独一页（官方 / ghfast.top 镜像），只在真的缺 ffmpeg 时出现。 }
 procedure InitializeWizard;
 begin
   DownloadPage := CreateDownloadPage(ExpandConstant('{cm:FfmpegPageTitle}'),
                                      ExpandConstant('{cm:FfmpegPageDesc}'), nil);
   DownloadPage.ShowBaseNameInsteadOfUrl := True;
+
+  { 源选择页必须排在 wpReady 之前：真正的下载由 NextButtonClick(wpReady) 触发，
+    页面若挂在 wpReady 之后，用户选完源点"安装"时这一步已经过去了。 }
+  FfmpegSourcePage := CreateInputOptionPage(wpSelectDir,
+    ExpandConstant('{cm:FfmpegSourceTitle}'),
+    ExpandConstant('{cm:FfmpegSourceDesc}'),
+    ExpandConstant('{cm:FfmpegSourceSub}'), True, False);
+  FfmpegSourcePage.Add(ExpandConstant('{cm:FfmpegSourceOfficial}'));
+  FfmpegSourcePage.Add(ExpandConstant('{cm:FfmpegSourceMirror}'));
+  FfmpegSourcePage.Values[0] := True;
 end;
 
 { 把安装目录加进系统 PATH。加之前先把原始值备份进注册表：
@@ -236,6 +263,12 @@ begin
   Result := FileSearch('ffmpeg.exe', Paths) <> '';
 end;
 
+{ ffmpeg 已经在 PATH 里、或者静默安装时，源选择页没必要出现 }
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := (PageID = FfmpegSourcePage.ID) and (FfmpegOnPath() or WizardSilent);
+end;
+
 function FormatSize(Bytes: Int64): string;
 var
   Tenths: Int64;
@@ -269,28 +302,43 @@ end;
 { 向下载站点查真实体积：提示里的"大小"必须是当前版本的实际大小，不能写死。
   地址由 ffmpeg_setup.ps1 自己解析（先用 GitHub API 找同名资产，国内快得多；
   解析不到才退回 gyan.dev），所以这里不传 -Url。 }
-function QueryFfmpegSize(): Int64;
+function OtherSource(const Source: string): string;
+begin
+  if Source = 'mirror' then
+    Result := 'official'
+  else
+    Result := 'mirror';
+end;
+
+function SourceLabel(const Source: string): string;
+begin
+  if Source = 'mirror' then
+    Result := ExpandConstant('{cm:FfmpegSourceMirror}')
+  else
+    Result := ExpandConstant('{cm:FfmpegSourceOfficial}');
+end;
+function QueryFfmpegSize(const Source: string): Int64;
 var
   SizeFile: string;
 begin
   Result := 0;
   SizeFile := ExpandConstant('{tmp}\ffmpeg_size.txt');
   DeleteFile(SizeFile);
-  if RunSetupScript('-Mode Size -OutFile "' + SizeFile + '"') <> 0 then
+  if RunSetupScript('-Mode Size -Source ' + Source + ' -OutFile "' + SizeFile + '"') <> 0 then
     exit;
   Result := StrToInt64Def(ReadFirstLine(SizeFile), 0);
   DeleteFile(SizeFile);
 end;
 
 { 解析当前版本的下载地址（版本号在文件名里，不能写死） }
-function ResolveFfmpegUrl(): string;
+function ResolveFfmpegUrl(const Source: string): string;
 var
   UrlFile: string;
 begin
   Result := '';
   UrlFile := ExpandConstant('{tmp}\ffmpeg_url.txt');
   DeleteFile(UrlFile);
-  if RunSetupScript('-Mode Url -OutFile "' + UrlFile + '"') <> 0 then
+  if RunSetupScript('-Mode Url -Source ' + Source + ' -OutFile "' + UrlFile + '"') <> 0 then
     exit;
   Result := ReadFirstLine(UrlFile);
   DeleteFile(UrlFile);
@@ -319,7 +367,8 @@ end;
 procedure TryInstallFfmpeg();
 var
   Size: Int64;
-  SizeText, Url, Zip, BinPath: string;
+  SizeText, Url, Zip, BinPath, Err, Other: string;
+  Downloaded: Boolean;
 begin
   if FfmpegOnPath() then
     exit;
@@ -334,41 +383,74 @@ begin
   { [Files] 里的 dontcopy 文件不会自动落到临时目录，用之前先手动解出来 }
   ExtractTemporaryFile('ffmpeg_setup.ps1');
 
-  Size := QueryFfmpegSize();
+  if FfmpegSourcePage.Values[1] then
+    FfmpegSource := 'mirror'
+  else
+    FfmpegSource := 'official';
+
+  Size := QueryFfmpegSize(FfmpegSource);
   if Size > 0 then
     SizeText := FormatSize(Size)
   else
     SizeText := '约 114 MB';
 
-  if MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegMissingAsk}'), [ExpandConstant('{%USERPROFILE}\ffmpeg'), SizeText]),
+  if MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegMissingAsk'), [ExpandConstant('{%USERPROFILE}\ffmpeg'), SizeText, SourceLabel(FfmpegSource)]),
             mbConfirmation, MB_YESNO) = IDNO then
   begin
     MsgBox(ExpandConstant('{cm:FfmpegSkip}'), mbInformation, MB_OK);
     exit;
   end;
 
-  Url := ResolveFfmpegUrl();
-  if Url = '' then
-  begin
-    MsgBox(ExpandConstant('{cm:FfmpegFailed}'), mbError, MB_OK);
-    exit;
-  end;
-
   Zip := ExpandConstant('{tmp}\ffmpeg-essentials.zip');
-  DownloadPage.Clear;
-  { 第三个参数是期望的 SHA256（空串则只校验长度/不校验），不是大小 }
-  DownloadPage.Add(Url, 'ffmpeg-essentials.zip', '');
-  DownloadPage.Show;
-  try
-    try
-      DownloadPage.Download;                       { 异常即失败，进度页自己处理联网错误 }
-    except
-      MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegFailDetail}'), [GetExceptionMessage]),
-             mbError, MB_OK);
+  while True do
+  begin
+    Url := ResolveFfmpegUrl(FfmpegSource);
+    if Url = '' then
+    begin
+      MsgBox(ExpandConstant('{cm:FfmpegFailed}'), mbError, MB_OK);
       exit;
     end;
-  finally
-    DownloadPage.Hide;
+
+    DeleteFile(Zip);
+    DownloadPage.Clear;
+    { 第三个参数是期望的 SHA256（空串则不校验内容），不是大小 }
+    DownloadPage.Add(Url, 'ffmpeg-essentials.zip', '');
+    DownloadPage.Show;
+    Downloaded := False;
+    try
+      try
+        DownloadPage.Download;
+        Downloaded := True;
+      except
+        Err := GetExceptionMessage;
+        Other := OtherSource(FfmpegSource);
+        if DownloadPage.AbortedByUser then
+        begin
+          { 用户按了"停止"：这就是下载途中的换源入口 }
+          if MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegSwitchAsk'), [SourceLabel(Other)]),
+                    mbConfirmation, MB_YESNO) = IDYES then
+            FfmpegSource := Other
+          else
+            exit;
+        end
+        else
+        begin
+          if MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegRetryAsk'), [SourceLabel(FfmpegSource), Err, SourceLabel(Other)]),
+                    mbConfirmation, MB_YESNO) = IDYES then
+            FfmpegSource := Other
+          else
+          begin
+            MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegFailDetail}'), [Err]), mbError, MB_OK);
+            exit;
+          end;
+        end;
+      end;
+    finally
+      DownloadPage.Hide;
+    end;
+
+    if Downloaded then
+      Break;
   end;
 
   if not ExtractFfmpeg(Zip) then
@@ -381,9 +463,8 @@ begin
   EnvAddPath(BinPath);
   { 只记下我们自己加的这一条：用户可能本来就有别的 ffmpeg，卸载不能乱删 }
   RegWriteStringValue(HKEY_CURRENT_USER, 'SOFTWARE\{#AppShortName}', 'FfmpegBin', BinPath);
-  MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegDone}'), [BinPath]), mbInformation, MB_OK);
+  MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegDone'), [BinPath]), mbInformation, MB_OK);
 end;
-
 { 点"安装"（Ready 页的下一步）时先把 ffmpeg 处理掉，再进入正式复制文件。
   外层 try 兜底：任何意外都变成一条出错提示，而不是 Inno 的 "Runtime error"。 }
 function NextButtonClick(CurPageID: Integer): Boolean;

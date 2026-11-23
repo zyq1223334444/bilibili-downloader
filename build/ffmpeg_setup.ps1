@@ -2,14 +2,18 @@
 #  ffmpeg_setup.ps1 -- resolve / extract ffmpeg for bilibili-downloader
 #
 #  Called by installer.iss while the setup is running. The actual download
-#  is done by Inno Setup itself (TDownloadWizardPage) so the user sees a
-#  real progress bar and can stop it; this script only does the small,
-#  non-blocking jobs around it:
+#  is done by Inno Setup itself (a progress page with a stop button), so this
+#  script only does the small, non-blocking jobs around it:
 #
 #      -Mode Url      write the resolved archive URL into -OutFile
 #      -Mode Size     write the archive's real size into -OutFile
 #      -Mode Extract  unpack the already downloaded -Zip into <Dest>\bin
 #      -Mode Install  download + extract in one go (standalone use)
+#
+#  -Source official  GitHub release asset (what Gyan publishes)
+#  -Source mirror    same asset through https://ghfast.top, which is usable
+#                    from mainland China without a proxy
+#  -Source auto      official; if that cannot be resolved, gyan.dev
 #
 #  Size must query the live URL (the installer shows that number before
 #  asking), never a hardcoded guess.
@@ -20,6 +24,8 @@
 param(
     [ValidateSet('Url', 'Size', 'Extract', 'Install')]
     [string]$Mode = 'Size',
+    [ValidateSet('auto', 'official', 'mirror')]
+    [string]$Source = 'auto',
     [string]$Url = '',
     [string]$Zip = '',
     [string]$Dest = '',
@@ -33,6 +39,8 @@ $ErrorActionPreference = 'Stop'
 # is resolved through the GitHub API first (same archive, an order of magnitude faster).
 $FallbackUrl = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
 $ReleaseApi = 'https://api.github.com/repos/GyanD/codexffmpeg/releases/latest'
+# ghfast.top proxies GitHub releases; measured ~4x faster than github.com from CN.
+$MirrorPrefix = 'https://ghfast.top/'
 
 function Write-Out([string]$Text) {
     if ($OutFile) {
@@ -43,17 +51,26 @@ function Write-Out([string]$Text) {
 # Resolve the current essentials zip. Its asset name carries the version (9.1),
 # so it cannot be hardcoded; query the API and fall back to $FallbackUrl.
 function Resolve-Url {
-    if ($Url) { return $Url }
-    try {
-        $headers = @{ 'User-Agent' = 'bilibili-downloader-setup' }
-        $resp = Invoke-WebRequest -Uri $ReleaseApi -Headers $headers -UseBasicParsing -TimeoutSec 20
-        $json = $resp.Content | ConvertFrom-Json
-        $asset = $json.assets | Where-Object { $_.name -like '*essentials_build.zip' } |
-                 Select-Object -First 1
-        if ($asset -and $asset.browser_download_url) { return [string]$asset.browser_download_url }
+    $base = ''
+    if ($Url) {
+        $base = $Url
     }
-    catch { }
-    return $FallbackUrl
+    else {
+        try {
+            $headers = @{ 'User-Agent' = 'bilibili-downloader-setup' }
+            $resp = Invoke-WebRequest -Uri $ReleaseApi -Headers $headers -UseBasicParsing -TimeoutSec 20
+            $json = $resp.Content | ConvertFrom-Json
+            $asset = $json.assets | Where-Object { $_.name -like '*essentials_build.zip' } |
+                     Select-Object -First 1
+            if ($asset -and $asset.browser_download_url) { $base = [string]$asset.browser_download_url }
+        }
+        catch { }
+        if (-not $base) { $base = $FallbackUrl }
+    }
+    if ($Source -eq 'mirror' -and $base -like 'https://github.com/*') {
+        return $MirrorPrefix + $base
+    }
+    return $base
 }
 
 # Copy the archive's bin\ folder into <Dest>\bin, then make sure the copy starts.
