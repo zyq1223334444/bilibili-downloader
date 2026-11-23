@@ -1,10 +1,10 @@
 # 版本变更记录
 
-本项目从 `1.1.0` 起按「新增 / 变更 / 修复」分类记录；`1.0.0` 是首个发布版，只列主要能力。
+本项目从 `2.0.0` 起按「新增 / 变更 / 修复」分类记录；`1.0.0` 是首个发布版，只列主要能力。
 
 ---
 
-## 1.1.0 — 2026-11-23
+## 2.0.0 — 2026-11-23
 
 弹幕、ffmpeg 自举、桌面默认目录，以及一次彻底的图形界面重写。
 
@@ -46,7 +46,7 @@
 - 构建脚本带 `--enable-plugin=tk-inter`，并先试 `import tkinter`，缺了给出补装说明；
   `build_unix.sh` 在无 tcl/tk 时降级为只编命令行版，避免 CI 挂掉。
 - 安装包的安装目录 `PATH` 条目改为"先备份原值、卸载时按原值还原"，别人中途改过就退化成只摘自己那一项。
-- 版本号 `1.0.0` → `1.1.0`（`installer.iss` 宏、三个构建脚本的 `--file-version/--product-version`）。
+- 版本号 `1.0.0` → `2.0.0`（`installer.iss` 宏、三个构建脚本的 `--file-version/--product-version`）。
 - `.gitattributes` 增加 `*.ps1 text eol=crlf`，两处 README 的安装包文件名改为版本无关的
   `bilibili_downloader_setup_<版本>.exe`。
 

@@ -3,7 +3,7 @@ rem =====================================================================
 rem  bilibili-downloader -- Windows installer (setup .exe)
 rem
 rem  Run:      build\build_installer.bat
-rem  Produces: build\out\dist_installer\bilibili_downloader_setup_1.1.0.exe
+rem  Produces: build\out\dist_installer\bilibili_downloader_setup_2.0.0.exe
 rem
 rem  It packages the *standalone folder* build, never the onefile exe: the
 rem  folder build returns the exact exit code 130 on Ctrl+C and starts about
