@@ -41,7 +41,7 @@
 
 #define AppName        "Bilibili Downloader"
 #define AppShortName   "bilibili-downloader"
-#define AppVersion     "2.0.3"
+#define AppVersion     "2.0.4"
 #define AppPublisher   "zyq1223334444"
 #define AppURL         "https://github.com/zyq1223334444/bilibili-downloader"
 #define ExeName        "bilibili_downloader.exe"
@@ -94,7 +94,7 @@ chinesesimplified.FfmpegSourceMirror=镜像源（ghfast.top 加速，国内通�
 chinesesimplified.FfmpegSwitchAsk=已停止下载。改用%1重新开始吗？
 chinesesimplified.FfmpegRetryAsk=从%1下载失败：%2%n%n改用%3重试吗？
 chinesesimplified.FfmpegPageTitle=正在下载 ffmpeg
-chinesesimplified.FfmpegPageDesc=缺少 ffmpeg，正在从官方源下载。下载完成后会自动解压并加入 PATH，可随时点“停止下载”。
+chinesesimplified.FfmpegPageDesc=缺少 ffmpeg，正在下载。下载完成后会自动解压并加入 PATH，可随时点“停止下载”；停止后会问你要不要换另一个源。
 chinesesimplified.FfmpegFailDetail=ffmpeg 下载或安装失败：%1%n%n也可以稍后运行 bilibili_downloader --install-ffmpeg 重试。
 chinesesimplified.FfmpegDone=ffmpeg 已安装到：%n%1%n%n该目录已加入系统 PATH，新开的命令行窗口里可以直接使用 ffmpeg。
 chinesesimplified.FfmpegFailed=ffmpeg 自动安装失败（可能是网络不通）。%n%n可以稍后运行 bilibili_downloader --install-ffmpeg 重试，%n或用 winget install Gyan.FFmpeg / choco install ffmpeg 手动安装。
@@ -113,7 +113,7 @@ english.FfmpegSourceMirror=Mirror (ghfast.top proxy; usually faster in mainland 
 english.FfmpegSwitchAsk=Download stopped. Restart from %1?
 english.FfmpegRetryAsk=Download from %1 failed: %2%n%nRetry from %3?
 english.FfmpegPageTitle=Downloading ffmpeg
-english.FfmpegPageDesc=ffmpeg is missing, so it is being downloaded from the official source. It will be unpacked and added to PATH automatically; you can stop the download at any time.
+english.FfmpegPageDesc=ffmpeg is missing, so it is being downloaded. It will be unpacked and added to PATH automatically; you can stop at any time and will then be asked whether to retry from the other source.
 english.FfmpegFailDetail=ffmpeg download or installation failed: %1%n%nYou can also run bilibili_downloader --install-ffmpeg later.
 english.FfmpegDone=ffmpeg installed to:%n%1%n%nThat folder was added to the system PATH; a new terminal can run ffmpeg directly.
 english.FfmpegFailed=Automatic ffmpeg installation failed (probably no network).%n%nRun bilibili_downloader --install-ffmpeg later, or install manually with winget install Gyan.FFmpeg / choco install ffmpeg.
@@ -169,7 +169,7 @@ begin
     ExpandConstant('{cm:FfmpegSourceSub}'), True, False);
   FfmpegSourcePage.Add(ExpandConstant('{cm:FfmpegSourceOfficial}'));
   FfmpegSourcePage.Add(ExpandConstant('{cm:FfmpegSourceMirror}'));
-  FfmpegSourcePage.Values[0] := True;
+  FfmpegSourcePage.Values[1] := True;   { 默认镜像源：GitHub 直连在国内经常卡在 0 字节 }
 end;
 
 { 把安装目录加进系统 PATH。加之前先把原始值备份进注册表：
@@ -394,7 +394,7 @@ begin
   else
     SizeText := '约 114 MB';
 
-  if MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegMissingAsk'), [ExpandConstant('{%USERPROFILE}\ffmpeg'), SizeText, SourceLabel(FfmpegSource)]),
+  if MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegMissingAsk}'), [ExpandConstant('{%USERPROFILE}\ffmpeg'), SizeText, SourceLabel(FfmpegSource)]),
             mbConfirmation, MB_YESNO) = IDNO then
   begin
     MsgBox(ExpandConstant('{cm:FfmpegSkip}'), mbInformation, MB_OK);
@@ -427,7 +427,7 @@ begin
         if DownloadPage.AbortedByUser then
         begin
           { 用户按了"停止"：这就是下载途中的换源入口 }
-          if MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegSwitchAsk'), [SourceLabel(Other)]),
+          if MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegSwitchAsk}'), [SourceLabel(Other)]),
                     mbConfirmation, MB_YESNO) = IDYES then
             FfmpegSource := Other
           else
@@ -435,7 +435,7 @@ begin
         end
         else
         begin
-          if MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegRetryAsk'), [SourceLabel(FfmpegSource), Err, SourceLabel(Other)]),
+          if MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegRetryAsk}'), [SourceLabel(FfmpegSource), Err, SourceLabel(Other)]),
                     mbConfirmation, MB_YESNO) = IDYES then
             FfmpegSource := Other
           else
@@ -463,7 +463,7 @@ begin
   EnvAddPath(BinPath);
   { 只记下我们自己加的这一条：用户可能本来就有别的 ffmpeg，卸载不能乱删 }
   RegWriteStringValue(HKEY_CURRENT_USER, 'SOFTWARE\{#AppShortName}', 'FfmpegBin', BinPath);
-  MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegDone'), [BinPath]), mbInformation, MB_OK);
+  MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegDone}'), [BinPath]), mbInformation, MB_OK);
 end;
 { 点"安装"（Ready 页的下一步）时先把 ffmpeg 处理掉，再进入正式复制文件。
   外层 try 兜底：任何意外都变成一条出错提示，而不是 Inno 的 "Runtime error"。 }

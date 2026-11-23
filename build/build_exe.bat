@@ -97,7 +97,7 @@ python -m nuitka --standalone --onefile --msvc=latest ^
     --windows-console-mode=force ^
     --company-name="zyq1223334444" ^
     --product-name="Bilibili Downloader" ^
-    --file-version=2.0.3.0 --product-version=2.0.3.0 ^
+    --file-version=2.0.4.0 --product-version=2.0.4.0 ^
     --file-description="Bilibili video / multi-part / collection downloader (DASH + ffmpeg + danmaku)" ^
     "%ROOT%\bilibili_downloader.py"
 if errorlevel 1 goto build_failed

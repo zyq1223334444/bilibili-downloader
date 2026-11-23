@@ -70,7 +70,7 @@ Download the latest `bilibili_downloader_setup_<version>.exe` from
   entry, so a `;;` or trailing `;` in the original value is never mangled).
 - **The installer also takes care of ffmpeg**: it checks the process `PATH`, the system `PATH`, the user `PATH`
   and `%USERPROFILE%\ffmpeg\bin`. If none has it, a **"ffmpeg download source" page** appears earlier in the wizard
-  (official GitHub release or the `ghfast.top` mirror, usually much faster in mainland China; the page is skipped
+  (mirror `ghfast.top` by default — usually much faster in mainland China — or the official GitHub release; the page is skipped
   when ffmpeg is already present); pressing "Install" on the last page then shows a dialog explaining that "without
   ffmpeg the full feature set is unavailable (no muxing, no MP3, no danmaku embedding)", **the real download size**
   (queried live, about 114 MB) and the chosen source, defaulting to "Yes". On approval a **download page** appears
@@ -547,7 +547,7 @@ same switch. The size shown in the prompt is the real byte count queried at that
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). 2.0.3 adds a selectable ffmpeg download source (official GitHub release or the
+See [CHANGELOG.md](CHANGELOG.md). 2.0.4 fixes the "Unclosed constant" error that 2.0.3 raised in the installer when ffmpeg was missing; 2.0.3 adds a selectable ffmpeg download source (official GitHub release or the
 `ghfast.top` mirror, chosen during setup and switchable mid-download); earlier releases brought danmaku download
 and embedding, automatic ffmpeg installation, Desktop as the default output root, and the Win11-style GUI
 (episode preview, index input and credential status block).
