@@ -90,17 +90,26 @@ if ! "$PY" -c 'import requests, tqdm, certifi' 2>/dev/null; then
     exit 1
 fi
 
+# GUI 用 tkinter：有就带上 Tcl/Tk 运行时，没有就只编命令行版（不能让 CI 直接挂掉）
+TK_FLAGS=()
+if "$PY" -c 'import tkinter' > /dev/null 2>&1; then
+    TK_FLAGS=(--enable-plugin=tk-inter)
+else
+    echo "[!] tkinter not available for $PY - building CLI only (the GUI will not open)."
+fi
+
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
 COMMON=(
     --assume-yes-for-downloads
     --include-package-data=certifi
+    "${TK_FLAGS[@]+"${TK_FLAGS[@]}"}"
     --company-name="zyq1223334444"
     --product-name="Bilibili Downloader"
-    --product-version=1.0.0
-    --file-version=1.0.0
-    --file-description="Bilibili video / multi-part / collection downloader (DASH + ffmpeg)"
+    --product-version=1.1.0
+    --file-version=1.1.0
+    --file-description="Bilibili video / multi-part / collection downloader (DASH + ffmpeg + danmaku)"
 )
 
 echo "[*] building the single-file (onefile) binary ..."

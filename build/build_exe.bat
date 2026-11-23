@@ -52,11 +52,14 @@ rem   --windows-console-mode=force
 rem     This is a console tool that prints progress bars. Without the flag
 rem     the exe would be a GUI-subsystem binary with no usable stdout.
 rem
+rem   --enable-plugin=tk-inter
+rem     Running without arguments opens the tkinter GUI. The plugin makes
+rem     Nuitka ship the Tcl/Tk runtime and the tcl data files; without it the
+rem     exe starts but the window cannot be created.
+rem
 rem   ffmpeg is deliberately NOT bundled
-rem     It is a ~100 MB external program. The exe finds it through
-rem     shutil.which("ffmpeg"), so ffmpeg.exe has to be on PATH
-rem     (choco install ffmpeg / scoop install ffmpeg / brew install ffmpeg /
-rem     sudo apt install ffmpeg).
+rem     It is a ~100-200 MB external program. The exe finds it through
+rem     shutil.which("ffmpeg") or the --install-ffmpeg copy in %USERPROFILE%\ffmpeg.
 rem =====================================================================
 setlocal
 set "HERE=%~dp0"
@@ -78,12 +81,15 @@ if not defined SITE goto no_python
 if not exist "%SITE%\requests\__init__.py" goto no_requests
 if not exist "%SITE%\tqdm\__init__.py" goto no_tqdm
 if not exist "%SITE%\certifi\cacert.pem" goto no_certifi
+python -c "import tkinter" >nul 2>&1
+if errorlevel 1 goto no_tk
 
 echo [*] repo root     : %ROOT%
 echo [*] output        : %OUT%
 echo [*] site-packages : %SITE%
 echo [*] Building bilibili_downloader.exe with Nuitka (takes a few minutes) ...
 python -m nuitka --standalone --onefile --msvc=latest ^
+    --enable-plugin=tk-inter ^
     --assume-yes-for-downloads ^
     --output-dir="%OUT%\nuitka_onefile" ^
     --output-filename=bilibili_downloader.exe ^
@@ -91,8 +97,8 @@ python -m nuitka --standalone --onefile --msvc=latest ^
     --windows-console-mode=force ^
     --company-name="zyq1223334444" ^
     --product-name="Bilibili Downloader" ^
-    --file-version=1.0.0.0 --product-version=1.0.0.0 ^
-    --file-description="Bilibili video / multi-part / collection downloader (DASH + ffmpeg)" ^
+    --file-version=1.1.0.0 --product-version=1.1.0.0 ^
+    --file-description="Bilibili video / multi-part / collection downloader (DASH + ffmpeg + danmaku)" ^
     "%ROOT%\bilibili_downloader.py"
 if errorlevel 1 goto build_failed
 
@@ -126,6 +132,11 @@ exit /b 1
 
 :no_certifi
 echo [ERR] certifi (requests' CA bundle) not found. Run: pip install -r requirements.txt
+exit /b 1
+
+:no_tk
+echo [ERR] tkinter is missing from this Python, so the GUI could not be built.
+echo       Reinstall Python with "tcl/tk and IDLE" enabled, then run this again.
 exit /b 1
 
 :build_failed

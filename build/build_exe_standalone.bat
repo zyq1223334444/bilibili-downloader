@@ -51,11 +51,14 @@ for /f "delims=" %%i in ('python -c "import sysconfig;print(sysconfig.get_paths(
 if not defined SITE goto no_python
 if not exist "%SITE%\requests\__init__.py" goto no_requests
 if not exist "%SITE%\certifi\cacert.pem" goto no_certifi
+python -c "import tkinter" >nul 2>&1
+if errorlevel 1 goto no_tk
 
 echo [*] repo root     : %ROOT%
 echo [*] output        : %STAGE%
 echo [*] Building the standalone folder with Nuitka (takes a few minutes) ...
 python -m nuitka --standalone --msvc=latest ^
+    --enable-plugin=tk-inter ^
     --assume-yes-for-downloads ^
     --output-dir="%OUTDIR%" ^
     --output-filename=bilibili_downloader.exe ^
@@ -63,8 +66,8 @@ python -m nuitka --standalone --msvc=latest ^
     --windows-console-mode=force ^
     --company-name="zyq1223334444" ^
     --product-name="Bilibili Downloader" ^
-    --file-version=1.0.0.0 --product-version=1.0.0.0 ^
-    --file-description="Bilibili video / multi-part / collection downloader (DASH + ffmpeg)" ^
+    --file-version=1.1.0.0 --product-version=1.1.0.0 ^
+    --file-description="Bilibili video / multi-part / collection downloader (DASH + ffmpeg + danmaku)" ^
     "%ROOT%\bilibili_downloader.py"
 if errorlevel 1 goto build_failed
 
@@ -106,6 +109,11 @@ exit /b 1
 
 :no_certifi
 echo [ERR] certifi (requests' CA bundle) not found. Run: pip install -r requirements.txt
+exit /b 1
+
+:no_tk
+echo [ERR] tkinter is missing from this Python, so the GUI could not be built.
+echo       Reinstall Python with "tcl/tk and IDLE" enabled, then run this again.
 exit /b 1
 
 :build_failed
