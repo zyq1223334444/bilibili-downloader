@@ -18,7 +18,7 @@ bili_downloads/
 *.part
 *.m4s
 
-# ---- Python ----
+# 运行期配置（画质 / 分段 / 预约任务）\nlive_record.json\n\n# ---- Python ----
 __pycache__/
 *.py[cod]
 *.egg-info/

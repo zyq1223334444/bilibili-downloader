@@ -46,11 +46,16 @@ B 站视频 / 分P / 合集 下载器（DASH 分流下载 + ffmpeg 合并）
 from __future__ import annotations
 
 import argparse
+import base64
 import getpass
 import gzip
 import hashlib
 import html
+import json
 import os
+import socket
+import ssl
+import struct
 import re
 import shutil
 import subprocess
@@ -1757,35 +1762,89 @@ def _text_width(text: str, font_size: int) -> float:
     return units * font_size
 
 
-def build_danmaku_ass(lines: Sequence[dict], width: int, height: int,
-                      title: str = "", *, strict: bool = False) -> str:
-    """把弹幕渲染成 ASS。
+class _AssLanes:
+    """弹幕 → ASS 事件的"车道"分配器（点播弹幕和直播弹幕共用一套规则）。
 
-    滚动 / 顶部 / 底部共用同一组"车道"（每条车道记下一次可用的时刻）：
+    滚动 / 顶部 / 底部共用同一组车道（每条车道记下一次可用的时刻）：
     三类弹幕如果各用一套车道表，就会在同一个纵坐标上互相压字，这是最容易被吐槽的画面。
     strict=True（精简档）时车道占满就丢掉这一条，宁可少几条也不压字；
     strict=False（多档）时挑最早空出来的车道，宁可轻微重叠也不丢弹幕。
+
+    直播是边录边收弹幕的，可能一录就是十几个小时、上百万条，不能像点播那样先攒成
+    一个大列表再渲染；这个类逐条吐事件，调用方可以直接往文件里写，内存只跟车道数有关。
     """
-    width = max(320, int(width or 1920))
-    height = max(240, int(height or 1080))
-    base_size = max(12, round(height / 720 * 25))         # 25 号字在 720p，按比例放大
-    lane_height = max(16, round(height / 1080 * 46))
-    lane_count = max(1, int(height * 0.9 // lane_height))
-    top_pad = max(4, round(height * 0.02))
 
-    lanes: dict[int, float] = {}          # 车道号（从上往下数）→ 最早可复用的时刻
+    def __init__(self, width: int, height: int, strict: bool = False) -> None:
+        self.width = max(320, int(width or 1920))
+        self.height = max(240, int(height or 1080))
+        self.strict = strict
+        self.base_size = max(12, round(self.height / 720 * 25))   # 25 号字在 720p，按比例放大
+        self.lane_height = max(16, round(self.height / 1080 * 46))
+        self.lane_count = max(1, int(self.height * 0.9 // self.lane_height))
+        self.top_pad = max(4, round(self.height * 0.02))
+        self.lanes: dict[int, float] = {}       # 车道号（从上往下数）→ 最早可复用的时刻
 
-    def pick_lane(now: float, from_bottom: bool = False) -> int | None:
-        order = range(lane_count - 1, -1, -1) if from_bottom else range(lane_count)
+    def _pick_lane(self, now: float, from_bottom: bool = False) -> int | None:
+        order = range(self.lane_count - 1, -1, -1) if from_bottom else range(self.lane_count)
         for index in order:
-            if lanes.get(index, 0.0) <= now:
+            if self.lanes.get(index, 0.0) <= now:
                 return index
-        if strict:
-            return None                     # 精简档：没位置就不放，画面干净优先
-        return min(range(lane_count), key=lambda index: lanes.get(index, 0.0))
+        if self.strict:
+            return None                         # 精简档：没位置就不放，画面干净优先
+        return min(range(self.lane_count), key=lambda index: self.lanes.get(index, 0.0))
+
+    def event(self, line: dict) -> str | None:
+        """把一条弹幕转成一行 Dialogue；放不下（精简档车位满）时返回 None。"""
+        width, height = self.width, self.height
+        mode_id = int(line["mode"])
+        start = float(line["time"])
+        font_size = max(10, round(int(line["size"]) * height / 720))
+        style = (f"\\fs{font_size}\\c{_ass_color(int(line['color']))}")
+        body = _ass_escape(str(line["text"]))
+
+        if mode_id in (1, 2, 3, 6):
+            text_w = _text_width(str(line["text"]), font_size)
+            duration = DANMAKU_SCROLL_SECONDS
+            lane = self._pick_lane(start)
+            if lane is None:
+                return None
+            y = self.top_pad + lane * self.lane_height
+            if mode_id == 6:                     # 逆向：从左往右
+                x1, x2 = -text_w, width
+            else:                                # 常规：从右往左
+                x1, x2 = width, -text_w
+            speed = (width + text_w) / duration   # 横向速度（像素/秒）
+            if self.strict:
+                # 精简档：这条车道等整条弹幕滚完再复用。只按"尾巴离开右边缘"算的话，
+                # 后进的长弹幕会追上先进去的短弹幕，屏幕上就是两行字叠在一起。
+                self.lanes[lane] = start + duration
+            else:
+                # 多档：尾巴离开出发侧边缘就允许下一条进，密度优先
+                travel = max(8, round(self.base_size * 0.8)) + text_w
+                self.lanes[lane] = start + max(0.0, min(duration, travel / max(speed, 1.0)))
+            return (
+                f"Dialogue: 0,{_ass_time(start)},{_ass_time(start + duration)},Danmaku,,0,0,0,,"
+                f"{{\\an7\\move({x1:.0f},{y:.0f},{x2:.0f},{y:.0f}){style}}}{body}"
+            )
+        if mode_id in (4, 5):
+            lane = self._pick_lane(start, from_bottom=(mode_id == 4))
+            if lane is None:
+                return None
+            self.lanes[lane] = start + DANMAKU_FIXED_SECONDS
+            if mode_id == 5:                     # 顶部：坐标按上边算
+                y = self.top_pad + lane * self.lane_height + font_size / 2
+            else:                                # 底部：同一条车道从下往上数
+                y = (height - self.top_pad
+                     - (self.lane_count - 1 - lane) * self.lane_height - font_size / 2)
+            return (
+                f"Dialogue: 0,{_ass_time(start)},{_ass_time(start + DANMAKU_FIXED_SECONDS)},"
+                f"Danmaku,,0,0,0,,{{\\an5\\pos({width / 2:.0f},{y:.0f}){style}}}{body}"
+            )
+        return None
 
 
-    header = [
+def _ass_header(width: int, height: int, title: str, base_size: int) -> str:
+    return "\n".join([
         "[Script Info]",
         "; 由 bilibili-downloader 生成" + (f"：{title}" if title else ""),
         "ScriptType: v4.00+",
@@ -1804,56 +1863,32 @@ def build_danmaku_ass(lines: Sequence[dict], width: int, height: int,
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
-    ]
-    events: list[str] = []
+    ]) + "\n"
 
-    for line in lines:
-        mode_id = int(line["mode"])
-        start = float(line["time"])
-        font_size = max(10, round(int(line["size"]) * height / 720))
-        style = (f"\\fs{font_size}\\c{_ass_color(int(line['color']))}")
-        body = _ass_escape(str(line["text"]))
 
-        if mode_id in (1, 2, 3, 6):
-            text_w = _text_width(str(line["text"]), font_size)
-            duration = DANMAKU_SCROLL_SECONDS
-            lane = pick_lane(start)
-            if lane is None:
-                continue
-            y = top_pad + lane * lane_height
-            if mode_id == 6:                     # 逆向：从左往右
-                x1, x2 = -text_w, width
-            else:                                # 常规：从右往左
-                x1, x2 = width, -text_w
-            speed = (width + text_w) / duration   # 横向速度（像素/秒）
-            if strict:
-                # 精简档：这条车道等整条弹幕滚完再复用。只按"尾巴离开右边缘"算的话，
-                # 后进的长弹幕会追上先进去的短弹幕，屏幕上就是两行字叠在一起。
-                lanes[lane] = start + duration
-            else:
-                # 多档：尾巴离开出发侧边缘就允许下一条进，密度优先
-                travel = max(8, round(base_size * 0.8)) + text_w
-                lanes[lane] = start + max(0.0, min(duration, travel / max(speed, 1.0)))
-            events.append(
-                f"Dialogue: 0,{_ass_time(start)},{_ass_time(start + duration)},Danmaku,,0,0,0,,"
-                f"{{\\an7\\move({x1:.0f},{y:.0f},{x2:.0f},{y:.0f}){style}}}{body}"
-            )
-        elif mode_id in (4, 5):
-            lane = pick_lane(start, from_bottom=(mode_id == 4))
-            if lane is None:
-                continue
-            lanes[lane] = start + DANMAKU_FIXED_SECONDS
-            if mode_id == 5:                     # 顶部：坐标按上边算
-                y = top_pad + lane * lane_height + font_size / 2
-            else:                                # 底部：同一条车道从下往上数
-                y = (height - top_pad
-                     - (lane_count - 1 - lane) * lane_height - font_size / 2)
-            events.append(
-                f"Dialogue: 0,{_ass_time(start)},{_ass_time(start + DANMAKU_FIXED_SECONDS)},"
-                f"Danmaku,,0,0,0,,{{\\an5\\pos({width / 2:.0f},{y:.0f}){style}}}{body}"
-            )
+def build_danmaku_ass(lines: Sequence[dict], width: int, height: int,
+                      title: str = "", *, strict: bool = False) -> str:
+    """把弹幕渲染成 ASS（点播用；直播用下面的 write_danmaku_ass 边读边写）。"""
+    lanes = _AssLanes(width, height, strict)
+    events = [event for event in (lanes.event(line) for line in lines) if event]
+    return (_ass_header(lanes.width, lanes.height, title, lanes.base_size)
+            + "\n".join(events) + ("\n" if events else ""))
 
-    return "\n".join(header + events) + "\n"
+
+def write_danmaku_ass(lines: Iterable[dict], dest: Path, width: int, height: int,
+                      title: str = "", *, strict: bool = False) -> int:
+    """流式写 ASS：逐条落盘，内存占用只跟车道数有关（长直播几十万条弹幕也不炸）。"""
+    lanes = _AssLanes(width, height, strict)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    count = 0
+    with open(dest, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(_ass_header(lanes.width, lanes.height, title, lanes.base_size))
+        for line in lines:
+            event = lanes.event(line)
+            if event:
+                handle.write(event + "\n")
+                count += 1
+    return count
 
 
 def _write_text_atomic(path: Path, text: str) -> None:
@@ -1861,6 +1896,1229 @@ def _write_text_atomic(path: Path, text: str) -> None:
     part = path.with_name(path.name + PART_SUFFIX)
     part.write_text(text, encoding="utf-8")
     part.replace(path)
+
+
+# ================= 直播录制 =================
+#
+# 直播和点播是两套东西：点播有确定的长度、DASH 分片，直播只有一条一直往下吐的 FLV。
+# 所以这里不复用 download_stream，而是走"流式读 → 按时间轮转分段 → 结束时 -c copy 拼一条"：
+# 整个过程中内存里只有一块读缓冲，录十几个小时也不会把机器拖死，中途断电最多丢最后一段。
+#
+# 弹幕走 WebSocket：手写握手 + 帧解析 + B 站协议包解析（zlib 用标准库），不引入第三方依赖。
+# 边收边写 JSONL，停止后再流式转成 XML / ASS，精简和全部两种模式各出一套。
+
+LIVE_INFO_API = "https://api.live.bilibili.com/room/v1/Room/get_info"
+LIVE_PLAY_API = "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo"
+LIVE_DANMU_API = "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo"
+LIVE_HOME = "https://live.bilibili.com/"
+LIVE_CONFIG_NAME = "live_record.json"
+LIVE_DEFAULT_QN = 10000                 # 原画（默认最高画质）
+LIVE_READ_CHUNK = 256 * 1024            # 单次写入的分块大小，和点播一致
+LIVE_QN_DESC = {30000: "杜比", 20000: "4K", 15000: "2K", 10000: "原画",
+                400: "蓝光", 250: "超清", 150: "高清", 80: "流畅"}
+LIVE_SEGMENT_MINUTES = 10               # 默认 10 分钟一段
+LIVE_POLL_SECONDS = 60                  # 预约任务轮询间隔
+LIVE_WS_HOST_FALLBACK = "broadcastlv.chat.bilibili.com"
+
+
+def live_headers(headers: dict) -> dict:
+    """直播接口和点播接口的 Referer/Origin 不一样，直接改副本，别污染下载用的头。"""
+    copy = dict(headers)
+    copy["Referer"] = LIVE_HOME
+    copy["Origin"] = LIVE_HOME.rstrip("/")
+    return copy
+
+
+def parse_live_room_id(text: str) -> int:
+    """从直播间链接 / 预约页链接 / 纯房间号里认出房间号。
+
+    预约链接的形态很多（live.bilibili.com/123、活动页 ?room_id=123、带一堆参数的分享链接），
+    这里按"最像房间号的那个数字"依次兜底；实在认不出来就让人直接填房间号。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        raise DownloadError("请填写直播间链接或房间号")
+    if raw.isdigit():
+        return int(raw)
+    for pattern in (
+        r"live\.bilibili\.com/(?:h5/)?(\d{3,})",
+        r"(?:room_?id|roomid|rid)=(\d{3,})",
+        r"/(\d{5,})(?:[/?#]|$)",
+    ):
+        match = re.search(pattern, raw, re.I)
+        if match:
+            return int(match.group(1))
+    digits = re.findall(r"\d{4,}", raw)
+    if len(digits) == 1:
+        return int(digits[0])
+    raise DownloadError("没能从链接里认出直播间号，请直接填房间号（例如 6 或 7734200）")
+
+
+def live_room_info(session: requests.Session, headers: dict, room_id: int,
+                   timeout: float = 10.0) -> dict:
+    data = api_get(session, LIVE_INFO_API, {"room_id": int(room_id)},
+                   live_headers(headers), timeout)
+    return {
+        "ref_id": int(room_id),
+        "room_id": int(data.get("room_id") or room_id),
+        "short_id": int(data.get("short_id") or 0),
+        "title": str(data.get("title") or ""),
+        "uname": str(data.get("uname") or ""),
+        "live_status": int(data.get("live_status") or 0),
+        "online": int(data.get("online") or 0),
+        "cover": str(data.get("user_cover") or data.get("cover") or ""),
+        "area": "/".join(x for x in (data.get("parent_area_name"),
+                                     data.get("area_name")) if x),
+        "live_time": str(data.get("live_time") or ""),
+    }
+
+
+def live_play_info(session: requests.Session, headers: dict, room_id: int,
+                   qn: int = LIVE_DEFAULT_QN, timeout: float = 10.0) -> dict:
+    """取一路可用直播流：优先 FLV/AVC（分段拼接兼容性最好），HLS 兜底。"""
+    params = {
+        "room_id": int(room_id), "protocol": "0,1", "format": "0,1,2", "codec": "0,1",
+        "qn": int(qn), "platform": "web", "ptype": 8, "dolby": 5, "panorama": 1,
+    }
+    data = api_get(session, LIVE_PLAY_API, params, live_headers(headers), timeout)
+    play = ((data.get("playurl_info") or {}).get("playurl")) or {}
+    candidates: list[dict] = []
+    for stream in play.get("stream") or []:
+        proto = str(stream.get("protocol_name") or "")
+        for fmt in stream.get("format") or []:
+            fmt_name = str(fmt.get("format_name") or "")
+            for codec in fmt.get("codec") or []:
+                codec_name = str(codec.get("codec_name") or "")
+                base_url = str(codec.get("base_url") or "")
+                urls = [f"{info.get('host', '')}{base_url}{info.get('extra', '')}"
+                        for info in (codec.get("url_info") or []) if info.get("host")]
+                if not urls:
+                    continue
+                # 越小越优先：http_stream/flv/avc → 0；hls/ts/hevc 会排到后面
+                rank = ((0 if proto == "http_stream" else 2)
+                        + (0 if fmt_name == "flv" else 1)
+                        + (0 if codec_name == "avc" else 1))
+                candidates.append({
+                    "rank": rank, "urls": urls, "protocol": proto, "format": fmt_name,
+                    "codec": codec_name, "qn": int(codec.get("current_qn") or qn),
+                    "accept_qn": [int(x) for x in (codec.get("accept_qn") or [])],
+                })
+    if not candidates:
+        raise DownloadError("这个直播间当前没有可用的播放地址（可能没开播，或需要登录）")
+    best = min(candidates, key=lambda item: item["rank"])
+    desc = []
+    for item in play.get("g_qn_desc") or []:
+        try:
+            desc.append((int(item.get("qn")), str(item.get("desc") or "")))
+        except (TypeError, ValueError):
+            continue
+    best["qn_desc"] = desc
+    if not best["accept_qn"]:
+        best["accept_qn"] = [item[0] for item in desc]
+    return best
+
+
+def live_quality_choices(play: dict) -> list[tuple[int, str]]:
+    """可切换的画质清单（按返回的 accept_qn 和 g_qn_desc 配对，从高到低）。"""
+    desc = dict(play.get("qn_desc") or {})
+    choices = []
+    for qn in sorted(set(play.get("accept_qn") or []), reverse=True):
+        choices.append((qn, desc.get(qn) or LIVE_QN_DESC.get(qn) or str(qn)))
+    return choices
+
+
+def live_snapshot(session: requests.Session, headers: dict, room_id: int, qn: int,
+                  dest: Path, timeout: float = 20.0) -> Path:
+    """抓一帧做预览：ffmpeg 直接从流里读一帧，不需要下载整段，也不占内存。"""
+    play = live_play_info(session, headers, room_id, qn, timeout=10.0)
+    errors: list[str] = []
+    tmp = dest.with_name(dest.stem + ".part.png")
+    for url in play["urls"][:3]:
+        try:
+            # Tk 的 PhotoImage 只认 PNG/GIF，这里必须输出真 PNG（image2 默认会按后缀写 JPEG）
+            run_ffmpeg(["-i", url, "-frames:v", "1", "-c:v", "png", "-f", "image2",
+                        "-update", "1", str(tmp)],
+                       "抓取直播预览失败")
+            if tmp.exists() and tmp.stat().st_size > 0:
+                tmp.replace(dest)
+                return dest
+            raise DownloadError("预览输出为空")
+        except Exception as exc:
+            errors.append(short_error(exc))
+    raise DownloadError(errors[-1] if errors else "抓取直播预览失败")
+
+
+def live_sample_clip(session: requests.Session, headers: dict, room_id: int, qn: int,
+                     dest: Path, seconds: int = 10) -> Path:
+    """试看：录一小段（默认 10 秒）直接 -c copy，几乎不花时间，用系统播放器打开。"""
+    play = live_play_info(session, headers, room_id, qn, timeout=10.0)
+    last: Exception | None = None
+    for url in play["urls"][:3]:
+        try:
+            run_ffmpeg(["-i", url, "-t", str(int(seconds)), "-c", "copy", str(dest)],
+                       "录制试看片段失败")
+            if dest.exists() and dest.stat().st_size > 0:
+                return dest
+            raise DownloadError("试看片段为空")
+        except Exception as exc:
+            last = exc
+    raise DownloadError(short_error(last) if last else "录制试看片段失败")
+
+
+def probe_media_size(video: Path) -> tuple[int, int]:
+    """取视频分辨率给弹幕排版用；取不到就按 1920×1080（ASS 会按 PlayRes 缩放）。"""
+    try:
+        ffmpeg = find_ffmpeg()
+        probe = Path(ffmpeg).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe")
+        if probe.is_file():
+            proc = subprocess.run(
+                [str(probe), "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", str(video)],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=30,
+            )
+            first = (proc.stdout or "").strip().splitlines()
+            if first and "x" in first[0]:
+                width, height = first[0].split("x")[:2]
+                return int(width), int(height)
+    except Exception:
+        pass
+    return 1920, 1080
+
+
+# ---- 直播配置（和 sessdata.txt 一样放在程序目录，便携、不写注册表）----
+
+_LIVE_CONFIG_CACHE: Path | None = None
+
+
+def live_config_path() -> Path:
+    """直播配置（画质、分段、预约任务）该写到哪。
+
+    装在 Program Files 时程序目录不可写，直接写会静默失败、预约任务下次启动就丢；
+    这种情况下退到 %APPDATA%\\bilibili-downloader\\，源码/绿色版仍然留在程序旁边。
+    """
+    global _LIVE_CONFIG_CACHE
+    if _LIVE_CONFIG_CACHE is not None:
+        return _LIVE_CONFIG_CACHE
+    app_dir = _app_dir()
+    app_file = app_dir / LIVE_CONFIG_NAME
+    if os.name == "nt":
+        try:
+            probe = app_dir / ".write_test"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+            _LIVE_CONFIG_CACHE = app_file
+            return app_file
+        except OSError:
+            base = Path(os.environ.get("APPDATA") or Path.home()) / "bilibili-downloader"
+            try:
+                base.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                _LIVE_CONFIG_CACHE = app_file
+                return app_file
+            _LIVE_CONFIG_CACHE = base / LIVE_CONFIG_NAME
+            return _LIVE_CONFIG_CACHE
+    _LIVE_CONFIG_CACHE = app_file
+    return app_file
+
+
+def load_live_config() -> dict:
+    defaults = {
+        "qn": LIVE_DEFAULT_QN,
+        "segment_minutes": LIVE_SEGMENT_MINUTES,
+        "danmaku_light": True,
+        "danmaku_full": True,
+        "keep_segments": False,
+        "output": str(default_output()),
+        "poll_seconds": LIVE_POLL_SECONDS,
+        "tasks": [],
+    }
+    for candidate in (live_config_path(), _app_dir() / LIVE_CONFIG_NAME):
+        try:
+            raw = json.loads(candidate.read_text("utf-8"))
+            break
+        except Exception:
+            continue
+    else:
+        return defaults
+    config = dict(defaults)
+    for key in defaults:
+        if key in raw:
+            config[key] = raw[key]
+    tasks = []
+    for task in raw.get("tasks") or []:
+        try:
+            room_id = int(task.get("room_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        tasks.append({
+            "link": str(task.get("link") or ""),
+            "room_id": room_id,
+            "note": str(task.get("note") or ""),
+            "enabled": bool(task.get("enabled", True)),
+        })
+    config["tasks"] = tasks
+    return config
+
+
+def save_live_config(config: dict) -> None:
+    _write_text_atomic(live_config_path(),
+                       json.dumps(config, ensure_ascii=False, indent=2))
+
+
+# ---- 直播弹幕：手写 WebSocket ----
+
+def _ws_frame(payload: bytes) -> bytes:
+    """客户端 → 服务端的单帧（固定 FIN + 文本帧，客户端发的帧必须带掩码）。"""
+    header = bytearray([0x81])
+    length = len(payload)
+    if length < 126:
+        header.append(0x80 | length)
+    elif length < 65536:
+        header.append(0x80 | 126)
+        header += struct.pack(">H", length)
+    else:
+        header.append(0x80 | 127)
+        header += struct.pack(">Q", length)
+    mask = os.urandom(4)
+    header += mask
+    return bytes(header) + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+
+def _ws_parse(buffer: bytes) -> tuple[list[tuple[int, bytes]], bytes]:
+    """把收到的字节切成 WebSocket 帧；不完整的尾巴原样返回，等下一批数据。"""
+    frames: list[tuple[int, bytes]] = []
+    while True:
+        if len(buffer) < 2:
+            break
+        opcode = buffer[0] & 0x0F
+        length = buffer[1] & 0x7F
+        offset = 2
+        if length == 126:
+            if len(buffer) < 4:
+                break
+            length = struct.unpack(">H", buffer[2:4])[0]
+            offset = 4
+        elif length == 127:
+            if len(buffer) < 10:
+                break
+            length = struct.unpack(">Q", buffer[2:10])[0]
+            offset = 10
+        if len(buffer) < offset + length:
+            break
+        frames.append((opcode, buffer[offset:offset + length]))
+        buffer = buffer[offset + length:]
+    return frames, buffer
+
+
+def _bili_packet(op: int, body: bytes) -> bytes:
+    """B 站协议包头：总长 / 头长 16 / 版本 1 / 操作码 / 序号。"""
+    return struct.pack(">IHHII", 16 + len(body), 16, 1, op, 1) + body
+
+
+def _bili_decode(payload: bytes) -> list[dict]:
+    """解一个 B 站协议包：ver=2 是 zlib 压的多包；ver=1 的普通消息是一整段 JSON。"""
+    if len(payload) < 16:
+        return []
+    total, header_len, version, _op = struct.unpack(">IHHI", payload[:12])
+    body = payload[header_len:total] if 0 < total <= len(payload) else payload[header_len:]
+    if version == 2:
+        try:
+            body = zlib.decompress(body)
+        except zlib.error:
+            return []
+    elif version == 3:
+        # brotli：为了不带第三方依赖，握手时固定要 protover=2（zlib），这里正常不会出现
+        return []
+    try:
+        whole = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        whole = None
+    if isinstance(whole, dict):
+        return [whole]
+    messages: list[dict] = []
+    offset = 0
+    while offset + 16 <= len(body):
+        try:
+            size, head, ver, op = struct.unpack(">IHHI", body[offset:offset + 12])
+        except struct.error:
+            break
+        if size <= 0 or offset + size > len(body):
+            break
+        chunk = body[offset:offset + size]
+        offset += size
+        if ver in (2, 3) and op == 5:
+            messages.extend(_bili_decode(chunk))      # 嵌套压缩包，递归解
+            continue
+        try:
+            data = json.loads(chunk[head:])
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if isinstance(data, dict):
+            messages.append(data)
+    return messages
+
+
+def _live_message_entry(message: dict, seconds: float) -> dict | None:
+    """把一条直播消息压成统一结构；精简档只留普通弹幕，全部档另有礼物/上舰/SC。"""
+    cmd = str(message.get("cmd") or "")
+    text = ""
+    kind = "danmaku"
+    color = 0xFFFFFF
+    size = 25
+    mode_id = 1
+    user = ""
+    try:
+        if cmd.startswith("DANMU_MSG"):
+            info = message.get("info") or []
+            text = str(info[1] or "")
+            meta = info[0] or []
+            mode_id = int(meta[1] or 1)
+            size = int(meta[2] or 25)
+            color = int(meta[3] or 0xFFFFFF) & 0xFFFFFF
+            user = str((info[2] or [0, ""])[1] or "")
+        elif cmd == "SEND_GIFT":
+            data = message.get("data") or {}
+            kind = "extra"
+            text = f"【礼物】{data.get('uname') or ''} 送出 {data.get('giftName') or ''} ×{data.get('num') or 1}"
+            color = 0xFFD700
+        elif cmd == "SUPER_CHAT_MESSAGE":
+            data = message.get("data") or {}
+            kind = "extra"
+            text = f"【醒目留言】{(data.get('user_info') or {}).get('uname') or ''}：{data.get('message') or ''}"
+            color = 0x00A1FF
+        elif cmd == "GUARD_BUY":
+            data = message.get("data") or {}
+            kind = "extra"
+            text = f"【上舰】{data.get('username') or ''} 开通了 {data.get('gift_name') or '大航海'}"
+            color = 0xFF6699
+        elif cmd == "INTERACT_WORD":
+            data = message.get("data") or {}
+            kind = "extra"
+            action = {1: "进入直播间", 2: "关注了主播", 3: "分享了直播间"}.get(
+                int(data.get("msg_type") or 1), "进入直播间")
+            text = f"【互动】{data.get('uname') or ''} {action}"
+        else:
+            return None
+    except (IndexError, TypeError, ValueError):
+        return None
+    text = _DANMAKU_CTRL.sub("", text).replace("\r", " ").replace("\n", " ").strip()
+    if not text:
+        return None
+    return {"t": round(max(0.0, seconds), 3), "cmd": cmd, "kind": kind, "text": text,
+            "mode": mode_id, "size": size, "color": color, "user": user}
+
+
+class _LiveDanmakuClient(threading.Thread):
+    """一条常驻的弹幕连接：断线自动重连，消息写 JSONL（一条一行，边收边落盘）。"""
+
+    def __init__(self, session: requests.Session, headers: dict, room_id: int,
+                 jsonl_path: Path, started_at: float, log: Callable[[str], None]) -> None:
+        super().__init__(name="live-danmaku", daemon=True)
+        self.session = session
+        self.headers = live_headers(headers)
+        self.room_id = int(room_id)
+        self.jsonl_path = jsonl_path
+        self.started_at = started_at
+        self.log = log
+        self.count = 0
+        self.handles: list = []
+        self._stop = threading.Event()
+        self._sock: socket.socket | None = None
+        self._buvid = ""
+        self._uid = 0
+        self._token = ""
+        self._host = LIVE_WS_HOST_FALLBACK
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            if self._sock:
+                self._sock.close()
+        except OSError:
+            pass
+
+    def _prepare(self) -> None:
+        if not self._buvid:
+            try:
+                self.session.get("https://www.bilibili.com/", headers=self.headers, timeout=10)
+            except Exception:
+                pass
+            self._buvid = next((c.value for c in self.session.cookies if c.name == "buvid3"), "")
+        if not self._uid:
+            try:
+                data = api_get(self.session, API_NAV, {}, self.headers, 10.0)
+                self._uid = int(data.get("mid") or 0)
+            except Exception:
+                self._uid = 0
+        # 弹幕 token 必须 WBI 签名，且 roomid 要和取 token 时用的 id 一致，否则握手即被踢
+        key = fetch_mixin_key(self.session, self.headers, 10.0)
+        data = api_get(self.session, LIVE_DANMU_API, {"id": self.room_id},
+                       self.headers, 10.0, mixin_key=key)
+        self._token = str(data.get("token") or "")
+        hosts = [str(item.get("host") or "") for item in data.get("host_list") or []]
+        self._host = next((x for x in hosts if "broadcast" in x), hosts[0] if hosts else "") or \
+            LIVE_WS_HOST_FALLBACK
+
+    def _connect(self) -> socket.socket:
+        host = self._host
+        sock = socket.create_connection((host, 443), timeout=15)
+        sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+        cookie = "; ".join(f"{c.name}={c.value}" for c in self.session.cookies)
+        key = base64.b64encode(os.urandom(16)).decode()
+        request = (
+            f"GET /sub HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
+            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+            f"Origin: {LIVE_HOME.rstrip('/')}\r\nCookie: {cookie}\r\n"
+            f"User-Agent: {USER_AGENT}\r\n\r\n"
+        )
+        sock.sendall(request.encode())
+        response = b""
+        while b"\r\n\r\n" not in response:
+            data = sock.recv(4096)
+            if not data:
+                raise DownloadError("弹幕连接被关闭")
+            response += data
+            if len(response) > 8192:
+                break
+        if b" 101 " not in response.split(b"\r\n")[0]:
+            raise DownloadError(f"弹幕握手失败：{response.split(b'\r\n')[0][:80]!r}")
+        return sock
+
+    def _session_once(self) -> None:
+        self._prepare()
+        sock = self._connect()
+        self._sock = sock
+        auth = {
+            "uid": self._uid, "roomid": self.room_id, "protover": 2,
+            "platform": "web", "type": 2, "key": self._token,
+        }
+        if self._buvid:
+            auth["buvid"] = self._buvid
+        sock.sendall(_ws_frame(_bili_packet(7, json.dumps(auth).encode())))
+        sock.settimeout(2.5)
+        self.log("[弹幕] 已连接，开始接收（精简 / 全部两套都会存）")
+        buffer = b""
+        last_beat = time.monotonic()
+        last_flush = time.monotonic()
+
+        def flush() -> None:
+            nonlocal last_flush
+            for handle in self.handles:
+                try:
+                    handle.flush()
+                except Exception:
+                    pass
+            last_flush = time.monotonic()
+
+        try:
+            while not self._stop.is_set():
+                if time.monotonic() - last_beat >= 25:
+                    try:
+                        sock.sendall(_ws_frame(_bili_packet(2, b"[object Object]")))
+                    except OSError:
+                        break
+                    last_beat = time.monotonic()
+                try:
+                    chunk = sock.recv(65536)
+                except socket.timeout:
+                    if time.monotonic() - last_flush >= 2:
+                        flush()
+                    continue
+                if not chunk:
+                    break
+                buffer += chunk
+                frames, buffer = _ws_parse(buffer)
+                for opcode, payload in frames:
+                    if opcode == 0x8:
+                        raise DownloadError("弹幕连接被服务端关闭")
+                    if opcode not in (0x1, 0x2):
+                        continue
+                    for message in _bili_decode(payload):
+                        entry = _live_message_entry(message, time.monotonic() - self.started_at)
+                        if not entry:
+                            continue
+                        line = json.dumps(entry, ensure_ascii=False)
+                        for handle in self.handles:
+                            handle.write(line + "\n")
+                        self.count += 1
+                if time.monotonic() - last_flush >= 2:
+                    flush()
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            self._sock = None
+
+    def run(self) -> None:
+        self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        # 追加模式：断线重连不覆盖之前已经收到的弹幕
+        handle = open(self.jsonl_path, "a", encoding="utf-8")
+        self.handles = [handle]
+        try:
+            while not self._stop.is_set():
+                try:
+                    self._session_once()
+                except Exception as exc:
+                    if self._stop.is_set():
+                        break
+                    self.log(f"[弹幕] 连接中断（{short_error(exc)}），3 秒后重连")
+                if self._stop.wait(3):
+                    break
+        finally:
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+
+def _live_danmaku_lines(jsonl: Path, mode: str, duration: float) -> Iterable[dict]:
+    """流式读 JSONL → 弹幕行；精简档做去重限流，全部档把礼物/SC 也当滚动弹幕渲染。"""
+    seen: dict[int, set] = {}
+    current_second = -1
+    current_count = 0
+    with open(jsonl, "r", encoding="utf-8") as handle:
+        for raw in handle:
+            try:
+                item = json.loads(raw)
+            except ValueError:
+                continue
+            stamp = float(item.get("t") or 0.0)
+            if duration > 0:
+                stamp = min(stamp, duration)
+            text = _DANMAKU_CTRL.sub("", str(item.get("text") or "")).strip()
+            if not text:
+                continue
+            if item.get("kind") != "danmaku":
+                if mode != "full":
+                    continue
+                yield {"time": max(0.0, stamp), "mode": 1, "size": 25,
+                       "color": int(item.get("color") or 0xFFFFFF), "text": text}
+                continue
+            mode_id = int(item.get("mode") or 1)
+            if mode_id in (7, 8):
+                continue
+            if mode == "light":
+                if mode_id == 6:
+                    continue
+                text = text[:DANMAKU_LIGHT_MAX_CHARS]
+                bucket = int(stamp // DANMAKU_LIGHT_DEDUPE_WINDOW)
+                for old in [key for key in seen if key < bucket - 1]:
+                    seen.pop(old, None)
+                group = seen.setdefault(bucket, set())
+                key = (mode_id, text)
+                if key in group:
+                    continue
+                group.add(key)
+                second = int(stamp)
+                if second != current_second:
+                    current_second, current_count = second, 0
+                if current_count >= DANMAKU_LIGHT_PER_SECOND:
+                    continue
+                current_count += 1
+            yield {"time": max(0.0, stamp), "mode": mode_id,
+                   "size": int(item.get("size") or 25),
+                   "color": int(item.get("color") or 0xFFFFFF), "text": text}
+
+
+def _write_danmaku_xml(lines: Iterable[dict], dest: Path, cid: int) -> int:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    count = 0
+    with open(dest, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write('<?xml version="1.0" encoding="UTF-8"?><i>')
+        handle.write(f"<chatid>{int(cid)}</chatid>")
+        for line in lines:
+            body = html.escape(str(line["text"]), quote=False)
+            handle.write(f'<d p="{line["time"]:.3f},{line["mode"]},{line["size"]},'
+                         f'{line["color"]},0,0,0,0">{body}</d>')
+            count += 1
+        handle.write("</i>")
+    return count
+
+
+class LiveRecorder:
+    """一次直播录制：录制线程 + 弹幕线程 + 结束时的拼接 / 弹幕导出。
+
+    内存模型：录制只持有一块读缓冲（256 KB）直接落盘；结束时用 ffmpeg concat -c copy 拼段，
+    ffmpeg 自己也是流式读写的，所以录 10 小时和录 10 分钟占的内存一样。
+    画质中途切换 = 关掉当前段、用新 qn 重开一段：各段参数不同就直接拼会失败，
+    这时按画质分组分别封装成 MP4，绝不把几个小时的直播偷偷重编码一遍。
+    """
+
+    def __init__(self, session: requests.Session, headers: dict, room: dict, *,
+                 out_dir: Path, qn: int = LIVE_DEFAULT_QN,
+                 segment_minutes: int = LIVE_SEGMENT_MINUTES,
+                 danmaku_light: bool = True, danmaku_full: bool = True,
+                 keep_segments: bool = False,
+                 log: Callable[[str], None] = emit,
+                 auto_stop_offline: bool = True) -> None:
+        self.session = session
+        self.headers = headers
+        self.room = room
+        self.out_dir = Path(out_dir).expanduser()
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self._want_qn = int(qn)
+        self._qn_now = int(qn)
+        self.segment_seconds = max(60, int(segment_minutes) * 60)
+        self.danmaku_light = bool(danmaku_light)
+        self.danmaku_full = bool(danmaku_full)
+        self.keep_segments = bool(keep_segments)
+        self.log = log
+        self.auto_stop_offline = bool(auto_stop_offline)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        self.base = self.out_dir / f"{clean_name(room.get('title') or '直播')}_{stamp}_live"
+        self.jsonl = self.base.with_name(f"{self.base.name}.danmaku.jsonl")
+        self.segments: list[dict] = []
+        self.total_bytes = 0
+        self.started_at = 0.0
+        self.finished_at = 0.0
+        self.failures = 0
+        self._stop = threading.Event()
+        self._switch = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._danmaku: _LiveDanmakuClient | None = None
+        self._lock = threading.Lock()
+
+    # ---- 状态 ----
+
+    @property
+    def running(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
+    @property
+    def duration(self) -> float:
+        if not self.started_at:
+            return 0.0
+        end = self.finished_at or time.monotonic()
+        return max(0.0, end - self.started_at)
+
+    def qn_label(self, qn: int | None = None) -> str:
+        value = int(self._qn_now if qn is None else qn)
+        return LIVE_QN_DESC.get(value, str(value))
+
+    # ---- 生命周期 ----
+
+    def start(self) -> None:
+        self.started_at = time.monotonic()
+        self._thread = threading.Thread(target=self._run, name="live-record", daemon=True)
+        self._thread.start()
+        if self.danmaku_light or self.danmaku_full:
+            self._danmaku = _LiveDanmakuClient(
+                self.session, self.headers, self.room["ref_id"], self.jsonl,
+                self.started_at, self.log,
+            )
+            self._danmaku.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def switch_quality(self, qn: int) -> None:
+        if int(qn) == self._want_qn and not self._switch.is_set():
+            return
+        self._want_qn = int(qn)
+        self._switch.set()
+        self.log(f"[直播] 画质切换为 {self.qn_label(qn)}（当前分段收尾后生效）")
+
+    def wait(self, timeout: float | None = None) -> bool:
+        if self._thread:
+            self._thread.join(timeout)
+        return not self.running
+
+    def finish(self) -> dict:
+        """停线程 → 导出弹幕 → 拼段。返回产物信息（失败也返回，由调用方展示）。"""
+        self._stop.set()
+        if self._thread:
+            self._thread.join(20)
+        if self._danmaku:
+            self._danmaku.stop()
+            self._danmaku.join(5)
+        self.finished_at = time.monotonic()
+        duration = self.duration
+        result = {
+            "base": self.base, "duration": duration, "bytes": self.total_bytes,
+            "segments": [item["path"] for item in self.segments],
+            "videos": [], "danmaku": {}, "error": "",
+        }
+        if self.jsonl.exists() and self.jsonl.stat().st_size > 0:
+            width, height = probe_media_size(self.segments[0]["path"]) if self.segments else (1920, 1080)
+            for mode, enabled in (("light", self.danmaku_light), ("full", self.danmaku_full)):
+                if not enabled:
+                    continue
+                try:
+                    xml = self.base.with_name(f"{self.base.name}.danmaku.{mode}.xml")
+                    ass = self.base.with_name(f"{self.base.name}.danmaku.{mode}.ass")
+                    xml_count = _write_danmaku_xml(
+                        _live_danmaku_lines(self.jsonl, mode, duration), xml, self.room["room_id"])
+                    ass_count = write_danmaku_ass(
+                        _live_danmaku_lines(self.jsonl, mode, duration), ass, width, height,
+                        str(self.room.get("title") or ""), strict=(mode == "light"))
+                    result["danmaku"][mode] = {"xml": xml, "ass": ass, "count": xml_count,
+                                               "ass_count": ass_count}
+                except Exception as exc:
+                    self.log(f"[弹幕] 导出{mode}失败：{short_error(exc)}")
+        if self.segments:
+            result["videos"] = self._merge_segments(result)
+        return result
+
+    # ---- 录制 ----
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                play = live_play_info(self.session, self.headers, self.room["ref_id"], self._want_qn)
+                self._qn_now = int(play["qn"])
+                self._stream(play)
+                self.failures = 0
+            except Aborted:
+                break
+            except Exception as exc:
+                if self._stop.is_set():
+                    break
+                self.failures += 1
+                self.log(f"[直播] 录制中断：{short_error(exc)}，2 秒后重连")
+                if self._stop.wait(2):
+                    break
+                if self.auto_stop_offline and self.failures >= 2 and self._looks_offline():
+                    self.log("[直播] 直播间已下播，自动结束录制")
+                    break
+
+    def _looks_offline(self) -> bool:
+        try:
+            return live_room_info(self.session, self.headers, self.room["ref_id"])["live_status"] != 1
+        except Exception:
+            return False
+
+    def _open_segment(self) -> tuple[Path, object]:
+        with self._lock:
+            index = len(self.segments) + 1
+            path = self.base.with_name(f"{self.base.name}_{index:04d}.flv")
+            handle = open(path, "ab", buffering=0)
+            self.segments.append({"path": path, "qn": self._qn_now})
+        return path, handle
+
+    def _stream(self, play: dict) -> None:
+        last_error: Exception | None = None
+        for url in play["urls"][:4]:
+            if self._stop.is_set() or self._switch.is_set():
+                return
+            resp = None
+            try:
+                resp = self.session.get(url, headers=live_headers(self.headers),
+                                        stream=True, timeout=(10, 35))
+                if resp.status_code != 200:
+                    raise DownloadError(f"HTTP {resp.status_code}")
+                path, handle = self._open_segment()
+                self.log(f"[直播] 录制中：{path.name}（{self.qn_label()} / {play['codec'].upper()}）")
+                started = time.monotonic()
+                try:
+                    for chunk in resp.iter_content(LIVE_READ_CHUNK):
+                        if self._stop.is_set() or self._switch.is_set():
+                            break
+                        if not chunk:
+                            continue
+                        handle.write(chunk)
+                        self.total_bytes += len(chunk)
+                        if time.monotonic() - started >= self.segment_seconds:
+                            break
+                finally:
+                    handle.close()
+                if self._switch.is_set():
+                    self._switch.clear()
+                return
+            except Exception as exc:
+                last_error = exc
+                if self._stop.is_set():
+                    return
+                self.log(f"[直播] 这条流断开（{short_error(exc)}），换节点重试")
+            finally:
+                try:
+                    if resp is not None:
+                        resp.close()
+                except Exception:
+                    pass
+        if last_error is not None:
+            raise last_error
+
+    # ---- 结束处理 ----
+
+    def _concat(self, segments: list[dict], out: Path, err_msg: str) -> None:
+        list_file = self.base.with_name(f"{self.base.name}.concat.txt")
+        lines = []
+        for item in segments:
+            value = item["path"].as_posix().replace("'", "'\\''")
+            lines.append(f"file '{value}'")
+        list_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        try:
+            run_ffmpeg(["-f", "concat", "-safe", "0", "-i", str(list_file),
+                        "-c", "copy", str(out)], err_msg)
+            if not out.exists() or out.stat().st_size == 0:
+                raise DownloadError(f"{err_msg}：输出为空")
+        finally:
+            try:
+                list_file.unlink()
+            except OSError:
+                pass
+
+    def _merge_segments(self, result: dict) -> list[Path]:
+        out = self.base.with_name(f"{self.base.name}.mp4")
+        try:
+            self._concat(self.segments, out, "拼接直播分段失败")
+            if not self.keep_segments:
+                for item in self.segments:
+                    try:
+                        item["path"].unlink()
+                    except OSError:
+                        pass
+            return [out]
+        except Exception as exc:
+            self.log(f"[直播] 合成一条失败（{short_error(exc)}），改按画质分段保存，不重编码")
+        groups: list[list[dict]] = []
+        for item in self.segments:
+            if groups and groups[-1][-1]["qn"] == item["qn"]:
+                groups[-1].append(item)
+            else:
+                groups.append([item])
+        videos: list[Path] = []
+        for index, group in enumerate(groups, 1):
+            path = self.base.with_name(
+                f"{self.base.name}.part{index}_{self.qn_label(group[0]['qn'])}.mp4")
+            try:
+                self._concat(group, path, "拼接直播分段失败")
+                videos.append(path)
+            except Exception as exc:
+                self.log(f"[直播] 第 {index} 段封装失败：{short_error(exc)}（原 .flv 分段已保留）")
+                result["error"] = "部分分段未能封装，已保留原始 .flv"
+        if videos and not self.keep_segments and not result["error"]:
+            for item in self.segments:
+                try:
+                    item["path"].unlink()
+                except OSError:
+                    pass
+        return videos
+
+
+class LiveScheduler(threading.Thread):
+    """预约任务：按房间轮询 live_status，开播就回调（只回调一次，下播后重新武装）。"""
+
+    def __init__(self, session: requests.Session, headers: dict,
+                 tasks: Sequence[dict], on_live: Callable[[dict, dict], None],
+                 log: Callable[[str], None] = emit, interval: int = LIVE_POLL_SECONDS) -> None:
+        super().__init__(name="live-scheduler", daemon=True)
+        self.session = session
+        self.headers = headers
+        self.tasks: list[dict] = [dict(item) for item in tasks]
+        self.on_live = on_live
+        self.log = log
+        self.interval = max(20, int(interval))
+        self._stop = threading.Event()
+        self._armed: set[int] = set()
+        self._lock = threading.Lock()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def set_tasks(self, tasks: Sequence[dict]) -> None:
+        with self._lock:
+            self.tasks = [dict(item) for item in tasks]
+
+    def poll_once(self) -> None:
+        with self._lock:
+            tasks = [dict(item) for item in self.tasks]
+        for task in tasks:
+            if not task.get("enabled", True):
+                continue
+            room_id = int(task.get("room_id") or 0)
+            if not room_id:
+                continue
+            try:
+                info = live_room_info(self.session, self.headers, room_id, timeout=8.0)
+            except Exception:
+                continue
+            if info["live_status"] != 1:
+                self._armed.discard(room_id)
+                continue
+            if room_id in self._armed:
+                continue
+            self._armed.add(room_id)
+            self.log(f"[预约] {info.get('uname') or room_id} 开播了：{info.get('title') or ''}")
+            try:
+                self.on_live(info, task)
+            except Exception as exc:
+                self.log(f"[预约] 自动录制启动失败：{short_error(exc)}")
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.poll_once()
+            except Exception as exc:
+                self.log(f"[预约] 轮询出错：{short_error(exc)}")
+            if self._stop.wait(self.interval):
+                break
+
+
+# ---- 字幕合并（独立功能：GUI 按钮 + 命令行）----
+
+def merge_subtitle(video: Path, subtitle: Path, mode: str, out: Path | None = None) -> Path:
+    """把字幕合进视频，产物另存，绝不覆盖原视频。
+
+    mode：
+        external —— 只把字幕整理成外挂文件（不改视频），返回字幕路径；
+        soft     —— 封成 MKV（一条字幕轨，可开关，不重新编码）；
+        hard     —— 烧进画面（重新编码，慢，但任何播放器都看得见）。
+    """
+    video = Path(video).expanduser()
+    subtitle = Path(subtitle).expanduser()
+    if not video.is_file():
+        raise DownloadError(f"视频不存在：{video}")
+    if not subtitle.is_file():
+        raise DownloadError(f"字幕文件不存在：{subtitle}")
+    mode = (mode or "soft").lower()
+    if mode not in {"external", "soft", "hard"}:
+        raise DownloadError("保存方式只能是 external / soft / hard")
+
+    temp_dir: Path | None = None
+    try:
+        ass = subtitle
+        if subtitle.suffix.lower() in {".xml", ".json"}:
+            # 弹幕 XML / JSON 先转成 ASS；转好的文件放在临时目录，不污染用户目录
+            temp_dir = Path(tempfile.mkdtemp(prefix="bd_sub_"))
+            ass = temp_dir / "subtitle.ass"
+            lines = parse_danmaku_xml(subtitle.read_bytes())
+            if not lines:
+                raise DownloadError("这个弹幕文件里没有可用的弹幕")
+            width, height = probe_media_size(video)
+            write_danmaku_ass(lines, ass, width, height, video.stem, strict=False)
+
+        if mode == "external":
+            dest = Path(out).expanduser() if out else video.with_name(video.stem + ".sub.ass")
+        elif mode == "soft":
+            dest = Path(out).expanduser() if out else video.with_name(video.stem + ".sub.mkv")
+        else:
+            dest = Path(out).expanduser() if out else video.with_name(video.stem + ".sub.mp4")
+        if dest.resolve() == video.resolve():
+            raise DownloadError("输出文件不能和原视频同名（会覆盖原视频）")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        if mode == "external":
+            shutil.copy2(ass, dest)
+            return dest
+
+        if mode == "soft":
+            _ffmpeg_to_file(
+                ["-i", str(video), "-i", str(ass), "-map", "0", "-map", "1",
+                 "-c", "copy", "-c:s", "ass", "-metadata:s:s:0", "language=chi",
+                 "-disposition:s:0", "default"],
+                dest, "封装字幕失败")
+            return dest
+
+        burn_danmaku(video, ass, dest)
+        return dest
+    finally:
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# ---- 系统托盘（零依赖：ctypes 直接调 Shell_NotifyIcon）----
+
+class _TrayIcon:
+    """最小化到托盘：图标 + 右键菜单（显示主界面 / 录制直播 / 退出）。
+
+    Tk 没有托盘 API，pystray 又要多带 Pillow，安装包会胖一圈；这里用 ctypes 起一个隐藏窗口
+    接 Shell_NotifyIcon 的消息，回调统一丢回 Tk 主线程的队列里处理。
+    """
+
+    WM_TRAY = 0x0400 + 102          # WM_APP + 102
+    WM_CLOSE = 0x0010
+
+    def __init__(self, tooltip: str, post: Callable[[str], None]) -> None:
+        self.tooltip = (tooltip or "B 站下载器")[:120]
+        self.post = post
+        self._thread: threading.Thread | None = None
+        self._hwnd = 0
+        self._proc = None
+        self._nid = None
+
+    def available(self) -> bool:
+        return os.name == "nt"
+
+    def start(self) -> None:
+        if not self.available() or self._thread:
+            return
+        self._thread = threading.Thread(target=self._run, name="tray", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._hwnd:
+            try:
+                import ctypes
+                ctypes.windll.user32.PostMessageW(self._hwnd, self.WM_CLOSE, 0, 0)
+            except Exception:
+                pass
+        self._hwnd = 0
+
+    def notify(self, title: str, message: str) -> None:
+        """气泡提示（NIM_MODIFY + NIF_INFO）。失败就算了，不影响主流程。"""
+        if not self._nid:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class NOTIFYICONDATAW(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD), ("hWnd", wintypes.HWND), ("uID", wintypes.UINT),
+                    ("uFlags", wintypes.UINT), ("uCallbackMessage", wintypes.UINT),
+                    ("hIcon", wintypes.HICON), ("szTip", wintypes.WCHAR * 128),
+                    ("dwState", wintypes.DWORD), ("dwStateMask", wintypes.DWORD),
+                    ("szInfo", wintypes.WCHAR * 256), ("uVersion", wintypes.UINT),
+                    ("szInfoTitle", wintypes.WCHAR * 64), ("dwInfoFlags", wintypes.DWORD),
+                    ("guidItem", wintypes.BYTE * 16), ("hBalloonIcon", wintypes.HICON),
+                ]
+
+            nid = NOTIFYICONDATAW.from_buffer_copy(self._nid)
+            nid.uFlags = 0x10 | 0x2 | 0x1          # NIF_INFO | NIF_ICON | NIF_MESSAGE
+            nid.szInfo = message[:250]
+            nid.szInfoTitle = title[:60]
+            nid.dwInfoFlags = 0x1                   # NIIF_INFO
+            ctypes.windll.shell32.Shell_NotifyIconW(1, ctypes.byref(nid))
+        except Exception:
+            pass
+
+    def _popup(self, hwnd) -> None:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        user32.CreatePopupMenu.restype = wintypes.HMENU
+        user32.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT,
+                                       ctypes.c_size_t, wintypes.LPCWSTR]
+        user32.AppendMenuW.restype = ctypes.c_int
+        user32.TrackPopupMenu.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_int,
+                                          ctypes.c_int, ctypes.c_int, wintypes.HWND,
+                                          ctypes.c_void_p]
+        user32.TrackPopupMenu.restype = ctypes.c_int
+        user32.DestroyMenu.argtypes = [wintypes.HMENU]
+        menu = user32.CreatePopupMenu()
+        user32.AppendMenuW(menu, 0x0000, 1, "显示主界面")
+        user32.AppendMenuW(menu, 0x0000, 2, "录制直播")
+        user32.AppendMenuW(menu, 0x0800, 0, None)
+        user32.AppendMenuW(menu, 0x0000, 3, "退出")
+        user32.SetForegroundWindow(hwnd)
+        point = ctypes.wintypes.POINT()
+        user32.GetCursorPos(ctypes.byref(point))
+        command = user32.TrackPopupMenu(menu, 0x0002 | 0x0020 | 0x0100,
+                                        point.x, point.y, 0, hwnd, None)
+        user32.PostMessageW(hwnd, 0x0000, 0, 0)
+        user32.DestroyMenu(menu)
+        if command == 1:
+            self.post("show")
+        elif command == 2:
+            self.post("live")
+        elif command == 3:
+            self.post("quit")
+
+    def _run(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        shell32 = ctypes.windll.shell32
+        IDI_APPLICATION = ctypes.cast(ctypes.c_void_p(32512), wintypes.LPCWSTR)
+
+        # 64 位下必须显式声明签名：默认按 32 位 int 处理，句柄 / lParam 会被截断
+        user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                          wintypes.WPARAM, wintypes.LPARAM]
+        user32.DefWindowProcW.restype = ctypes.c_ssize_t
+        user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                           wintypes.DWORD, ctypes.c_int, ctypes.c_int,
+                                           ctypes.c_int, ctypes.c_int, wintypes.HWND,
+                                           wintypes.HANDLE, wintypes.HINSTANCE,
+                                           ctypes.c_void_p]
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.RegisterClassW.argtypes = [ctypes.c_void_p]
+        user32.RegisterClassW.restype = ctypes.c_ushort
+        user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
+        user32.LoadIconW.restype = wintypes.HICON
+        user32.DestroyWindow.argtypes = [wintypes.HWND]
+        user32.PostQuitMessage.argtypes = [ctypes.c_int]
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                       wintypes.UINT, wintypes.UINT]
+        user32.GetMessageW.restype = ctypes.c_int
+        user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                        wintypes.WPARAM, wintypes.LPARAM]
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.c_void_p]
+        shell32.Shell_NotifyIconW.restype = ctypes.c_int
+
+        class NOTIFYICONDATAW(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD), ("hWnd", wintypes.HWND), ("uID", wintypes.UINT),
+                ("uFlags", wintypes.UINT), ("uCallbackMessage", wintypes.UINT),
+                ("hIcon", wintypes.HICON), ("szTip", wintypes.WCHAR * 128),
+                ("dwState", wintypes.DWORD), ("dwStateMask", wintypes.DWORD),
+                ("szInfo", wintypes.WCHAR * 256), ("uVersion", wintypes.UINT),
+                ("szInfoTitle", wintypes.WCHAR * 64), ("dwInfoFlags", wintypes.DWORD),
+                ("guidItem", wintypes.BYTE * 16), ("hBalloonIcon", wintypes.HICON),
+            ]
+
+        WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT,
+                                     wintypes.WPARAM, wintypes.LPARAM)
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [
+                ("style", wintypes.UINT), ("lpfnWndProc", WNDPROC),
+                ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON),
+                ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH),
+                ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR),
+            ]
+
+        @WNDPROC
+        def proc(hwnd, message, wparam, lparam):
+            if message == self.WM_TRAY:
+                if int(lparam) == 0x0203:              # WM_LBUTTONDBLCLK
+                    self.post("show")
+                elif int(lparam) == 0x0205:            # WM_RBUTTONUP
+                    self._popup(hwnd)
+            elif message == self.WM_CLOSE:
+                user32.DestroyWindow(hwnd)
+                user32.PostQuitMessage(0)
+                return 0
+            return user32.DefWindowProcW(hwnd, message, wparam, lparam)
+
+        self._proc = proc
+        instance = kernel32.GetModuleHandleW(None)
+        window_class = WNDCLASSW()
+        window_class.lpfnWndProc = proc
+        window_class.hInstance = instance
+        window_class.hIcon = user32.LoadIconW(None, IDI_APPLICATION)
+        window_class.lpszClassName = f"BiliDownloaderTray_{os.getpid()}"
+        if not user32.RegisterClassW(ctypes.byref(window_class)):
+            return
+        hwnd = user32.CreateWindowExW(0, window_class.lpszClassName, "BiliDownloaderTray",
+                                      0, 0, 0, 0, 0, None, None, instance, None)
+        if not hwnd:
+            return
+        self._hwnd = hwnd
+        nid = NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        nid.hWnd = hwnd
+        nid.uID = 1
+        nid.uFlags = 0x1 | 0x2 | 0x4                       # MESSAGE | ICON | TIP
+        nid.uCallbackMessage = self.WM_TRAY
+        nid.hIcon = user32.LoadIconW(None, IDI_APPLICATION)
+        nid.szTip = self.tooltip
+        self._nid = bytes(nid)
+        shell32.Shell_NotifyIconW(0, ctypes.byref(nid))     # NIM_ADD
+
+        message = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(message))
+            user32.DispatchMessageW(ctypes.byref(message))
+        shell32.Shell_NotifyIconW(2, ctypes.byref(nid))     # NIM_DELETE
 
 
 # ================= 单个视频的处理流程 =================
@@ -2159,6 +3417,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                              "official=只走 GitHub 官方，mirror=走 ghfast.top 镜像")
     parser.add_argument("--gui", action="store_true",
                         help="打开图形界面（不带任何参数运行时默认就是图形界面）")
+    parser.add_argument("--live", action="store_true",
+                        help="直接打开「录制直播」窗口（图形界面功能，命令行不录制直播）")
+    parser.add_argument("--merge-sub", nargs=2, metavar=("VIDEO", "SUB"),
+                        help="把字幕 / 弹幕合并进视频，产物另存，不覆盖原视频")
+    parser.add_argument("--sub-mode", choices=("external", "soft", "hard"), default="soft",
+                        help="字幕保存方式：external=外挂（只整理字幕文件），"
+                             "soft=软字幕（封装 MKV，可开关），hard=硬字幕（烧进画面，重新编码）")
+    parser.add_argument("--merge-out", default="",
+                        help="合并产物路径（默认在视频旁边生成 *.sub.mkv / *.sub.mp4）")
     parser.add_argument("-y", "--yes", action="store_true", help="不询问，直接开始")
     args = parser.parse_args(argv)
 
@@ -2224,6 +3491,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if not raw or raw == ["--gui"]:
         return run_gui()
+    if raw and all(item in ("--live", "--gui") for item in raw) and "--live" in raw:
+        return run_gui(start_live=True)
     try:
         return _main_impl(raw)
     except KeyboardInterrupt:
@@ -2250,6 +3519,17 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
 
     if not ffmpeg_available():
         _handle_missing_ffmpeg(args)
+
+    if args.merge_sub:                   # 独立动作：合并字幕进视频，做完就结束
+        video, subtitle = args.merge_sub
+        try:
+            output = Path(args.merge_out).expanduser() if args.merge_out else None
+            result = merge_subtitle(Path(video), Path(subtitle), args.sub_mode, output)
+            print(f"[完成] 已保存到：{result}")
+            return 0
+        except DownloadError as exc:
+            print(f"[失败] {short_error(exc, limit=300)}")
+            return 1
 
     session = build_session()
     sessdata, headers = ensure_credential(session, args)
@@ -2555,12 +3835,48 @@ def _fmt_duration(seconds) -> str:
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
 
 
-def run_gui() -> int:
+def _enable_dpi_awareness() -> None:
+    """在创建任何窗口之前声明 DPI 感知，避免 150% 缩放下整窗被虚拟化后超出屏幕。
+
+    不开这个开关时 Windows 会把进程按 96dpi 虚拟化，Tk 以为自己是 1588 逻辑像素宽，
+    实际只映射到 1073 物理像素，右边和底部的控件就被切掉了。
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        # PER_MONITOR_AWARE_V2 = -4；失败说明进程已经设置过，忽略即可
+        try:
+            user32.SetProcessDpiAwarenessContext.argtypes = [wintypes.HANDLE]
+            user32.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
+            if user32.SetProcessDpiAwarenessContext(wintypes.HANDLE(-4)):
+                return
+        except Exception:
+            pass
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            return
+        except Exception:
+            pass
+        user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+_enable_dpi_awareness()
+
+
+def run_gui(start_live: bool = False) -> int:
     """不带参数运行时的图形界面（Win11 风格 + 分集预览）。
 
     界面只负责"收集参数"和"挑要下哪几集"，真正的下载、弹幕、ffmpeg 仍然走 _main_impl；
     分集清单用 build_plan 预先取一次，勾选结果通过 _SELECTION_CALLBACK 原样交回去，
     所以不会出现"界面一套逻辑、命令行另一套"的问题。
+
+    start_live=True 时（--live 启动参数）只把「录制直播」窗口打开，主界面收起来。
     """
     try:
         import queue
@@ -2823,7 +4139,7 @@ def run_gui() -> int:
 
     # ---------------- 主体两栏 ----------------
     main = tk.Frame(root, bg=GUI_BG)
-    main.pack(fill="both", expand=True, padx=px(18))
+    # 先不 pack：底部按钮条要先占住窗口底部，否则窗口一矮就被挤出屏幕
     main.columnconfigure(0, weight=5)
     main.columnconfigure(1, weight=4)
     main.rowconfigure(0, weight=1)
@@ -3138,9 +4454,705 @@ def run_gui() -> int:
     log_text.configure(yscrollcommand=log_bar.set)
     log_bar.grid(row=1, column=1, sticky="ns")
 
+    # ---------------- 直播录制 / 字幕合并 ----------------
+    #
+    # 直播是纯 GUI 功能（命令行只有 --merge-sub 这种独立动作）；
+    # 默认原画、可切画质、预览、预约开播自动录、弹幕单独存，全部收在这个窗口里。
+
+    live_cfg = load_live_config()
+    start_live_only = bool(start_live)
+    live_state: dict = {"win": None, "rec": None, "room": None, "session": None,
+                        "headers": None, "preview_busy": False, "preview_auto": False, "auto_start": None}
+
+    def live_http() -> tuple[requests.Session, dict]:
+        if live_state["session"] is None:
+            live_state["session"] = build_session()
+            live_state["headers"] = live_headers(build_headers(load_sessdata()))
+        return live_state["session"], live_state["headers"]
+
+    def live_save(**updates) -> None:
+        live_cfg.update(updates)
+        try:
+            save_live_config(live_cfg)
+        except Exception:
+            pass
+
+    def open_live_window() -> None:
+        existing = live_state.get("win")
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.state("normal")
+            existing.lift()
+            existing.focus_force()
+            return
+
+        win = tk.Toplevel(root)
+        live_state["win"] = win
+        win.title("录制直播 - Bilibili Downloader")
+        win.configure(bg=GUI_BG)
+        live_w = min(px(1060), screen_w - px(24))
+        live_h = min(px(740), screen_h - px(120))
+        win.geometry(f"{live_w}x{live_h}"
+                     f"+{max(px(8), (screen_w - live_w) // 2)}"
+                     f"+{max(px(6), (screen_h - live_h) // 2 - px(28))}")
+        win.minsize(min(px(880), screen_w - px(24)), min(px(620), screen_h - px(60)))
+
+        quality = {"map": {}, "choices": []}
+        qn_var = tk.StringVar()
+        seg_var = tk.StringVar(value=str(live_cfg.get("segment_minutes") or LIVE_SEGMENT_MINUTES))
+        out_var_live = tk.StringVar(value=str(live_cfg.get("output") or default_output()))
+        room_var = tk.StringVar(value=str(live_cfg.get("last_link") or ""))
+        task_var = tk.StringVar()
+        light_var = tk.BooleanVar(value=bool(live_cfg.get("danmaku_light", True)))
+        full_var = tk.BooleanVar(value=bool(live_cfg.get("danmaku_full", True)))
+        keep_var = tk.BooleanVar(value=bool(live_cfg.get("keep_segments", False)))
+        status_var_live = tk.StringVar(value="未读取房间")
+        info_var = tk.StringVar(value="填直播间链接或房间号后点「读取」")
+
+        def make_panel(parent, title: str, expand: bool = False) -> tk.Frame:
+            outer = tk.Frame(parent, bg=GUI_CARD, highlightbackground=GUI_BORDER,
+                             highlightthickness=1)
+            if expand:
+                outer.pack(fill="both", expand=True, pady=(0, px(6)))
+            else:
+                outer.pack(fill="x", pady=(0, px(6)))
+            head = tk.Frame(outer, bg=GUI_CARD)
+            head.pack(fill="x", padx=px(12), pady=(px(8), 0))
+            tk.Label(head, text=title, font=bold_font, bg=GUI_CARD,
+                     fg=GUI_TEXT).pack(side="left")
+            inner = tk.Frame(outer, bg=GUI_CARD)
+            inner.pack(fill="both", expand=True, padx=px(12), pady=(px(6), px(10)))
+            return inner
+
+        def append_live_log(text: str) -> None:
+            try:
+                live_log.configure(state="normal")
+                live_log.insert("end", text + ("\n" if not text.endswith("\n") else ""))
+                live_log.see("end")
+                live_log.configure(state="disabled")
+            except Exception:
+                pass
+
+        def current_qn() -> int:
+            return int(quality["map"].get(qn_var.get(), LIVE_DEFAULT_QN))
+
+        def set_quality_choices(choices: list[tuple[int, str]]) -> None:
+            quality["map"] = {f"{desc}（{qn}）": qn for qn, desc in choices}
+            quality["choices"] = list(choices)
+            values = list(quality["map"].keys())
+            qn_combo.configure(values=values)
+            want = int(live_cfg.get("qn") or LIVE_DEFAULT_QN)
+            label = next((key for key, value in quality["map"].items() if value == want), None)
+            if label is None and values:
+                label = values[0]
+            if label:
+                qn_var.set(label)
+
+        # ---- 顶部 ----
+        head = tk.Frame(win, bg=GUI_BG)
+        head.pack(fill="x", padx=px(16), pady=(px(10), px(6)))
+        tk.Label(head, text="录制直播", font=title_font, bg=GUI_BG,
+                 fg=GUI_TEXT).pack(side="left")
+        tk.Label(head, text="默认原画 · 中途可切画质 · 弹幕单独保存 · 预约开播自动录",
+                 font=small_font, bg=GUI_BG, fg=GUI_SUB).pack(side="left", padx=px(12))
+
+        body = tk.Frame(win, bg=GUI_BG)
+        body.pack(fill="both", expand=True, padx=px(16), pady=(0, px(6)))
+        body.columnconfigure(0, weight=3)
+        body.columnconfigure(1, weight=2)
+        body.rowconfigure(0, weight=1)
+        left = tk.Frame(body, bg=GUI_BG)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, px(10)))
+        right = tk.Frame(body, bg=GUI_BG)
+        right.grid(row=0, column=1, sticky="nsew")
+
+        # ---- 直播间 ----
+        room_panel = make_panel(left, "直播间")
+        room_row = tk.Frame(room_panel, bg=GUI_CARD)
+        room_row.pack(fill="x")
+        tk.Label(room_row, text="链接 / 房间号", font=small_font, bg=GUI_CARD,
+                 fg=GUI_SUB).pack(side="left")
+        room_entry = tk.Entry(room_row, textvariable=room_var, font=small_font,
+                              relief="flat", bg="#FFFFFF", fg=GUI_TEXT,
+                              highlightthickness=1, highlightbackground=GUI_BORDER,
+                              highlightcolor=GUI_ACCENT)
+        room_entry.pack(side="left", fill="x", expand=True, padx=px(8), ipady=px(3))
+        read_btn = _RoundedButton(room_row, "读取", kind="secondary", width=64, height=28,
+                                  command=lambda: read_room())
+        read_btn.pack(side="right")
+        tk.Label(room_panel, textvariable=info_var, font=small_font, bg=GUI_CARD,
+                 fg=GUI_SUB, justify="left", anchor="w").pack(fill="x", pady=(px(6), 0))
+
+        # ---- 选项 ----
+        opt_panel = make_panel(left, "录制选项")
+        row1 = tk.Frame(opt_panel, bg=GUI_CARD)
+        row1.pack(fill="x")
+        tk.Label(row1, text="画质", font=small_font, bg=GUI_CARD, fg=GUI_SUB).pack(side="left")
+        qn_combo = ttk.Combobox(row1, textvariable=qn_var, state="readonly",
+                                values=["原画（10000）"], width=14)
+        qn_combo.pack(side="left", padx=(px(6), px(14)))
+        qn_combo.bind("<<ComboboxSelected>>", lambda _e: on_quality_change())
+        tk.Label(row1, text="分段", font=small_font, bg=GUI_CARD, fg=GUI_SUB).pack(side="left")
+        seg_box = ttk.Spinbox(row1, from_=1, to=120, width=5, textvariable=seg_var)
+        seg_box.pack(side="left", padx=(px(6), px(4)))
+        tk.Label(row1, text="分钟/段", font=small_font, bg=GUI_CARD,
+                 fg=GUI_SUB).pack(side="left")
+
+        row2 = tk.Frame(opt_panel, bg=GUI_CARD)
+        row2.pack(fill="x", pady=(px(8), 0))
+        ttk.Checkbutton(row2, text="精简弹幕", variable=light_var).pack(side="left")
+        ttk.Checkbutton(row2, text="全部弹幕（含礼物 / 上舰）",
+                        variable=full_var).pack(side="left", padx=(px(10), 0))
+        ttk.Checkbutton(row2, text="保留分段", variable=keep_var).pack(side="left",
+                                                                          padx=(px(10), 0))
+
+        row3 = tk.Frame(opt_panel, bg=GUI_CARD)
+        row3.pack(fill="x", pady=(px(8), 0))
+        tk.Label(row3, text="保存到", font=small_font, bg=GUI_CARD, fg=GUI_SUB).pack(side="left")
+        out_entry = tk.Entry(row3, textvariable=out_var_live, font=small_font, relief="flat",
+                             bg="#FFFFFF", fg=GUI_TEXT, highlightthickness=1,
+                             highlightbackground=GUI_BORDER, highlightcolor=GUI_ACCENT)
+        out_entry.pack(side="left", fill="x", expand=True, padx=px(8), ipady=px(3))
+        _RoundedButton(row3, "浏览", kind="ghost", width=56, height=26,
+                       command=lambda: browse_live_out()).pack(side="right")
+
+        # ---- 录制按钮 ----
+        btn_row = tk.Frame(left, bg=GUI_BG)
+        btn_row.pack(fill="x", pady=(0, px(8)))
+        start_btn_live = _RoundedButton(btn_row, "开始录制", kind="accent", width=110, height=36,
+                                        font=("Microsoft YaHei UI", 10, "bold"),
+                                        command=lambda: start_record())
+        start_btn_live.pack(side="left")
+        stop_btn = _RoundedButton(btn_row, "停止", kind="secondary", width=76, height=36,
+                                  enabled=False, command=lambda: stop_record())
+        stop_btn.pack(side="left", padx=px(8))
+        _RoundedButton(btn_row, "打开目录", kind="ghost", width=88, height=36,
+                       command=lambda: open_folder(out_var_live.get())).pack(side="left")
+
+        # ---- 预览 ----
+        prev_panel = make_panel(right, "预览")
+        prev_row = tk.Frame(prev_panel, bg=GUI_CARD)
+        prev_row.pack(fill="both", expand=True)
+        holder = tk.Frame(prev_row, bg="#101418", width=px(236), height=px(132))
+        holder.pack(side="left")
+        holder.pack_propagate(False)
+        preview_label = tk.Label(holder, text="暂无预览", font=small_font,
+                                 bg="#101418", fg="#8A8A8A")
+        preview_label.pack(fill="both", expand=True)
+        side = tk.Frame(prev_row, bg=GUI_CARD)
+        side.pack(side="left", fill="both", expand=True, padx=(px(10), 0))
+        tk.Label(side, textvariable=status_var_live, font=small_font, bg=GUI_CARD,
+                 fg=GUI_TEXT, justify="left", anchor="w", wraplength=px(108)).pack(fill="x")
+        _RoundedButton(side, "刷新预览", kind="secondary", width=74, height=24,
+                       command=lambda: refresh_preview()).pack(anchor="w", pady=(px(8), px(4)))
+        _RoundedButton(side, "试看 10 秒", kind="ghost", width=74, height=24,
+                       command=lambda: sample_clip()).pack(anchor="w")
+
+        # ---- 预约任务 ----
+        task_panel = make_panel(right, "预约直播（开播自动录）")
+        task_row = tk.Frame(task_panel, bg=GUI_CARD)
+        task_row.pack(fill="x")
+        task_entry = tk.Entry(task_row, textvariable=task_var, font=small_font, relief="flat",
+                              bg="#FFFFFF", fg=GUI_TEXT, highlightthickness=1,
+                              highlightbackground=GUI_BORDER, highlightcolor=GUI_ACCENT)
+        task_entry.pack(side="left", fill="x", expand=True, ipady=px(3))
+        _RoundedButton(task_row, "添加", kind="secondary", width=62, height=28,
+                       command=lambda: add_task()).pack(side="left", padx=(px(6), 0))
+        task_tree = ttk.Treeview(task_panel, columns=("room", "state"), show="headings",
+                                 height=3, style="Win.Treeview")
+        task_tree.heading("room", text="直播间")
+        task_tree.heading("state", text="状态")
+        task_tree.column("room", width=px(150), anchor="w")
+        task_tree.column("state", width=px(60), anchor="center")
+        task_tree.pack(fill="both", expand=True, pady=(px(8), px(6)))
+        task_btns = tk.Frame(task_panel, bg=GUI_CARD)
+        task_btns.pack(fill="x")
+        _RoundedButton(task_btns, "暂停 / 启用", kind="ghost", width=92, height=26,
+                       command=lambda: toggle_task()).pack(side="left")
+        _RoundedButton(task_btns, "删除", kind="ghost", width=62, height=26,
+                       command=lambda: remove_task()).pack(side="left", padx=px(6))
+
+        # ---- 日志 ----
+        log_panel = make_panel(left, "录制日志", expand=True)
+        live_log = tk.Text(log_panel, height=6, width=1, font=mono_font, bg="#FFFFFF", fg=GUI_TEXT,
+                           relief="flat", wrap="word", state="disabled")
+        live_log.pack(fill="both", expand=True)
+
+        footer = tk.Frame(win, bg=GUI_BG)
+        footer.pack(fill="x", padx=px(16), pady=(0, px(12)))
+        tk.Label(footer, text="录制直播只保存弹幕文件，不嵌进视频；要嵌进视频请用主界面的「合并弹幕」。",
+                 font=small_font, bg=GUI_BG, fg=GUI_SUB).pack(side="left")
+        _RoundedButton(footer, "关闭", kind="secondary", width=72, height=32,
+                       command=lambda: close_live_window()).pack(side="right")
+        _RoundedButton(footer, "最小化到托盘", kind="ghost", width=110, height=32,
+                       command=lambda: hide_to_tray()).pack(side="right", padx=(0, px(8)))
+
+        # ---- 行为 ----
+        def browse_live_out() -> None:
+            chosen = filedialog.askdirectory(initialdir=out_var_live.get() or str(default_output()),
+                                             title="选择直播保存目录", parent=win)
+            if chosen:
+                out_var_live.set(chosen)
+
+        def on_quality_change() -> None:
+            rec = live_state.get("rec")
+            qn = current_qn()
+            if rec and rec.running:
+                rec.switch_quality(qn)
+            live_save(qn=qn)
+
+        def apply_room(room: dict, play: dict | None) -> None:
+            read_btn.set_enabled(True)
+            live_state["room"] = room
+            if play:
+                set_quality_choices(live_quality_choices(play))
+            else:
+                set_quality_choices(sorted(((qn, LIVE_QN_DESC.get(qn, str(qn)))
+                                            for qn in LIVE_QN_DESC), reverse=True))
+            state_text = {1: "直播中", 2: "轮播中", 0: "未开播"}.get(room["live_status"], "未知")
+            info_var.set(f"{room.get('uname') or ''}  ·  {room.get('title') or ''}\n"
+                         f"{state_text}  ·  在线 {room.get('online') or 0}  ·  {room.get('area') or ''}")
+            status_var_live.set(f"已读取（{state_text}）")
+            if room["live_status"] == 1:
+                refresh_preview(auto=True)
+
+        def fail_room(exc: Exception) -> None:
+            read_btn.set_enabled(True)
+            status_var_live.set("读取失败")
+            messagebox.showerror("读取直播间", short_error(exc, 300), parent=win)
+
+        def read_room() -> None:
+            raw = room_var.get().strip()
+            if not raw:
+                messagebox.showinfo("提示", "先填直播间链接或房间号", parent=win)
+                return
+            try:
+                room_id = parse_live_room_id(raw)
+            except DownloadError as exc:
+                messagebox.showerror("房间号", short_error(exc, 200), parent=win)
+                return
+            read_btn.set_enabled(False)
+            status_var_live.set("正在读取房间…")
+
+            def worker() -> None:
+                try:
+                    session, headers = live_http()
+                    room = live_room_info(session, headers, room_id)
+                    play = None
+                    if room["live_status"] == 1:
+                        try:
+                            play = live_play_info(session, headers, room_id, current_qn())
+                        except Exception:
+                            play = None
+                    ui_jobs.put(lambda: apply_room(room, play))
+                except Exception as exc:
+                    ui_jobs.put(lambda: fail_room(exc))
+
+            threading.Thread(target=worker, name="live-read-room", daemon=True).start()
+
+        def start_record(auto_room: dict | None = None) -> None:
+            rec = live_state.get("rec")
+            if rec and rec.running:
+                messagebox.showinfo("正在录制", "已经有一段直播在录，先停止再开新的。", parent=win)
+                return
+            room = auto_room or live_state.get("room")
+            if not room:
+                messagebox.showinfo("提示", "先点「读取」拿到直播间信息", parent=win)
+                return
+            if int(room.get("live_status") or 0) != 1:
+                messagebox.showwarning("还没开播",
+                                       "这个直播间当前不在直播中。\n可以加到下面的预约列表，开播后自动开始。",
+                                       parent=win)
+                return
+            try:
+                minutes = max(1, int(float(seg_var.get() or LIVE_SEGMENT_MINUTES)))
+            except ValueError:
+                minutes = LIVE_SEGMENT_MINUTES
+            session, headers = live_http()
+            try:
+                recorder = LiveRecorder(
+                    session, headers, room, out_dir=Path(out_var_live.get().strip() or default_output()),
+                    qn=current_qn(), segment_minutes=minutes,
+                    danmaku_light=light_var.get(), danmaku_full=full_var.get(),
+                    keep_segments=keep_var.get(),
+                    log=lambda text: ui_jobs.put(lambda value=text: append_live_log(value)))
+            except Exception as exc:
+                messagebox.showerror("无法开始录制", short_error(exc, 300), parent=win)
+                return
+            live_state["rec"] = recorder
+            recorder.start()
+            start_btn_live.set_enabled(False)
+            stop_btn.set_enabled(True)
+            append_live_log(f"[直播] 开始录制：{room.get('title') or room.get('ref_id')}")
+            live_save(last_link=room_var.get().strip(), qn=current_qn(),
+                      segment_minutes=minutes, output=str(out_var_live.get()),
+                      danmaku_light=light_var.get(), danmaku_full=full_var.get(),
+                      keep_segments=keep_var.get())
+            win.after(1200, lambda: refresh_preview(auto=True))
+
+        def after_stop(result: dict) -> None:
+            live_state["rec"] = None
+            start_btn_live.set_enabled(True)
+            stop_btn.set_enabled(False)
+            status_var_live.set("已停止")
+            lines = []
+            for video in result.get("videos") or []:
+                lines.append(f"视频：{video}")
+            for mode, info in (result.get("danmaku") or {}).items():
+                lines.append(f"{mode} 弹幕：{info['count']} 条 → {info['ass'].name}")
+            if result.get("error"):
+                lines.append(result["error"])
+            body = "\n".join(lines) if lines else "没有产物（可能录得太短）"
+            append_live_log("[直播] 录制结束\n" + body)
+            messagebox.showinfo("录制结束", "已保存：\n" + body, parent=win)
+
+        def stop_record() -> None:
+            rec = live_state.get("rec")
+            if not rec or not rec.running:
+                return
+            stop_btn.set_enabled(False)
+            status_var_live.set("正在收尾：停弹幕、拼分段…")
+
+            def worker() -> None:
+                result = rec.finish()
+                ui_jobs.put(lambda: after_stop(result))
+
+            threading.Thread(target=worker, name="live-finish", daemon=True).start()
+
+        def apply_preview(path: Path) -> None:
+            try:
+                image = tk.PhotoImage(file=str(path))
+                # 缩略图不超过预览框（按实际容器尺寸算，别按固定数字，否则高缩放下会溢出）
+                shrink = max(1, -(-image.width() // px(232)), -(-image.height() // px(128)))
+                if shrink > 1:
+                    image = image.subsample(shrink, shrink)
+                preview_label.configure(image=image, text="")
+                preview_label.image = image
+                rec = live_state.get("rec")
+                if not (rec and rec.running):
+                    status_var_live.set("预览已更新")
+            except Exception as exc:
+                preview_failed(exc)
+
+        def preview_failed(exc: Exception) -> None:
+            status_var_live.set(f"预览失败：{short_error(exc, 80)}")
+
+        def refresh_preview(auto: bool = False) -> None:
+            room = live_state.get("room")
+            if not room or int(room.get("live_status") or 0) != 1:
+                return
+            if live_state["preview_busy"]:
+                return
+            live_state["preview_busy"] = True
+            live_state["preview_auto"] = bool(auto)
+            rec = live_state.get("rec")
+            if not (rec and rec.running):
+                status_var_live.set("预览加载中…")
+            session, headers = live_http()
+
+            def worker() -> None:
+                try:
+                    dest = Path(tempfile.gettempdir()) / "bd_live_preview.png"
+                    # 预览只要看得清，不必占原画带宽：取 150（高清），拿不到再由接口降级
+                    live_snapshot(session, headers, room["ref_id"], 150, dest)
+                    ui_jobs.put(lambda: apply_preview(dest))
+                except Exception as exc:
+                    ui_jobs.put(lambda: preview_failed(exc))
+                finally:
+                    live_state["preview_busy"] = False
+                    ui_jobs.put(_schedule_next_preview)
+
+            threading.Thread(target=worker, name="live-preview", daemon=True).start()
+
+        def _schedule_next_preview() -> None:
+            """只在主线程里排下一次刷新，tkiner 的 after 不能从工作线程调。"""
+            if not live_state.get("preview_auto"):
+                return
+            try:
+                if not win.winfo_exists():
+                    return
+            except tk.TclError:
+                return
+            win.after(12000, lambda: refresh_preview(True))
+
+        def sample_clip() -> None:
+            room = live_state.get("room")
+            if not room or int(room.get("live_status") or 0) != 1:
+                messagebox.showinfo("提示", "直播间当前没有开播", parent=win)
+                return
+            session, headers = live_http()
+
+            def worker() -> None:
+                try:
+                    dest = Path(tempfile.gettempdir()) / "bd_live_sample.flv"
+                    live_sample_clip(session, headers, room["ref_id"], current_qn(), dest, 10)
+                    if os.name == "nt":
+                        os.startfile(str(dest))
+                    elif sys.platform == "darwin":
+                        subprocess.Popen(["open", str(dest)])
+                    else:
+                        subprocess.Popen(["xdg-open", str(dest)])
+                except Exception as exc:
+                    ui_jobs.put(lambda: messagebox.showerror("试看失败", short_error(exc, 300),
+                                                            parent=win))
+
+            threading.Thread(target=worker, name="live-sample", daemon=True).start()
+
+        def refresh_tasks() -> None:
+            for item in task_tree.get_children():
+                task_tree.delete(item)
+            for index, task in enumerate(live_cfg.get("tasks") or []):
+                state_text = "启用" if task.get("enabled", True) else "暂停"
+                task_tree.insert("", "end", iid=str(index),
+                                 values=(f"{task.get('room_id')}  {task.get('link')}", state_text))
+
+        def add_task() -> None:
+            raw = task_var.get().strip() or room_var.get().strip()
+            if not raw:
+                messagebox.showinfo("提示", "填预约直播的链接", parent=win)
+                return
+            try:
+                room_id = parse_live_room_id(raw)
+            except DownloadError as exc:
+                messagebox.showerror("预约链接", short_error(exc, 200), parent=win)
+                return
+            tasks = list(live_cfg.get("tasks") or [])
+            if any(int(item.get("room_id") or 0) == room_id for item in tasks):
+                messagebox.showinfo("提示", "这个直播间已经在预约列表里了", parent=win)
+                return
+            tasks.append({"link": raw, "room_id": room_id, "note": "", "enabled": True})
+            live_save(tasks=tasks)
+            task_var.set("")
+            refresh_tasks()
+            if scheduler:
+                scheduler.set_tasks(tasks)
+            append_live_log(f"[预约] 已添加房间 {room_id}，每 {LIVE_POLL_SECONDS} 秒查一次开播状态")
+
+        def current_task() -> int | None:
+            selection = task_tree.selection()
+            return int(selection[0]) if selection else None
+
+        def toggle_task() -> None:
+            index = current_task()
+            if index is None:
+                return
+            tasks = list(live_cfg.get("tasks") or [])
+            if 0 <= index < len(tasks):
+                tasks[index]["enabled"] = not bool(tasks[index].get("enabled", True))
+                live_save(tasks=tasks)
+                refresh_tasks()
+                if scheduler:
+                    scheduler.set_tasks(tasks)
+
+        def remove_task() -> None:
+            index = current_task()
+            if index is None:
+                return
+            tasks = list(live_cfg.get("tasks") or [])
+            if 0 <= index < len(tasks):
+                tasks.pop(index)
+                live_save(tasks=tasks)
+                refresh_tasks()
+                if scheduler:
+                    scheduler.set_tasks(tasks)
+
+        def close_live_window() -> None:
+            if live_state.get("rec") and live_state["rec"].running:
+                if not messagebox.askyesno("正在录制", "录制还在进行，关掉窗口会隐藏到托盘继续录。\n"
+                                                          "要停止录制请先点「停止」。继续？", parent=win):
+                    return
+                win.withdraw()
+                if tray:
+                    tray.notify("直播录制中", "窗口已隐藏到托盘，录制继续。")
+                return
+            live_state["win"] = None
+            win.destroy()
+            if start_live_only:
+                quit_app()
+
+        def live_tick() -> None:
+            try:
+                if not win.winfo_exists():
+                    return
+            except Exception:
+                return
+            rec = live_state.get("rec")
+            if rec and rec.running:
+                seconds = int(rec.duration)
+                status_var_live.set(
+                    f"录制中  {seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}\n"
+                    f"{human_size(rec.total_bytes)}  ·  {rec.qn_label()}\n"
+                    f"分段 {len(rec.segments)} 个")
+                try:
+                    start_btn_live.set_enabled(False)
+                    stop_btn.set_enabled(True)
+                except Exception:
+                    pass
+            elif rec is None:
+                try:
+                    start_btn_live.set_enabled(True)
+                    stop_btn.set_enabled(False)
+                except Exception:
+                    pass
+            win.after(1000, live_tick)
+
+        live_state["append"] = append_live_log
+
+        # 打开窗口时的初始状态：有保存过的房间就顺手读一次
+        set_quality_choices(sorted(((qn, LIVE_QN_DESC.get(qn, str(qn)))
+                                    for qn in LIVE_QN_DESC), reverse=True))
+        refresh_tasks()
+        win.protocol("WM_DELETE_WINDOW", close_live_window)
+        win.bind("<Unmap>", lambda _e: (win.after(30, lambda: win.state() == "iconic"
+                                         and (win.withdraw(), tray and tray.notify(
+                                             "B 站下载器", "直播窗口已最小化到托盘。")))))
+        live_tick()
+        if room_var.get().strip():
+            win.after(300, lambda: read_room())
+        win.focus_force()
+
+    def open_merge_dialog() -> None:
+        dlg = tk.Toplevel(root)
+        dlg.title("合并弹幕 / 字幕")
+        dlg.configure(bg=GUI_BG)
+        dlg.geometry(f"{px(760)}x{px(430)}+{px(80)}+{px(80)}")
+        dlg.transient(root)
+        dlg.resizable(False, False)
+
+        tk.Label(dlg, text="把弹幕 / 字幕合进视频（产物另存，绝不覆盖原视频）",
+                 font=bold_font, bg=GUI_BG, fg=GUI_TEXT).pack(anchor="w", padx=px(18),
+                                                              pady=(px(16), px(8)))
+        form = tk.Frame(dlg, bg=GUI_CARD, highlightbackground=GUI_BORDER, highlightthickness=1)
+        form.pack(fill="both", expand=True, padx=px(18), pady=(0, px(10)))
+        video_var = tk.StringVar()
+        sub_var = tk.StringVar()
+        mode_var = tk.StringVar(value="soft")
+        out_var_merge = tk.StringVar()
+
+        def pick_file(var: tk.StringVar, title: str, patterns: str) -> None:
+            chosen = filedialog.askopenfilename(title=title, parent=dlg,
+                                                filetypes=[("支持的文件", patterns),
+                                                           ("全部文件", "*.*")])
+            if chosen:
+                var.set(chosen)
+
+        def row(label: str, var: tk.StringVar, title: str, patterns: str) -> None:
+            line = tk.Frame(form, bg=GUI_CARD)
+            line.pack(fill="x", padx=px(12), pady=(px(8), 0))
+            tk.Label(line, text=label, font=small_font, bg=GUI_CARD, fg=GUI_SUB,
+                     width=8, anchor="w").pack(side="left")
+            entry = tk.Entry(line, textvariable=var, font=small_font, relief="flat",
+                             bg="#FFFFFF", fg=GUI_TEXT, highlightthickness=1,
+                             highlightbackground=GUI_BORDER, highlightcolor=GUI_ACCENT)
+            entry.pack(side="left", fill="x", expand=True, padx=px(6), ipady=px(3))
+            _RoundedButton(line, "浏览", kind="ghost", width=56, height=26,
+                           command=lambda: pick_file(var, title, patterns)).pack(side="right")
+
+        row("视频", video_var, "选择视频", "*.mp4 *.mkv *.flv *.mov *.ts")
+        row("字幕 / 弹幕", sub_var, "选择字幕或弹幕", "*.ass *.srt *.xml *.json")
+        row("输出路径", out_var_merge, "", "*.*")
+
+        mode_row = tk.Frame(form, bg=GUI_CARD)
+        mode_row.pack(fill="x", padx=px(12), pady=(px(10), px(8)))
+        tk.Label(mode_row, text="保存方式", font=small_font, bg=GUI_CARD, fg=GUI_SUB,
+                 width=8, anchor="w").pack(side="left")
+        for text, value in (("外挂（只整理字幕文件）", "external"),
+                            ("软字幕（MKV，可开关）", "soft"),
+                            ("硬字幕（烧进画面，较慢）", "hard")):
+            ttk.Radiobutton(mode_row, text=text, value=value, variable=mode_var).pack(
+                side="left", padx=(0, px(8)))
+
+        hint_var = tk.StringVar(value="")
+        tk.Label(dlg, textvariable=hint_var, font=small_font, bg=GUI_BG, fg=GUI_SUB,
+                 justify="left", anchor="w").pack(fill="x", padx=px(18))
+
+        buttons = tk.Frame(dlg, bg=GUI_BG)
+        buttons.pack(fill="x", padx=px(18), pady=(px(8), px(12)))
+        merge_btn = _RoundedButton(buttons, "开始合并", kind="accent", width=104, height=34,
+                                   font=("Microsoft YaHei UI", 10, "bold"),
+                                   command=lambda: run_merge())
+        merge_btn.pack(side="right")
+        _RoundedButton(buttons, "关闭", kind="ghost", width=70, height=34,
+                       command=lambda: dlg.destroy()).pack(side="right", padx=(0, px(8)))
+
+        def run_merge() -> None:
+            video = Path(video_var.get().strip()).expanduser() if video_var.get().strip() else None
+            subtitle = Path(sub_var.get().strip()).expanduser() if sub_var.get().strip() else None
+            if not video or not subtitle:
+                messagebox.showinfo("提示", "先选视频和字幕文件", parent=dlg)
+                return
+            out = Path(out_var_merge.get().strip()).expanduser() if out_var_merge.get().strip() else None
+            merge_btn.set_enabled(False)
+            hint_var.set("正在处理…（软字幕 / 外挂是秒级，硬字幕要重新编码整段视频）")
+
+            def worker() -> None:
+                try:
+                    result = merge_subtitle(video, subtitle, mode_var.get(), out)
+                    def done() -> None:
+                        merge_btn.set_enabled(True)
+                        hint_var.set(f"完成：{result}")
+                        messagebox.showinfo("合并完成", f"已保存到：\n{result}", parent=dlg)
+                    ui_jobs.put(done)
+                except Exception as exc:
+                    def failed() -> None:
+                        merge_btn.set_enabled(True)
+                        hint_var.set("失败")
+                        messagebox.showerror("合并失败", short_error(exc, 300), parent=dlg)
+                    ui_jobs.put(failed)
+
+            threading.Thread(target=worker, name="merge-sub", daemon=True).start()
+
+    def auto_record(info: dict) -> None:
+        """预约开播的自动录制：不依赖直播窗口是否打开，按配置直接开录，结束自动收尾。"""
+        rec = live_state.get("rec")
+        if rec and rec.running:
+            append_log("[预约] 已经有一段录制在进行，跳过这次自动录制\n")
+            return
+        try:
+            session, headers = live_http()
+            recorder = LiveRecorder(
+                session, headers, info,
+                out_dir=Path(str(live_cfg.get("output") or default_output())),
+                qn=int(live_cfg.get("qn") or LIVE_DEFAULT_QN),
+                segment_minutes=int(live_cfg.get("segment_minutes") or LIVE_SEGMENT_MINUTES),
+                danmaku_light=bool(live_cfg.get("danmaku_light", True)),
+                danmaku_full=bool(live_cfg.get("danmaku_full", True)),
+                keep_segments=bool(live_cfg.get("keep_segments", False)),
+                log=lambda text: ui_jobs.put(lambda value=text: append_log(value + "\n")))
+        except Exception as exc:
+            append_log(f"[预约] 无法开始录制：{short_error(exc)}\n")
+            return
+        live_state["rec"] = recorder
+        recorder.start()
+        append_log(f"[预约] 已开始录制：{info.get('title') or info.get('ref_id')}\n")
+        if tray:
+            tray.notify("直播开播", f"{info.get('uname') or ''} 开播了，已自动开始录制。")
+
+        def watcher() -> None:
+            while recorder.running:
+                time.sleep(3)
+            result = recorder.finish()
+            lines = [f"视频：{item}" for item in result.get("videos") or []]
+            for mode, item in (result.get("danmaku") or {}).items():
+                lines.append(f"{mode} 弹幕：{item['count']} 条 → {item['ass'].name}")
+            text = "\n".join(lines) or "没有产物（可能录得太短）"
+
+            def done() -> None:
+                if live_state.get("rec") is recorder:
+                    live_state["rec"] = None
+                append_log("[预约] 直播结束，已自动保存：\n" + text + "\n")
+                if tray:
+                    tray.notify("直播录制完成", text[:200])
+
+            ui_jobs.put(done)
+
+        threading.Thread(target=watcher, name="live-auto-finish", daemon=True).start()
+
+    live_state["auto_start"] = auto_record
+
     # ---------------- 底部 ----------------
     bottom = tk.Frame(root, bg=GUI_BG)
-    bottom.pack(fill="x", padx=px(18), pady=(px(8), px(12)))
+    bottom.pack(side="bottom", fill="x", padx=px(18), pady=(px(8), px(12)))
     progress = ttk.Progressbar(bottom, mode="indeterminate",
                                style="Win.Horizontal.TProgressbar")
     progress.pack(fill="x", pady=(0, px(6)))
@@ -3165,6 +5177,11 @@ def run_gui() -> int:
                    command=lambda: open_folder(out_var.get())).pack(side="right", padx=(0, px(8)))
     _RoundedButton(foot, "帮助", kind="ghost", width=70, height=34,
                    command=lambda: show_help()).pack(side="right")
+    _RoundedButton(foot, "合并弹幕", kind="ghost", width=92, height=34,
+                   command=lambda: open_merge_dialog()).pack(side="left")
+    _RoundedButton(foot, "录制直播", kind="secondary", width=92, height=34,
+                   command=lambda: open_live_window()).pack(side="left", padx=(0, px(8)))
+    main.pack(fill="both", expand=True, padx=px(18), pady=(0, px(4)))
 
 
     # ---------------- 状态 ----------------
@@ -3738,6 +5755,37 @@ def run_gui() -> int:
     else:
         render_cred()
 
+    tray_events: "queue.Queue[str]" = queue.Queue()
+    tray = _TrayIcon("B 站视频下载器", tray_events.put)
+
+    def hide_to_tray() -> None:
+        # 没有托盘（非 Windows / 托盘起不来）时不能把窗口藏起来，否则就找不回来了
+        if not (tray and tray.available() and tray._thread):
+            root.destroy()
+            return
+        root.withdraw()
+        tray.notify("B 站视频下载器", "已最小化到托盘；右键托盘图标可以显示窗口或退出。")
+
+    def quit_app() -> None:
+        rec = live_state.get("rec")
+        if rec and rec.running:
+            if not messagebox.askyesno("正在录制直播",
+                                       "录制还在进行，退出会停止录制并保留已经录下的分段。\n确定退出？"):
+                return
+            rec.stop()
+        if scheduler:
+            scheduler.stop()
+        if tray:
+            tray.stop()
+        root.destroy()
+
+    def maybe_minimize() -> None:
+        try:
+            if root.state() == "iconic" and tray and tray.available():
+                root.withdraw()
+        except Exception:
+            pass
+
     def drain() -> None:
         try:
             while True:
@@ -3748,6 +5796,20 @@ def run_gui() -> int:
             while True:
                 total, items, box = dialog_jobs.get_nowait()
                 open_selection_dialog(total, items, box)
+        except queue.Empty:
+            pass
+        try:
+            while True:
+                action = tray_events.get_nowait()
+                if action == "show":
+                    root.deiconify()
+                    root.state("normal")
+                    root.lift()
+                elif action == "live":
+                    root.deiconify()
+                    open_live_window()
+                elif action == "quit":
+                    quit_app()
         except queue.Empty:
             pass
         try:
@@ -3763,10 +5825,35 @@ def run_gui() -> int:
                                                    "（已下载的部分会保留，下次可续传）"):
                 return
             request_abort()
-        root.destroy()
+        rec = live_state.get("rec")
+        if rec and rec.running:
+            if not messagebox.askyesno("正在录制直播",
+                                       "录制还在进行，关掉主界面会隐藏到托盘继续录。\n"
+                                       "要停止录制请在直播窗口点「停止」。继续？"):
+                return
+        hide_to_tray()
 
     _SELECTION_CALLBACK = ask_in_gui
     root.protocol("WM_DELETE_WINDOW", on_close)
+    root.bind("<Unmap>", lambda _event: root.after(30, maybe_minimize))
+
+    # 托盘：Windows 下才有；其他平台照常是普通窗口
+    tray.start()
+
+    # 预约任务：无论有没有任务都起一个线程，之后添加任务直接生效
+    scheduler: LiveScheduler | None = None
+    try:
+        session_now, headers_now = live_http()
+        scheduler = LiveScheduler(
+            session_now, headers_now, list(live_cfg.get("tasks") or []),
+            on_live=lambda info, task: ui_jobs.put(
+                lambda: live_state.get("auto_start") and live_state["auto_start"](info)),
+            log=lambda text: ui_jobs.put(lambda value=text: append_log(value + "\n")),
+            interval=int(live_cfg.get("poll_seconds") or LIVE_POLL_SECONDS),
+        )
+        scheduler.start()
+    except Exception:
+        scheduler = None
 
     # 按内容实际尺寸定窗口：不同 DPI / 字体下控件请求的宽度差很多，
     # 写死 1240x900 会在 150% 缩放时把右栏挤出屏幕。
@@ -3778,7 +5865,7 @@ def run_gui() -> int:
     # 控件、字体、间距都按 SCALE 折算过了，请求尺寸就是物理像素，
     # 窗口只需要在"内容需要"和"屏幕可用"之间取一个合适的值。
     want_w = min(screen_w - px(60), max(need_w + px(16), int(screen_w * 0.68)))
-    want_h = min(screen_h - px(60), max(need_h + px(16), int(screen_h * 0.72)))
+    want_h = min(screen_h - px(150), max(need_h + px(16), int(screen_h * 0.72)))
     root.minsize(min(px(980), want_w), min(px(660), want_h))
     root.geometry(f"{want_w}x{want_h}+{max(0, (screen_w - want_w) // 2)}+"
                   f"{max(px(20), (screen_h - want_h) // 3)}")
@@ -3787,6 +5874,9 @@ def run_gui() -> int:
     append_log("1) 把视频链接粘到上面的输入框\n"
                "2) 点“读取分集”，在右侧清单里勾选要下的分集\n"
                "3) 选好画质 / 弹幕等选项，点“开始下载”\n")
+    if start_live_only:
+        root.withdraw()
+        open_live_window()
     drain()
     try:
         root.mainloop()
