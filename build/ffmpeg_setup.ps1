@@ -54,7 +54,9 @@ $UserAgent = 'bilibili-downloader-setup'
 
 function Write-Out([string]$Text) {
     if ($OutFile) {
-        Set-Content -LiteralPath $OutFile -Value $Text -Encoding ASCII
+        # 带 BOM 的 UTF-8：安装器（Inno Setup，Unicode）按 BOM 解码，中文提示不会变成 ????
+        [System.IO.File]::WriteAllText($OutFile, $Text + [Environment]::NewLine,
+            (New-Object System.Text.UTF8Encoding($true)))
     }
 }
 
@@ -87,24 +89,39 @@ function Resolve-Url {
 # rejected by the GitHub asset host, so ask for the first byte and read the
 # total out of Content-Range (bytes 0-0/119467219).
 function Get-RemoteMeta([string]$Target) {
-    $request = [System.Net.HttpWebRequest]::Create($Target)
-    $request.Method = 'GET'
-    $request.UserAgent = $UserAgent
-    $request.AllowAutoRedirect = $true
-    $request.Timeout = 25000
-    $request.AddRange(0, 0)
-    $response = $request.GetResponse()
-    $range = [string]$response.Headers['Content-Range']
-    $length = 0
-    $ranges = $false
-    if ($range -match '/(\d+)$') {
-        $length = [int64]$Matches[1]
-        $ranges = $true
+    # 用 HttpClient：它的 Timeout 覆盖 DNS / 建连 / 等响应全过程。
+    # 之前用 HttpWebRequest 时镜像源偶发卡在握手，安装器会长时间停在"准备安装"页。
+    Add-Type -AssemblyName System.Net.Http
+    $client = New-Object System.Net.Http.HttpClient
+    $client.Timeout = [TimeSpan]::FromSeconds(15)
+    $resp = $null
+    try {
+        $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $Target)
+        [void]$req.Headers.TryAddWithoutValidation('User-Agent', $UserAgent)
+        $req.Headers.Range = New-Object System.Net.Http.Headers.RangeHeaderValue(0, 0)
+        $resp = $client.SendAsync($req).GetAwaiter().GetResult()
+        $range = [string]$resp.Content.Headers.ContentRange
+        $length = 0
+        $ranges = $false
+        if ($range -match '/(\d+)$') {
+            $length = [int64]$Matches[1]
+            $ranges = $true
+        }
+        if ($length -le 0 -and $resp.Content.Headers.ContentLength) {
+            $length = [int64]$resp.Content.Headers.ContentLength
+        }
+        if ($length -le 0) { throw 'server did not report a size' }
+        return @{ Length = $length; Ranges = $ranges }
     }
-    if ($length -le 0) { $length = $response.ContentLength }
-    $response.Close()
-    if ($length -le 0) { throw 'server did not report a size' }
-    return @{ Length = $length; Ranges = $ranges }
+    catch {
+        $why = $_.Exception.Message
+        if ($_.Exception.InnerException) { $why = $_.Exception.InnerException.Message }
+        throw ('读取文件大小失败：' + $why)
+    }
+    finally {
+        if ($resp) { $resp.Dispose() }
+        $client.Dispose()
+    }
 }
 
 function Format-Mb([double]$Bytes) {
@@ -330,18 +347,6 @@ function Install-Bin([string]$SrcRoot, [string]$Target) {
 # thread count and a stop button. DoEvents keeps the window alive without a
 # timer; the transfer itself runs on .NET threads inside FfDl.
 function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Threads) {
-    $meta = Get-RemoteMeta $Target
-    [int64]$total = $meta.Length
-    $useRanges = [bool]$meta.Ranges
-    if (-not $useRanges) { $Threads = 1 }
-    if ($Threads -lt 1) { $Threads = 1 }
-    if ($Threads -gt 16) { $Threads = 16 }
-
-    Initialize-Downloader
-
-    $work = Join-Path $env:TEMP ('bili_dl_' + [Guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $work -Force | Out-Null
-
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
 
@@ -356,7 +361,7 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
     $form.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
 
     $title = New-Object System.Windows.Forms.Label
-    $title.Text = ('共 {0}，{1} 线程并行下载' -f (Format-Mb $total), $Threads)
+    $title.Text = '正在获取文件信息…'
     $title.AutoSize = $true
     $title.Location = New-Object System.Drawing.Point(18, 16)
     $form.Controls.Add($title)
@@ -369,7 +374,7 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
     $form.Controls.Add($bar)
 
     $detail = New-Object System.Windows.Forms.Label
-    $detail.Text = '0.0 MB / 0.0 MB（0%）'
+    $detail.Text = '正在连接下载服务器，请稍候…'
     $detail.AutoSize = $true
     $detail.Location = New-Object System.Drawing.Point(18, 82)
     $form.Controls.Add($detail)
@@ -389,9 +394,34 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
     $form.CancelButton = $stopBtn
     $stopBtn.Add_Click({ [FfDl]::Stop = $true; $stopBtn.Enabled = $false })
 
+    # 先把窗口亮出来：抓远端大小可能要十几秒，不能让它看起来像卡死。
+    # 安装器是用 SW_HIDE 起的进程，Windows 会把"首个窗口"按隐藏状态处理，
+    # 所以 Show() 之后还要用 ShowWindow(SW_SHOW) 强制显示一次。
+    $form.Show()
+    Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class WinShow{[DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr h,int n);}'
+    [void][WinShow]::ShowWindow($form.Handle, 5)
+    $form.Activate()
+    [System.Windows.Forms.Application]::DoEvents()
+
+    $meta = Get-RemoteMeta $Target
+    [int64]$total = $meta.Length
+    $useRanges = [bool]$meta.Ranges
+    if (-not $useRanges) { $Threads = 1 }
+    if ($Threads -lt 1) { $Threads = 1 }
+    if ($Threads -gt 16) { $Threads = 16 }
+
+    Initialize-Downloader
+
+    $work = Join-Path $env:TEMP ('bili_dl_' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+
+    $title.Text = ('共 {0}，{1} 线程并行下载' -f (Format-Mb $total), $Threads)
+    $detail.Text = '0.0 MB / 0.0 MB（0%）'
+    $speed.Text = '总速度 0.0 MB/s'
+    [System.Windows.Forms.Application]::DoEvents()
+
     [FfDl]::Begin($Target, $total, $work, $ZipPath, $Threads, $useRanges)
 
-    $form.Show()
     [int64]$lastDone = 0
     $lastTick = [DateTime]::UtcNow
     [double]$rate = 0
@@ -510,6 +540,8 @@ try {
     exit 0
 }
 catch {
-    Write-Out ('ERR: ' + $_.Exception.Message)
+    $why = [string]$_.Exception.Message
+    if ($why.Length -gt 120) { $why = $why.Substring(0, 120) + '…' }
+    Write-Out ('ERR: ' + $why)
     exit 1
 }

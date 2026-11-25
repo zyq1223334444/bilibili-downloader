@@ -43,7 +43,7 @@
 
 #define AppName        "Bilibili Downloader"
 #define AppShortName   "bilibili-downloader"
-#define AppVersion     "2.1.1"
+#define AppVersion     "2.1.2"
 #define AppPublisher   "zyq1223334444"
 #define AppURL         "https://github.com/zyq1223334444/bilibili-downloader"
 #define ExeName        "bilibili_downloader.exe"
@@ -98,7 +98,7 @@ chinesesimplified.FfmpegRetryAsk=从%1下载失败：%2%n%n改用%3重试吗？
 chinesesimplified.FfmpegPageTitle=正在下载 ffmpeg
 chinesesimplified.FfmpegPageDesc=缺少 ffmpeg，正在下载。下载完成后会自动解压并加入 PATH，可随时点“停止下载”；停止后会问你要不要换另一个源。
 chinesesimplified.FfmpegFailDetail=ffmpeg 下载或安装失败：%1%n%n也可以稍后运行 bilibili_downloader --install-ffmpeg 重试。
-chinesesimplified.FfmpegDone=ffmpeg 已安装到：%n%1%n%n该目录已加入系统 PATH，新开的命令行窗口里可以直接使用 ffmpeg。
+chinesesimplified.FfmpegDone=ffmpeg 已安装到：%n%1%n%n该目录已加入用户 PATH，新开的命令行窗口里可以直接使用 ffmpeg。
 chinesesimplified.FfmpegFailed=ffmpeg 自动安装失败（可能是网络不通）。%n%n可以稍后运行 bilibili_downloader --install-ffmpeg 重试，%n或用 winget install Gyan.FFmpeg / choco install ffmpeg 手动安装。
 chinesesimplified.FfmpegSkip=已跳过 ffmpeg 安装。%n%n注意：没有 ffmpeg 时只能下载分离的音视频流，无法生成 MP4/MP3、也无法嵌入弹幕。%n稍后可以运行 bilibili_downloader --install-ffmpeg 补装。
 english.CreateDesktopIcon=Create a desktop shortcut
@@ -117,7 +117,7 @@ english.FfmpegRetryAsk=Download from %1 failed: %2%n%nRetry from %3?
 english.FfmpegPageTitle=Downloading ffmpeg
 english.FfmpegPageDesc=ffmpeg is missing, so it is being downloaded. It will be unpacked and added to PATH automatically; you can stop at any time and will then be asked whether to retry from the other source.
 english.FfmpegFailDetail=ffmpeg download or installation failed: %1%n%nYou can also run bilibili_downloader --install-ffmpeg later.
-english.FfmpegDone=ffmpeg installed to:%n%1%n%nThat folder was added to the system PATH; a new terminal can run ffmpeg directly.
+english.FfmpegDone=ffmpeg installed to:%n%1%n%nThat folder was added to the user PATH; a new terminal can run ffmpeg directly.
 english.FfmpegFailed=Automatic ffmpeg installation failed (probably no network).%n%nRun bilibili_downloader --install-ffmpeg later, or install manually with winget install Gyan.FFmpeg / choco install ffmpeg.
 english.FfmpegSkip=ffmpeg installation skipped.%n%nWithout ffmpeg only separate audio/video streams can be downloaded - no MP4/MP3 and no danmaku.%nYou can run bilibili_downloader --install-ffmpeg later.
 
@@ -246,6 +246,25 @@ begin
   end;
 end;
 
+{ 往"用户 PATH"（HKCU\Environment）追加一条，专门用来登记 ffmpeg 的 bin 目录。
+  卸载时不会碰它：用户机器上别的工具可能也依赖这个 ffmpeg。 }
+procedure EnvAddUserPath(Path: string);
+var
+  Paths, UpPaths, UpPath: string;
+begin
+  if not RegQueryStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', Paths) then
+    Paths := '';
+  UpPaths := Uppercase(Paths);
+  UpPath := Uppercase(Path);
+  if (UpPaths = UpPath) or (Pos(';' + UpPath + ';', ';' + UpPaths + ';') > 0) then
+    exit;                                    { 已经在用户 PATH 里，别重复加 }
+  if (Paths <> '') and (Paths[Length(Paths)] <> ';') then
+    Paths := Paths + ';';
+  Paths := Paths + Path;
+  if not RegWriteStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', Paths) then
+    MsgBox('无法写入用户 PATH，请手动把以下目录加入 PATH：' + #13#10 + Path, mbError, MB_OK);
+end;
+
 function FfmpegOnPath(): Boolean;
 var
   Paths, UserPaths: string;
@@ -255,16 +274,28 @@ begin
     Paths := '';
   if RegQueryStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', UserPaths) then
     Paths := Paths + ';' + UserPaths;
-  { 当前进程的 PATH 是启动那一刻的快照，装完 ffmpeg 后要新开进程才更新；
-    再直接拼上约定的安装目录，避免"刚装完却检测不到" }
-  Paths := Paths + ';' + GetEnv('PATH') + ';' + ExpandConstant('{%USERPROFILE}\ffmpeg\bin');
+  { 只认环境变量 PATH：系统 PATH + 用户 PATH + 本进程 PATH 快照。
+    不去猜任何固定安装目录，没在 PATH 里就等于没装 }
+  Paths := Paths + ';' + GetEnv('PATH');
   Result := FileSearch('ffmpeg.exe', Paths) <> '';
 end;
 
 { ffmpeg 已经在 PATH 里、或者静默安装时，源选择页没必要出现 }
 function ShouldSkipPage(PageID: Integer): Boolean;
+var
+  OnPath, Silent: Boolean;
 begin
-  Result := (PageID = FfmpegSourcePage.ID) and (FfmpegOnPath() or WizardSilent);
+  OnPath := FfmpegOnPath();
+  Silent := WizardSilent;
+  Result := (PageID = FfmpegSourcePage.ID) and (OnPath or Silent);
+  if PageID = FfmpegSourcePage.ID then
+    Log('ffmpeg source page skipped=' + IntToStr(Ord(Result)) + ' onpath=' + IntToStr(Ord(OnPath)));
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  { 安装器日志里留下每一步，出问题能看出卡在哪一页 }
+  Log('page shown: ' + IntToStr(CurPageID));
 end;
 
 function FormatSize(Bytes: Int64): string;
@@ -445,9 +476,9 @@ begin
   end;
 
   BinPath := ExpandConstant('{%USERPROFILE}\ffmpeg\bin');
-  { PATH 里只加不改：卸载时保留这一条（见 CurUninstallStepChanged），
-    用户之后重装或别的工具还能直接用 ffmpeg }
-  EnvAddPath(BinPath);
+  { 只把 ffmpeg 的 bin 目录追加进"用户 PATH"，不动系统 PATH；
+    卸载时对 ffmpeg 不做任何事，这条 PATH 和文件都原样留着 }
+  EnvAddUserPath(BinPath);
   MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegDone}'), [BinPath]), mbInformation, MB_OK);
 end;
 { 点"安装"（Ready 页的下一步）时先把 ffmpeg 处理掉，再进入正式复制文件。
