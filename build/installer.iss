@@ -44,7 +44,7 @@
 
 #define AppName        "Bilibili Downloader"
 #define AppShortName   "bilibili-downloader"
-#define AppVersion     "2.1.6"
+#define AppVersion     "2.1.7"
 #define AppPublisher   "zyq1223334444"
 #define AppURL         "https://github.com/zyq1223334444/bilibili-downloader"
 #define ExeName        "bilibili_downloader.exe"
@@ -155,6 +155,9 @@ const
 var
   FfmpegSourcePage: TInputOptionWizardPage;
   FfmpegSource: string;
+  FfmpegUrl: string;
+  { 预热探测：进入"准备安装"页就先异步问一次地址和体积，
+    用户点"安装"时结果已经在文件里，不用再等一个 PowerShell 冷启动 + 网络 }
 
 { 下载不再用 TDownloadWizardPage：它的下载器是单线程的。ffmpeg_setup.ps1
   自己开 8 个 runspace 分段下载，并弹出自己的进度窗口（总进度 + 总速度 +
@@ -295,10 +298,54 @@ begin
     Log('ffmpeg source page skipped=' + IntToStr(Ord(Result)) + ' onpath=' + IntToStr(Ord(OnPath)));
 end;
 
+{ 用户在当前页选的源：默认镜像，第二项勾选即镜像 }
+function FfmpegSourceOfPage(): string;
+begin
+  if FfmpegSourcePage.Values[1] then
+    Result := 'mirror'
+  else
+    Result := 'official';
+end;
+
+function FfmpegInfoFile(const Source: string): string;
+begin
+  Result := ExpandConstant('{tmp}\ffmpeg_info_' + Source + '.txt');
+end;
+
+{ 起一个后台 PowerShell 只做 Info 探测（地址 + 体积 + 是否支持分段）。
+  结果落在 info 文件里；-OutFile 是最后一次性写入的，文件出现即代表内容完整。 }
+procedure StartFfmpegInfoProbe(const Source: string);
+var
+  Code: Integer;
+begin
+  { 脚本本身还是 dontcopy，进这一页时先解出来；重复解压没有副作用 }
+  try
+    ExtractTemporaryFile('ffmpeg_setup.ps1');
+  except
+    exit;
+  end;
+  { 已有结果就不再重复打扰网络 }
+  if FileExists(FfmpegInfoFile(Source)) then
+    exit;
+  Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+       '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' +
+       ExpandConstant('{tmp}\ffmpeg_setup.ps1') + '" -HideConsole -Mode Info -Source ' +
+       Source + ' -OutFile "' + FfmpegInfoFile(Source) + '"',
+       '', SW_HIDE, ewNoWait, Code);
+  Log('ffmpeg info probe started for ' + Source);
+end;
+
 procedure CurPageChanged(CurPageID: Integer);
 begin
   { 安装器日志里留下每一步，出问题能看出卡在哪一页 }
   Log('page shown: ' + IntToStr(CurPageID));
+
+  { 到了"准备安装"页就把 ffmpeg 地址/体积的探测挂到后台去跑。
+    用户在这一页通常要停顿一两秒（读摘要、改勾选项），刚好把这段网络+进程启动
+    时间藏掉 —— 点"安装"时探测结果多半已经写好了，不会再出现"点了没反应" }
+  if (CurPageID = wpReady) and (not WizardSilent) then
+    if not FfmpegOnPath() then
+      StartFfmpegInfoProbe(FfmpegSourceOfPage());
 end;
 
 function FormatSize(Bytes: Int64): string;
@@ -331,6 +378,52 @@ begin
     Result := Trim(Lines[0]);
 end;
 
+{ 读预热探测写下的 info 文件：第 1 行地址、第 2 行字节数、第 3 行是否支持分段 }
+function ReadFfmpegInfo(const Source: string; var Url: string; var Size: Int64): Boolean;
+var
+  Lines: TArrayOfString;
+begin
+  Result := False;
+  Url := '';
+  Size := 0;
+  if not FileExists(FfmpegInfoFile(Source)) then
+    exit;
+  if not LoadStringsFromFile(FfmpegInfoFile(Source), Lines) then
+    exit;
+  if Length(Lines) < 2 then
+    exit;
+  if Trim(Lines[0]) = '' then
+    exit;
+  Url := Trim(Lines[0]);
+  Size := StrToInt64Def(Trim(Lines[1]), 0);
+  Result := Size > 0;
+end;
+
+{ 拿不到就同步补一次；拿到了就带着 URL 走，后面下载不用再解析一遍 }
+function EnsureFfmpegInfo(const Source: string; var Url: string; var Size: Int64): Boolean;
+var
+  i: Integer;
+begin
+  StartFfmpegInfoProbe(Source);
+
+  { 预热一般早就跑完了，这里最多再等 3 秒 }
+  for i := 0 to 59 do
+  begin
+    if ReadFfmpegInfo(Source, Url, Size) then
+    begin
+      Result := True;
+      exit;
+    end;
+    Sleep(50);
+  end;
+
+  DeleteFile(FfmpegInfoFile(Source));
+  Result := RunSetupScript('-Mode Info -Source ' + Source +
+                           ' -OutFile "' + FfmpegInfoFile(Source) + '"') = 0;
+  if Result then
+    Result := ReadFfmpegInfo(Source, Url, Size);
+end;
+
 { 向下载站点查真实体积：提示里的"大小"必须是当前版本的实际大小，不能写死。
   地址由 ffmpeg_setup.ps1 自己解析（先用 GitHub API 找同名资产，国内快得多；
   解析不到才退回 gyan.dev），所以这里不传 -Url。 }
@@ -348,32 +441,6 @@ begin
     Result := ExpandConstant('{cm:FfmpegSourceMirror}')
   else
     Result := ExpandConstant('{cm:FfmpegSourceOfficial}');
-end;
-function QueryFfmpegSize(const Source: string): Int64;
-var
-  SizeFile: string;
-begin
-  Result := 0;
-  SizeFile := ExpandConstant('{tmp}\ffmpeg_size.txt');
-  DeleteFile(SizeFile);
-  if RunSetupScript('-Mode Size -Source ' + Source + ' -OutFile "' + SizeFile + '"') <> 0 then
-    exit;
-  Result := StrToInt64Def(ReadFirstLine(SizeFile), 0);
-  DeleteFile(SizeFile);
-end;
-
-{ 解析当前版本的下载地址（版本号在文件名里，不能写死） }
-function ResolveFfmpegUrl(const Source: string): string;
-var
-  UrlFile: string;
-begin
-  Result := '';
-  UrlFile := ExpandConstant('{tmp}\ffmpeg_url.txt');
-  DeleteFile(UrlFile);
-  if RunSetupScript('-Mode Url -Source ' + Source + ' -OutFile "' + UrlFile + '"') <> 0 then
-    exit;
-  Result := ReadFirstLine(UrlFile);
-  DeleteFile(UrlFile);
 end;
 
 { 只解压已经下载好的 zip，不再联网 —— 联网那一步交给下载页，用户能看到进度 }
@@ -416,13 +483,13 @@ begin
   ExtractTemporaryFile('ffmpeg_setup.ps1');
   ExtractTemporaryFile('app.ico');
 
-  if FfmpegSourcePage.Values[1] then
-    FfmpegSource := 'mirror'
-  else
-    FfmpegSource := 'official';
+  FfmpegSource := FfmpegSourceOfPage();
 
-  Size := QueryFfmpegSize(FfmpegSource);
-  if Size > 0 then
+  { 地址和体积一次问完，并把这个地址缓存下来给下载用：
+     以前 Size 一次进程、Download 里再解析一遍 API，两趟加起来就是好几秒的"点了没反应" }
+  FfmpegUrl := '';
+  Size := 0;
+  if EnsureFfmpegInfo(FfmpegSource, FfmpegUrl, Size) then
     SizeText := FormatSize(Size)
   else
     SizeText := '约 114 MB';
@@ -438,12 +505,18 @@ begin
   StatusFile := ExpandConstant('{tmp}\ffmpeg_download.txt');
   while True do
   begin
-    { 下载整个交给脚本：8 线程分段 + 自己的进度窗口。
-      退出码 0 = 成功，3 = 用户点了停止，其它 = 出错（原因写在 StatusFile） }
+    { 下载整个交给脚本：8 线程分段 + 自己的进度窗口 + 下载完就地解压。
+      退出码 0 = 成功，3 = 用户点了停止，其它 = 出错（原因写在 StatusFile）。
+      -Url 用预热阶段就解析好的地址，下载这趟不再重新访问 GitHub API；
+      -Dest 让解压留在同一个进程里，省掉一次 PowerShell 冷启动和一段"窗口消失后干等"。 }
     DeleteFile(Zip);
     DeleteFile(StatusFile);
+    if FfmpegUrl = '' then
+      EnsureFfmpegInfo(FfmpegSource, FfmpegUrl, Size);
     Code := RunSetupScript('-Mode Download -Source ' + FfmpegSource +
+                           ' -Url "' + FfmpegUrl + '"' +
                            ' -Zip "' + Zip + '" -Threads 8' +
+                           ' -Dest "' + ExpandConstant('{%USERPROFILE}\ffmpeg') + '"' +
                            ' -IconFile "' + ExpandConstant('{tmp}\app.ico') + '"' +
                            ' -OutFile "' + StatusFile + '"');
     if (Code = 0) and FileExists(Zip) then
@@ -458,7 +531,10 @@ begin
       { 用户按了"停止"：这就是下载途中的换源入口 }
       if MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegSwitchAsk}'), [SourceLabel(Other)]),
                 mbConfirmation, MB_YESNO) = IDYES then
-        FfmpegSource := Other
+      begin
+        FfmpegSource := Other;
+        FfmpegUrl := '';   { 换源了，地址要按新源重新取 }
+      end
       else
         exit;
     end
@@ -466,7 +542,10 @@ begin
     begin
       if MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegRetryAsk}'), [SourceLabel(FfmpegSource), Err, SourceLabel(Other)]),
                 mbConfirmation, MB_YESNO) = IDYES then
-        FfmpegSource := Other
+      begin
+        FfmpegSource := Other;
+        FfmpegUrl := '';
+      end
       else
       begin
         MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegFailDetail}'), [Err]), mbError, MB_OK);
@@ -475,11 +554,13 @@ begin
     end;
   end;
 
-  if not ExtractFfmpeg(Zip) then
-  begin
-    MsgBox(ExpandConstant('{cm:FfmpegFailed}'), mbError, MB_OK);
-    exit;
-  end;
+  { 正常路径下下载窗口已经把 bin 写好了；只有老包/异常才走这里补一次解压 }
+  if not FileExists(ExpandConstant('{%USERPROFILE}\ffmpeg\bin\ffmpeg.exe')) then
+    if not ExtractFfmpeg(Zip) then
+    begin
+      MsgBox(ExpandConstant('{cm:FfmpegFailed}'), mbError, MB_OK);
+      exit;
+    end;
 
   BinPath := ExpandConstant('{%USERPROFILE}\ffmpeg\bin');
   { 只把 ffmpeg 的 bin 目录追加进"用户 PATH"，不动系统 PATH；

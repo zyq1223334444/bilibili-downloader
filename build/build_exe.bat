@@ -48,9 +48,12 @@ rem     file rather than code. Without it the exe starts fine but every
 rem     HTTPS call dies with
 rem     "Could not find a suitable TLS CA certificate bundle".
 rem
-rem   --windows-console-mode=force
-rem     This is a console tool that prints progress bars. Without the flag
-rem     the exe would be a GUI-subsystem binary with no usable stdout.
+rem   --windows-console-mode=attach
+rem     The exe is both a CLI (prints progress bars) and a tkinter GUI. `force` opens
+rem     a black console behind the GUI on every launch, `disable` would kill stdout in
+rem     a terminal. `attach` only borrows the console it was started from, so Explorer /
+rem     shortcut launches have no console window at all while running it from a terminal
+rem     still prints.
 rem
 rem   --enable-plugin=tk-inter
 rem     Running without arguments opens the tkinter GUI. The plugin makes
@@ -96,10 +99,10 @@ python -m nuitka --standalone --onefile --msvc=latest ^
     --include-package-data=certifi ^
     --windows-icon-from-ico="%ROOT%\assets\app.ico" ^
     --include-data-files="%ROOT%\assets\app.ico=assets/app.ico" ^
-    --windows-console-mode=force ^
+    --windows-console-mode=attach ^
     --company-name="zyq1223334444" ^
     --product-name="Bilibili Downloader" ^
-    --file-version=2.1.6.0 --product-version=2.1.6.0 ^
+    --file-version=2.1.7.0 --product-version=2.1.7.0 ^
     --file-description="Bilibili video / multi-part / collection downloader (DASH + ffmpeg + danmaku)" ^
     "%ROOT%\bilibili_downloader.py"
 if errorlevel 1 goto build_failed

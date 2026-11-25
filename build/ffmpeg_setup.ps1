@@ -5,8 +5,12 @@
 #
 #      -Mode Url       write the resolved archive URL into -OutFile
 #      -Mode Size      write the archive's real size into -OutFile
+#      -Mode Info      write url / size / ranges (3 lines) into -OutFile,
+#                      so the installer needs one process instead of two
 #      -Mode Download  multi-threaded download into -Zip, with its own small
-#                      progress window (total progress, total speed, stop)
+#                      progress window (total progress, total speed, stop);
+#                      with -Dest it unpacks straight into <Dest>\bin before
+#                      the window closes, so no second process is needed
 #      -Mode Extract   unpack the already downloaded -Zip into <Dest>\bin
 #      -Mode Install   silent multi-threaded download + extract (CLI use)
 #
@@ -30,7 +34,7 @@
 #  unless it sees a BOM, and the progress window below uses Chinese text.
 # =====================================================================
 param(
-    [ValidateSet('Url', 'Size', 'Download', 'Extract', 'Install')]
+    [ValidateSet('Url', 'Size', 'Info', 'Download', 'Extract', 'Install')]
     [string]$Mode = 'Size',
     [ValidateSet('auto', 'official', 'mirror')]
     [string]$Source = 'auto',
@@ -47,16 +51,10 @@ param(
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# 安装器那边虽然已经用 SW_HIDE + -WindowStyle Hidden 起本进程，PowerShell 仍会先
-# 建一个控制台窗口，在部分机器上能看到黑框一直挂在下载窗后面。装完就藏掉：
-# 没有控制台（已经在隐藏状态下启动）时 GetConsoleWindow 返回 0，什么都不做。
-if ($HideConsole) {
-    Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class WinCon{[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int n);}'
-    try {
-        $cw = [WinCon]::GetConsoleWindow()
-        if ($cw -ne [IntPtr]::Zero) { [void][WinCon]::ShowWindow($cw, 0) }   # 0 = SW_HIDE
-    } catch { }
-}
+# 这里刻意不再用 Add-Type 藏控制台：每调一次 Add-Type 都要起一遍 csc，
+# 光这一下就是 300-800 ms，而 -Mode Info / Size / Url 本来就只跑几百毫秒。
+# 安装器已经用 SW_HIDE + -WindowStyle Hidden 起进程，控制台不会露出来；
+# 真正需要兜底的只有带 GUI 的那些模式，放到 Initialize-Native 里一次编译完。
 
 # gyan.dev is the upstream release page, but it served ~30 KB/s here, so the URL
 # is resolved through the GitHub API first (same archive, an order of magnitude faster).
@@ -82,13 +80,23 @@ function Resolve-Url {
         $base = $Url
     }
     else {
+        # PS 5.1 的 Invoke-WebRequest 光握手就要 1-3 秒，安装器上这段等待全变成"卡"。
+        # 换成 HttpClient，超时也只能靠它覆盖 DNS/建连/等响应。
+        # PS 5.1 里 System.Net.Http 不会自动加载，Add-Type -AssemblyName 只是装程序集，
+        # 不起 csc，几十毫秒。
+        try { Add-Type -AssemblyName System.Net.Http -ErrorAction Stop } catch { }
         try {
-            $headers = @{ 'User-Agent' = $UserAgent }
-            $resp = Invoke-WebRequest -Uri $ReleaseApi -Headers $headers -UseBasicParsing -TimeoutSec 20
-            $json = $resp.Content | ConvertFrom-Json
-            $asset = $json.assets | Where-Object { $_.name -like '*essentials_build.zip' } |
-                     Select-Object -First 1
-            if ($asset -and $asset.browser_download_url) { $base = [string]$asset.browser_download_url }
+            $client = New-Object System.Net.Http.HttpClient
+            $client.Timeout = [TimeSpan]::FromSeconds(8)
+            try {
+                $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $ReleaseApi)
+                [void]$req.Headers.TryAddWithoutValidation('User-Agent', $UserAgent)
+                $resp = $client.SendAsync($req).GetAwaiter().GetResult()
+                $body = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                $m = [regex]::Match($body, '"browser_download_url"\s*:\s*"(https://[^"]+essentials_build\.zip)"')
+                if ($m.Success) { $base = $m.Groups[1].Value }
+            }
+            finally { $client.Dispose() }
         }
         catch { }
         if (-not $base) { $base = $FallbackUrl }
@@ -99,15 +107,84 @@ function Resolve-Url {
     return $base
 }
 
+# 候选地址：按源解析出来的那个排第一；它是 ghfast.top 镜像的话，再补上
+# github.com 原地址和 gyan.dev 备用。探测只认"第一个真的能连上并报出大小的"。
+function Get-Candidates {
+    $list = New-Object System.Collections.Generic.List[string]
+    $first = Resolve-Url
+    if (-not $first) { $first = $FallbackUrl }
+    $list.Add($first)
+    if ($first -like ($MirrorPrefix + 'https://github.com/*')) {
+        $list.Add($first.Substring($MirrorPrefix.Length))
+    }
+    if ($first -notlike '*gyan.dev*') { $list.Add($FallbackUrl) }
+    return $list
+}
+
+# 实测可用的地址 + 它的体积元信息。镜像源经常整段挂掉（超时 / 403），
+# 这里把候选地址**同时**发出去探，谁先报出大小就用谁：
+# 串行试的时候三个源全挂要等 12 秒，并行最多只等一个超时。
+function Get-BestTarget([int]$TimeoutSec = 5) {
+    $cands = Get-Candidates
+    Add-Type -AssemblyName System.Net.Http
+    $client = New-Object System.Net.Http.HttpClient
+    $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSec)
+    $probes = @()
+    try {
+        foreach ($t in $cands) {
+            try {
+                $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $t)
+                [void]$req.Headers.TryAddWithoutValidation('User-Agent', $UserAgent)
+                $req.Headers.Range = New-Object System.Net.Http.Headers.RangeHeaderValue(0, 0)
+                $probes += @{ Target = $t; Response = $client.SendAsync($req) }
+            }
+            catch { }
+        }
+        # 三个请求同时飞出去，谁先完成且报得出大小就用谁 —— 不去等排在前面的那个超时。
+        $why = ''
+        $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec + 1)
+        $done = @()
+        while ([DateTime]::UtcNow -lt $deadline) {
+            foreach ($pr in $probes) {
+                if ($done -contains $pr.Target) { continue }
+                if (-not $pr.Response.IsCompleted) { continue }
+                $done += $pr.Target
+                try {
+                    $resp = $pr.Response.GetAwaiter().GetResult()
+                    $range = [string]$resp.Content.Headers.ContentRange
+                    $length = [int64]0
+                    $ranges = $false
+                    if ($range -match '/(\d+)$') { $length = [int64]$Matches[1]; $ranges = $true }
+                    if (($length -le 0) -and $resp.Content.Headers.ContentLength) {
+                        $length = [int64]$resp.Content.Headers.ContentLength
+                    }
+                    $resp.Dispose()
+                    if ($length -gt 0) {
+                        return @{ Target = $pr.Target; Meta = @{ Length = $length; Ranges = $ranges } }
+                    }
+                    $why = 'server did not report a size'
+                }
+                catch {
+                    $why = [string]$_.Exception.Message
+                    if ($_.Exception.InnerException) { $why = [string]$_.Exception.InnerException.Message }
+                }
+            }
+            Start-Sleep -Milliseconds 25
+        }
+        throw ('读取文件大小失败：' + $why)
+    }
+    finally { $client.Dispose() }
+}
+
 # Total size + whether the host honours Range requests. A HEAD request is
 # rejected by the GitHub asset host, so ask for the first byte and read the
 # total out of Content-Range (bytes 0-0/119467219).
-function Get-RemoteMeta([string]$Target) {
+function Get-RemoteMeta([string]$Target, [int]$TimeoutSec = 15) {
     # 用 HttpClient：它的 Timeout 覆盖 DNS / 建连 / 等响应全过程。
     # 之前用 HttpWebRequest 时镜像源偶发卡在握手，安装器会长时间停在"准备安装"页。
     Add-Type -AssemblyName System.Net.Http
     $client = New-Object System.Net.Http.HttpClient
-    $client.Timeout = [TimeSpan]::FromSeconds(15)
+    $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSec)
     $resp = $null
     try {
         $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $Target)
@@ -341,18 +418,59 @@ function Initialize-Downloader {
     }
 }
 
-# Copy the archive's bin\ folder into <Dest>\bin, then make sure the copy starts.
-function Install-Bin([string]$SrcRoot, [string]$Target) {
-    $exe = Get-ChildItem -LiteralPath $SrcRoot -Recurse -Filter 'ffmpeg.exe' |
-           Where-Object { $_.Directory.Name -eq 'bin' } |
-           Select-Object -First 1
-    if (-not $exe) { throw 'ffmpeg.exe not found inside the archive' }
+# 一次 Add-Type 拿到全部原生调用：以前 GetConsoleWindow / DPI / ShowWindow 各编译一次，
+# 每次都要起 csc，装个 ffmpeg 光编译就白等一两秒。
+$NativeCode = @'
+using System;
+using System.Runtime.InteropServices;
+public class WinTrim {
+    [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+    [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr v);
+    [DllImport("user32.dll")] public static extern uint GetDpiForSystem();
+}
+'@
+function Initialize-Native {
+    if (([System.Management.Automation.PSTypeName]'WinTrim').Type) { return }
+    try { Add-Type -TypeDefinition $NativeCode -Language CSharp }
+    catch { Add-Type -TypeDefinition $NativeCode }
+    if (-not $HideConsole) { return }
+    # 安装器是 SW_HIDE 起进程的，正常没有控制台；这个兜底只对"从终端手动跑"有意义
+    try {
+        $cw = [WinTrim]::GetConsoleWindow()
+        if ($cw -ne [IntPtr]::Zero) { [void][WinTrim]::ShowWindow($cw, 0) }   # 0 = SW_HIDE
+    } catch { }
+}
 
+# Copy the archive's bin\ folder into <Dest>\bin, then make sure the copy starts.
+# 从 zip 里直接把 <root>\bin\ 的文件写到 <Dest>\bin。
+# 以前是先整包解到临时目录再整套拷一遍，113 MB 的包等于写了两趟盘，
+# 而除了 bin 里的几个 exe/dll 之外其它内容我们根本不用。
+function Install-FromZip([string]$ZipPath, [string]$Target, [scriptblock]$OnTick) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
     $bin = Join-Path $Target 'bin'
     New-Item -ItemType Directory -Path $bin -Force | Out-Null
-    Copy-Item -Path (Join-Path $exe.DirectoryName '*') -Destination $bin -Force
+
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        $total = $zip.Entries.Count
+        $i = 0
+        foreach ($e in $zip.Entries) {
+            $i++
+            if ($OnTick -and ($i % 25 -eq 0)) { & $OnTick ([double]$i / [double]$total) }
+            $rel = $e.FullName -replace '\\', '/'
+            $m = [regex]::Match($rel, '^[^/]+/bin/(.+)$')
+            if (-not $m.Success) { continue }
+            $dst = Join-Path $bin ($m.Groups[1].Value -replace '/', '\')
+            $dir = Split-Path -Parent $dst
+            if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, $dst, $true)
+        }
+    }
+    finally { $zip.Dispose() }
 
     $installed = Join-Path $bin 'ffmpeg.exe'
+    if (-not (Test-Path -LiteralPath $installed)) { throw 'ffmpeg.exe not found inside the archive' }
     & $installed -version | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'installed ffmpeg does not start' }
 }
@@ -360,14 +478,14 @@ function Install-Bin([string]$SrcRoot, [string]$Target) {
 # Multi-threaded download in its own window: total progress, total speed,
 # thread count and a stop button. DoEvents keeps the window alive without a
 # timer; the transfer itself runs on .NET threads inside FfDl.
-function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Threads) {
+function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Threads, [string]$InstallTo) {
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
 
     # 150% 缩放时窗口被系统按位图拉伸的话，字会糊成一团毛边：
     # 先把本进程声明成 Per-Monitor V2，让 WinForms 自己按真实像素排版。
-    Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class WinDpi{[DllImport("user32.dll")]public static extern bool SetProcessDpiAwarenessContext(System.IntPtr v);[DllImport("user32.dll")]public static extern uint GetDpiForSystem();}'
-    try { [void][WinDpi]::SetProcessDpiAwarenessContext([IntPtr]-4) } catch { }
+    Initialize-Native
+    try { [void][WinTrim]::SetProcessDpiAwarenessContext([IntPtr]-4) } catch { }
 
 
     # GDI+ 兼容文本渲染（UseCompatibleTextRendering）的边缘是硬锯齿；关掉它走 GDI+Uniscribe 混合路径才有 ClearType
@@ -523,8 +641,7 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
     # 安装器是用 SW_HIDE 起的进程，Windows 会把"首个窗口"按隐藏状态处理，
     # 所以 Show() 之后还要用 ShowWindow(SW_SHOW) 强制显示一次。
     $form.Show()
-    Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class WinShow{[DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr h,int n);}'
-    [void][WinShow]::ShowWindow($form.Handle, 5)
+    [void][WinTrim]::ShowWindow($form.Handle, 5)
     $form.Activate()
     [System.Windows.Forms.Application]::DoEvents()
 
@@ -587,7 +704,11 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
     $form.Refresh()
     [System.Windows.Forms.Application]::DoEvents()
 
-    $meta = Get-RemoteMeta $Target
+    { 窗口已经亮出来了，探测才在这里做：镜像挂掉时最多 4 秒换下一个源，
+      这段时间窗口显示"正在获取文件信息"，不会再出现"点了没反应"。 }
+    $best = Get-BestTarget
+    $Target = $best.Target
+    $meta = $best.Meta
     [int64]$total = $meta.Length
     $useRanges = [bool]$meta.Ranges
     if (-not $useRanges) { $Threads = 1 }
@@ -655,10 +776,46 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
             }
             Start-Sleep -Milliseconds 60
         }
+
+        if (([FfDl]::Result -eq 0) -and $InstallTo) {
+            # 下载完就地解压：以前这一趟会另起一个 PowerShell，窗口先消失、
+            # 安装器干等 5-10 秒才弹"已安装"，看起来就是卡死。现在窗口留着，
+            # 直接切到"正在安装"状态，进度条改报解压进度。
+            $title.Text = '正在安装 ffmpeg'
+            $sub.Text = '已下载完 · 正在解压，马上就好'
+            # 目标路径可能很长（测试用的临时目录尤其长），超出就留尾巴加省略号，
+            # 不能让下载窗里出现一行被右边缘切掉的字
+            $destText = ($InstallTo + '\bin')
+            if ($destText.Length -gt 40) { $destText = '…' + $destText.Substring($destText.Length - 37) }
+            $detail.Text = $destText
+            $percent.Text = '解压 0%'
+            $speed.Text = '只解 bin 目录，不再整包中转'
+            $hint.Text = '安装完成后会自动继续装程序'
+            $stopBtn.Enabled = $false
+            $stopBtn.Text = '安装中…'
+            $track.Tag = [double]0
+            $track.Invalidate()
+            [System.Windows.Forms.Application]::DoEvents()
+
+            $onTick = {
+                param($frac)
+                $track.Tag = [double]$frac
+                $percent.Text = ('解压 {0}%' -f [int][Math]::Floor($frac * 100))
+                $track.Invalidate()
+                [System.Windows.Forms.Application]::DoEvents()
+            }
+            Install-FromZip $ZipPath $InstallTo $onTick
+            $percent.Text = '100%'
+            $track.Tag = [double]1
+            $track.Invalidate()
+            [System.Windows.Forms.Application]::DoEvents()
+        }
     }
     finally {
-        $form.Close()
-        $form.Dispose()
+        if (-not $form.IsDisposed) {
+            $form.Close()
+            $form.Dispose()
+        }
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
     }
 
@@ -702,9 +859,17 @@ try {
         $meta = Get-RemoteMeta (Resolve-Url)
         Write-Out ([string]$meta.Length)
     }
+    elseif ($Mode -eq 'Info') {
+        # 安装器要的三样东西一次问完：实测可用的地址、真实大小、是否支持分段。
+        # 以前 Url / Size 各起一次 PowerShell，每次都要重新解析一遍 API，
+        # 从"点安装"到弹 ffmpeg 询问能卡十几秒。
+        $best = Get-BestTarget
+        $meta = $best.Meta
+        Write-Out ($best.Target + [Environment]::NewLine + [string]$meta.Length + [Environment]::NewLine + $(if ($meta.Ranges) { '1' } else { '0' }))
+    }
     elseif ($Mode -eq 'Download') {
         if (-not $Zip) { throw 'no -Zip given' }
-        $code = Invoke-ParallelDownload (Resolve-Url) $Zip $Threads
+        $code = Invoke-ParallelDownload (Resolve-Url) $Zip $Threads $Dest
         if ($code -eq 3) { Write-Out 'STOPPED'; exit 3 }
         if (-not (Test-Path -LiteralPath $Zip)) { throw 'archive was not written' }
         Write-Out 'OK'
@@ -712,15 +877,7 @@ try {
     elseif ($Mode -eq 'Extract') {
         if (-not $Zip) { throw 'no -Zip given' }
         if (-not (Test-Path -LiteralPath $Zip)) { throw "archive not found: $Zip" }
-        $tmp = Join-Path $env:TEMP ('bili_ffmpeg_' + [Guid]::NewGuid().ToString('N'))
-        New-Item -ItemType Directory -Path $tmp -Force | Out-Null
-        try {
-            Expand-Archive -LiteralPath $Zip -DestinationPath $tmp -Force
-            Install-Bin $tmp $Dest
-        }
-        finally {
-            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
-        }
+        Install-FromZip $Zip $Dest
         Write-Out 'OK'
     }
     else {
@@ -728,10 +885,9 @@ try {
         New-Item -ItemType Directory -Path $tmp -Force | Out-Null
         try {
             $zipFile = Join-Path $tmp 'ffmpeg.zip'
-            Invoke-SilentDownload (Resolve-Url) $zipFile $Threads
-            $unzip = Join-Path $tmp 'unzip'
-            Expand-Archive -LiteralPath $zipFile -DestinationPath $unzip -Force
-            Install-Bin $unzip $Dest
+            $best = Get-BestTarget
+            Invoke-SilentDownload $best.Target $zipFile $Threads
+            Install-FromZip $zipFile $Dest
             Write-Out 'OK'
         }
         finally {
