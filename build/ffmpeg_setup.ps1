@@ -38,6 +38,7 @@ param(
     [string]$Zip = '',
     [string]$Dest = '',
     [string]$OutFile = '',
+    [string]$IconFile = '',
     [int]$Threads = 8
 )
 
@@ -377,6 +378,22 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
     $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
     $form.ClientSize = New-Object System.Drawing.Size(520, 220)
 
+    # 标题栏那个四色小方块是 WinForms 的默认图标，和 B 站粉的整套观感完全不搭；
+    # 换成真正发布用的 app.ico（安装器会把图标解到临时目录并通过 -IconFile 传进来）
+    $icoPath = ''
+    if ($IconFile -and (Test-Path -LiteralPath $IconFile)) { $icoPath = $IconFile }
+    else {
+        foreach ($cand in @(
+            (Join-Path $PSScriptRoot 'app.ico'),
+            (Join-Path $PSScriptRoot '..\assets\app.ico'),
+            (Join-Path (Split-Path -Parent $PSCommandPath) 'assets\app.ico')) ) {
+            if (-not $icoPath -and (Test-Path -LiteralPath $cand)) { $icoPath = $cand }
+        }
+    }
+    if ($icoPath) {
+        try { $form.Icon = New-Object System.Drawing.Icon((Resolve-Path -LiteralPath $icoPath).Path) } catch { }
+    }
+
     $title = New-Object System.Windows.Forms.Label
     $title.Text = '正在获取文件信息…'
     $title.AutoSize = $true
@@ -498,52 +515,63 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
     $form.Activate()
     [System.Windows.Forms.Application]::DoEvents()
 
-    # 排版：不猜缩放比例，先 Show 拿到真实 DeviceDpi，再按倍数摆位置和固定尺寸。
-    # 字号交给 GDI 按点数渲染，这里绝不再对 Font 二次放大 —— 那正是 200% 下
-    # 字比框还大、糊成一团的原因。
-    $sc = [single]1
-    try { $sc = [single]($form.DeviceDpi / 96.0) } catch { }
-    if ($sc -lt 1) { $sc = [single]1 }
+    # 排版：不猜 DPI。行高、行宽全部从控件自己量出来的 PreferredSize 推，
+    # 这样无论系统是 100% / 125% / 200%，比例都对，也不会把字放大两遍。
+    # 间距按正文行高的比例给，取的是老版本那一版（标题—副标题—进度条—大小—速度—底栏）的呼吸感。
+    $lh = [int]$sub.PreferredSize.Height
+    if ($lh -lt 14) { $lh = 14 }
 
-    $pad  = [int][Math]::Round(18 * $sc)
-    $pctW = [int][Math]::Round(96 * $sc)
-    $btnW = [int][Math]::Round(96 * $sc)
-    $btnH = [int][Math]::Round(32 * $sc)
-    $gap  = [int][Math]::Round(16 * $sc)
+    $padX  = [int][Math]::Round($lh * 0.95)
+    $padT  = [int][Math]::Round($lh * 0.95)
+    $padB  = [int][Math]::Round($lh * 0.85)
+    $gap1  = [int][Math]::Round($lh * 0.45)
+    $gap2  = [int][Math]::Round($lh * 0.70)
+    $gap3  = [int][Math]::Round($lh * 0.45)
+    $gap4  = [int][Math]::Round($lh * 0.50)
+    $gap5  = [int][Math]::Round($lh * 1.15)
+    $barH  = [int][Math]::Round($lh * 0.62)
+    $pctW  = [int][Math]::Round($lh * 4.2)
+    $btnW  = [int][Math]::Round($lh * 5.0)
+    $btnH  = [int][Math]::Round($lh * 1.70)
 
-    $innerW = [int][Math]::Round(484 * $sc)
-    foreach ($need in @(($detail.PreferredSize.Width + $pctW + $gap),
-                        ($hint.PreferredSize.Width + $btnW + $gap),
-                        ($title.PreferredSize.Width))) {
+    # 宽度：先给一个老版本那样的 484 基础宽，再按最长的那一行撑开，保证没有一个字被裁
+    $innerW = [int][Math]::Round($lh * 25.5)
+    foreach ($need in @(
+            ($sub.PreferredSize.Width),
+            ($detail.PreferredSize.Width + $pctW + [int][Math]::Round($lh * 0.6)),
+            ($hint.PreferredSize.Width + $btnW + [int][Math]::Round($lh * 0.9)),
+            ($title.PreferredSize.Width),
+            ($speed.PreferredSize.Width + $pctW)) ) {
         if ($need -gt $innerW) { $innerW = [int]$need }
     }
 
-    $y = [int][Math]::Round(16 * $sc)
-    $title.Location = New-Object System.Drawing.Point($pad, $y)
-    $y += $title.PreferredSize.Height + [int][Math]::Round(6 * $sc)
-    $sub.Location = New-Object System.Drawing.Point($pad, $y)
-    $y += $sub.PreferredSize.Height + [int][Math]::Round(12 * $sc)
+    $y = $padT
+    $title.Location = New-Object System.Drawing.Point($padX, $y)
+    $y += $title.PreferredSize.Height + $gap1
 
-    $barH = [int][Math]::Round(12 * $sc)
-    $track.Location = New-Object System.Drawing.Point($pad, $y)
+    $sub.Location = New-Object System.Drawing.Point($padX, $y)
+    $y += $sub.PreferredSize.Height + $gap2
+
+    $track.Location = New-Object System.Drawing.Point($padX, $y)
     $track.Size = New-Object System.Drawing.Size($innerW, $barH)
-    $y += $barH + [int][Math]::Round(12 * $sc)
+    $y += $barH + $gap3
 
     $rowH = [Math]::Max($detail.PreferredSize.Height, $percent.PreferredSize.Height)
-    $detail.Location = New-Object System.Drawing.Point($pad, ($y + [int][Math]::Round(($rowH - $detail.PreferredSize.Height) / 2)))
+    $detail.Location = New-Object System.Drawing.Point($padX, ($y + [int][Math]::Round(($rowH - $detail.PreferredSize.Height) / 2)))
     $percent.Size = New-Object System.Drawing.Size($pctW, $rowH)
-    $percent.Location = New-Object System.Drawing.Point(($pad + $innerW - $pctW), $y)
-    $y += $rowH + [int][Math]::Round(6 * $sc)
+    $percent.Location = New-Object System.Drawing.Point(($padX + $innerW - $pctW), $y)
+    $y += $rowH + $gap4
 
-    $speed.Location = New-Object System.Drawing.Point($pad, ($y + [int][Math]::Round(($rowH - $speed.PreferredSize.Height) / 2)))
-    $y += $speed.PreferredSize.Height + [int][Math]::Round(14 * $sc)
+    $speed.Location = New-Object System.Drawing.Point($padX, $y)
+    $y += $speed.PreferredSize.Height + $gap5
 
-    $hint.Location = New-Object System.Drawing.Point($pad, ($y + [int][Math]::Round(($btnH - $hint.PreferredSize.Height) / 2)))
+    $hint.Location = New-Object System.Drawing.Point($padX, ($y + [int][Math]::Round(($btnH - $hint.PreferredSize.Height) / 2)))
     $stopBtn.Size = New-Object System.Drawing.Size($btnW, $btnH)
-    $stopBtn.Location = New-Object System.Drawing.Point(($pad + $innerW - $btnW), $y)
+    $stopBtn.Location = New-Object System.Drawing.Point(($padX + $innerW - $btnW), $y)
     $y += $btnH
 
-    $form.ClientSize = New-Object System.Drawing.Size(($innerW + 2 * $pad), ($y + [int][Math]::Round(14 * $sc)))
+    $form.ClientSize = New-Object System.Drawing.Size(($innerW + 2 * $padX), ($y + $padB))
+    $form.Refresh()
     [System.Windows.Forms.Application]::DoEvents()
 
     $meta = Get-RemoteMeta $Target

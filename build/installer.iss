@@ -44,7 +44,7 @@
 
 #define AppName        "Bilibili Downloader"
 #define AppShortName   "bilibili-downloader"
-#define AppVersion     "2.1.5"
+#define AppVersion     "2.1.6"
 #define AppPublisher   "zyq1223334444"
 #define AppURL         "https://github.com/zyq1223334444/bilibili-downloader"
 #define ExeName        "bilibili_downloader.exe"
@@ -135,6 +135,7 @@ Source: "..\CHANGELOG.md"; DestDir: "{app}"; DestName: "CHANGELOG.md"; Flags: ig
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE"; Flags: ignoreversion
 ; 只在安装期间用一次，装完删掉，不留在用户的临时目录里
 Source: "ffmpeg_setup.ps1"; Flags: dontcopy
+Source: "..\assets\app.ico"; Flags: dontcopy
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#ExeName}"
@@ -413,6 +414,7 @@ begin
 
   { [Files] 里的 dontcopy 文件不会自动落到临时目录，用之前先手动解出来 }
   ExtractTemporaryFile('ffmpeg_setup.ps1');
+  ExtractTemporaryFile('app.ico');
 
   if FfmpegSourcePage.Values[1] then
     FfmpegSource := 'mirror'
@@ -441,7 +443,9 @@ begin
     DeleteFile(Zip);
     DeleteFile(StatusFile);
     Code := RunSetupScript('-Mode Download -Source ' + FfmpegSource +
-                           ' -Zip "' + Zip + '" -Threads 8 -OutFile "' + StatusFile + '"');
+                           ' -Zip "' + Zip + '" -Threads 8' +
+                           ' -IconFile "' + ExpandConstant('{tmp}\app.ico') + '"' +
+                           ' -OutFile "' + StatusFile + '"');
     if (Code = 0) and FileExists(Zip) then
       Break;
 

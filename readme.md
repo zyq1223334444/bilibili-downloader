@@ -304,7 +304,7 @@ hand-drawn with WinForms and opts into Per-Monitor V2 DPI plus GDI text renderin
 
 ## Changelog
 
-**2.1.5** fixes the installer window scaling for good (fonts are no longer multiplied twice, so 200% no longer turns into a smear); **2.1.4** gives the app and the installer an icon and makes that window DPI-aware with GDI text rendering, plus a visible minimum progress width. 2.1.3 restyled that window; 2.1.2 corrected the ffmpeg contract (PATH-only detection, user
+**2.1.6** re-lays out the installer download window back to the earlier, airier composition (width now driven by the longest line, so the subtitle, the percentage and the stop button are never clipped) and swaps the title-bar icon for the pink Bilibili mark; **2.1.5** fixes the window scaling for good (fonts are no longer multiplied twice, so 200% no longer turns into a smear); **2.1.4** gives the app and the installer an icon and makes that window DPI-aware with GDI text rendering, plus a visible minimum progress width. 2.1.3 restyled that window; 2.1.2 corrected the ffmpeg contract (PATH-only detection, user
 `PATH` only, uninstall leaves ffmpeg alone) and fixed the hidden download window; 2.1.1 made the download
 8-threaded and stoppable, trimmed subtitle merging to soft/hard with folder output, and defaulted live
 recordings to the Desktop; 2.1.0 added live recording, subtitle merging and tray support.
