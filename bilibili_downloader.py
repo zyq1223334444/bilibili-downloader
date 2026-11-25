@@ -95,6 +95,28 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
+APP_DIR = Path(__file__).resolve().parent
+
+
+def app_icon_path() -> Path | None:
+    """assets/app.ico，源码运行时在仓库里，打包后跟着 exe 在一起。"""
+    for base in (APP_DIR, Path(sys.argv[0]).resolve().parent):
+        icon = base / "assets" / "app.ico"
+        if icon.is_file():
+            return icon
+    return None
+
+
+def apply_window_icon(win) -> None:
+    """把 Tk 默认的羽毛图标换成自己的（非 Windows 或图标缺失时静默跳过）。"""
+    icon = app_icon_path()
+    if icon is None:
+        return
+    try:
+        win.iconbitmap(str(icon))
+    except Exception:
+        pass
+
 # WBI 签名用的混淆表（来自 B 站 web 端实现，顺序不可改）
 MIXIN_KEY_ENC_TAB = (
     46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
@@ -4078,6 +4100,7 @@ def run_gui(start_live: bool = False) -> int:
                                height=max(1, h - pad * 2))
 
     root.title("B 站视频下载器")
+    apply_window_icon(root)
     root.configure(bg=GUI_BG)
     root.minsize(px(980), px(660))
     screen_w, screen_h = root.winfo_screenwidth(), root.winfo_screenheight()
@@ -4487,6 +4510,7 @@ def run_gui(start_live: bool = False) -> int:
         win = tk.Toplevel(root)
         live_state["win"] = win
         win.title("录制直播 - Bilibili Downloader")
+        apply_window_icon(win)
         win.configure(bg=GUI_BG)
         live_w = min(px(1060), screen_w - px(24))
         live_h = min(px(740), screen_h - px(120))
@@ -5034,6 +5058,7 @@ def run_gui(start_live: bool = False) -> int:
     def open_merge_dialog() -> None:
         dlg = tk.Toplevel(root)
         dlg.title("合并弹幕 / 字幕")
+        apply_window_icon(dlg)
         dlg.configure(bg=GUI_BG)
         dlg.geometry(f"{px(760)}x{px(430)}+{px(80)}+{px(80)}")
         dlg.transient(root)
@@ -5584,6 +5609,7 @@ def run_gui(start_live: bool = False) -> int:
     def open_selection_dialog(total: int, items: Sequence[Item], box: dict) -> None:
         top = tk.Toplevel(root)
         top.title("选择要下载的项目")
+        apply_window_icon(top)
         top.configure(bg=GUI_BG)
         top.transient(root)
         top.geometry(f"{px(640)}x{px(min(600, 260 + 22 * min(total, 14)))}")
@@ -5663,6 +5689,7 @@ def run_gui(start_live: bool = False) -> int:
     def show_help() -> None:
         win = tk.Toplevel(root)
         win.title("帮助（图形界面）")
+        apply_window_icon(win)
         win.configure(bg=GUI_BG)
         win.geometry(f"{px(840)}x{px(680)}")
         win.transient(root)

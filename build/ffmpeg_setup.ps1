@@ -350,6 +350,21 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
 
+    # 150% 缩放时窗口被系统按位图拉伸的话，字会糊成一团毛边：
+    # 先把本进程声明成 Per-Monitor V2，让 WinForms 自己按真实像素排版。
+    Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class WinDpi{[DllImport("user32.dll")]public static extern bool SetProcessDpiAwarenessContext(System.IntPtr v);[DllImport("user32.dll")]public static extern uint GetDpiForSystem();}'
+    try { [void][WinDpi]::SetProcessDpiAwarenessContext([IntPtr]-4) } catch { }
+
+    # 缩放不是 100% 时，让控件按真实像素自己放大，而不是让 DWM 把整窗位图拉伸
+    $sf = [single]1
+    try {
+        $sf = [single]([WinDpi]::GetDpiForSystem() / 96.0)
+        if ($sf -lt 1) { $sf = [single]1 }
+    } catch { }
+
+    # GDI+ 兼容文本渲染（UseCompatibleTextRendering）的边缘是硬锯齿；关掉它走 GDI+Uniscribe 混合路径才有 ClearType
+    try { [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false) } catch { }
+
     # 配色：白底 + B 站粉，尽量贴近 Win11 的观感
     $pink  = [System.Drawing.Color]::FromArgb(251, 114, 153)
     $ink   = [System.Drawing.Color]::FromArgb(31, 35, 41)
@@ -366,7 +381,7 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
     $form.ClientSize = New-Object System.Drawing.Size(520, 206)
     $form.BackColor = [System.Drawing.Color]::White
     $form.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
-    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
+    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
 
     $title = New-Object System.Windows.Forms.Label
     $title.Text = '正在获取文件信息…'
@@ -407,7 +422,9 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
         $ratio = [double]$sndr.Tag
         if ($ratio -gt 0) {
             $fw = [single]($gw * $ratio)
-            if ($fw -lt (2 * $gr)) { $fw = 2 * $gr }
+            $minw = [single](2 * $gh)
+            if ($fw -lt $minw) { $fw = $minw }
+            if ($fw -gt $gw) { $fw = $gw }
             $fp = New-Object System.Drawing.Drawing2D.GraphicsPath
             $fp.AddArc(0, 0, 2 * $gr, 2 * $gr, 180, 90)
             $fp.AddArc($fw - 2 * $gr, 0, 2 * $gr, 2 * $gr, 270, 90)
@@ -473,6 +490,28 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
     $form.AcceptButton = $stopBtn
     $stopBtn.Add_MouseEnter({ $stopBtn.ForeColor = [System.Drawing.Color]::White; $stopBtn.FlatAppearance.BorderColor = $pink })
     $stopBtn.Add_MouseLeave({ $stopBtn.ForeColor = $ink; $stopBtn.FlatAppearance.BorderColor = $edge })
+
+    # Label 默认走 GDI+ 的 TextRenderer 之外那一套，字号小时边缘全是锯齿；
+    # 逐个改回 GDI 文本渲染，字才有灰度抗锯齿。
+    foreach ($c in $form.Controls) {
+        if ($c -is [System.Windows.Forms.Label]) { $c.UseCompatibleTextRendering = $false }
+    }
+
+    # 控件坐标都是按 96 DPI 摆的，这里按真实缩放整体放大一次
+    if ($sf -ne 1) {
+        $form.Scale((New-Object System.Drawing.SizeF($sf, $sf)))
+        $form.ClientSize = New-Object System.Drawing.Size([int](520 * $sf), [int](206 * $sf))
+        # Scale() 只放大了控件框，字号还是 96 DPI 那套，得一起放大，不然字会显得瘪
+        foreach ($c in $form.Controls) {
+            try {
+                $cf = $c.Font
+                if ($cf) {
+                    $c.Font = New-Object System.Drawing.Font($cf.FontFamily, [single]($cf.SizeInPoints * $sf), $cf.Style, $cf.Unit)
+                }
+            }
+            catch { }
+        }
+    }
     $stopBtn.Add_Click({
         [FfDl]::Stop = $true
         $stopBtn.Enabled = $false

@@ -25,15 +25,16 @@
 ;
 ;  ffmpeg is NOT bundled inside the setup (the archive is ~110-200 MB and
 ;  changes with every upstream release). Instead the [Code] section:
-;    1. checks PATH *and* %USERPROFILE%\ffmpeg\bin before installing;
+;    1. checks the PATH environment variable (machine + user + process);
 ;    2. when it is missing, asks whether to download it, showing the size
 ;       that ffmpeg_setup.ps1 just read from the live URL (not a guess);
 ;    3. on "yes", ffmpeg_setup.ps1 downloads it itself: 8 parallel range
 ;       requests into part files, shown in its own small window with total
 ;       progress, total speed and a stop button, then the parts are merged and
-;       unpacked into %USERPROFILE%\ffmpeg and that bin folder is added to the
-;       machine PATH. The PATH entry is deliberately kept on uninstall, so a
-;       later reinstall (or any other tool) still finds ffmpeg.
+;       unpacked into %USERPROFILE%\ffmpeg and that bin folder is appended to
+;       the *user* PATH (HKCU\Environment). Uninstall never touches ffmpeg:
+;       both the files and that PATH entry stay, so a later reinstall (or any
+;       other tool) still finds ffmpeg.
 ;  Declining is allowed - the app then runs in a degraded mode (it can still
 ;  download raw streams, but cannot merge/export MP3/embed danmaku).
 ;
@@ -43,7 +44,7 @@
 
 #define AppName        "Bilibili Downloader"
 #define AppShortName   "bilibili-downloader"
-#define AppVersion     "2.1.3"
+#define AppVersion     "2.1.4"
 #define AppPublisher   "zyq1223334444"
 #define AppURL         "https://github.com/zyq1223334444/bilibili-downloader"
 #define ExeName        "bilibili_downloader.exe"
@@ -73,6 +74,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 UninstallDisplayIcon={app}\{#ExeName}
+SetupIconFile=..\assets\app.ico
 UninstallDisplayName={#AppName} {#AppVersion}
 ChangesEnvironment=yes
 SetupLogging=yes

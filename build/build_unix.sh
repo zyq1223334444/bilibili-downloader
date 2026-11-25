@@ -107,8 +107,8 @@ COMMON=(
     "${TK_FLAGS[@]+"${TK_FLAGS[@]}"}"
     --company-name="zyq1223334444"
     --product-name="Bilibili Downloader"
-    --product-version=2.1.3
-    --file-version=2.1.3
+    --product-version=2.1.4
+    --file-version=2.1.4
     --file-description="Bilibili video / multi-part / collection downloader (DASH + ffmpeg + danmaku)"
 )
 
