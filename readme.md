@@ -22,7 +22,7 @@ every command-line switch is still there.
   readable) or `full` (keep as much as possible), written as `.danmaku.xml` and `.danmaku.ass`;
   `--danmaku-video soft` muxes the track into MKV (no re-encode, seconds), `hard` burns it into the frame
   (re-encode, slow, but readable anywhere including phones and chat apps).
-- **Live recording, GUI only**: the "录制直播" button on the main window (or `--live` to open that window straight
+- **Live recording, GUI only** (output defaults to Desktop\<room title>\): the "录制直播" button on the main window (or `--live` to open that window straight
   away). Original quality (`qn=10000`) by default, switchable mid-recording from the qualities the room actually
   offers; written in segments so **memory stays flat no matter how long the stream runs**. Built-in preview
   (a snapshot every 12 s) and a 10-second sample clip; paste a scheduled-live link or room id and it polls until
@@ -30,9 +30,10 @@ every command-line switch is still there.
   full danmaku stream (gifts / guard purchases / SC included) and **saves them separately only** as
   `.jsonl` + `.xml` + `.ass` — nothing is burned into the video.
 - **Subtitle merging as its own feature**: the "合并弹幕" button, or
-  `--merge-sub VIDEO SUB --sub-mode external|soft|hard`. External writes an aligned `.ass`, soft muxes a switchable
-  subtitle track into an `.mkv` (`-c copy`), hard burns it into the frame. Output is always a new file —
-  **the source video is never overwritten** — and long videos are processed as a stream.
+  `--merge-sub VIDEO SUB --sub-mode soft|hard`. Soft muxes a switchable subtitle track into an `.mkv`
+  (`-c copy`), hard burns it into the frame. The output field is a **folder**; files are named
+  `<video>.sub.mkv / .sub.mp4` and always written as a new file — **the source video is never overwritten** —
+  and long videos are processed as a stream.
 - **Minimize to tray**: closing the main window or minimizing the live window keeps the recorder running from the
   tray; the tray menu offers show / record live / quit.
 - **Win11-style GUI**: two columns, inputs and options on the left, episode plan and log on the right; it sizes
@@ -186,8 +187,8 @@ python bilibili_downloader.py BV1xx411c7mD --audio-only --mp3-bitrate 192
 # open only the live-recording window (GUI; the main window has the same button)
 python bilibili_downloader.py --live
 
-# merge danmaku/subtitles into a video (writes a new .sub.mkv, never touches the source)
-python bilibili_downloader.py --merge-sub video.mp4 danmaku.xml --sub-mode soft
+# merge danmaku/subtitles into a video (writes <video>.sub.mkv into that folder, never touches the source)
+python bilibili_downloader.py --merge-sub video.mp4 danmaku.xml --sub-mode soft --merge-out D:\output
 
 # no ffmpeg? download the Windows build to ~\ffmpeg (about 114 MB)
 python bilibili_downloader.py --install-ffmpeg
@@ -566,9 +567,12 @@ same switch. The size shown in the prompt is the real byte count queried at that
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). 2.1.0 adds live recording (original quality by default, switchable mid-recording,
-segmented writes, preview, scheduled rooms that record themselves, and both danmaku streams saved separately)
-plus subtitle merging as its own feature (external / soft-MKV / burned-in, always a new file), and lets the window
+See [CHANGELOG.md](CHANGELOG.md). 2.1.1 downloads ffmpeg with 8 threads in the installer (total progress + total
+speed, stoppable, resumes after a dropped connection), keeps only soft / hard subtitle merging and picks a folder
+for output, defaults live recordings to `Desktop\<room title>\`, and no longer removes the ffmpeg PATH entry on
+uninstall; 2.1.0 adds live recording (original quality by default, switchable mid-recording, segmented writes,
+preview, scheduled rooms that record themselves, and both danmaku streams saved separately)
+plus subtitle merging as its own feature (soft-MKV / burned-in, always a new file), and lets the window
 minimize to the tray; 2.0.4 fixes the "Unclosed constant" error that 2.0.3 raised in the installer when ffmpeg was
 missing; 2.0.3 adds a selectable ffmpeg download source (official GitHub release or the `ghfast.top` mirror, chosen
 during setup and switchable mid-download); earlier releases brought danmaku download and embedding, automatic ffmpeg

@@ -2863,9 +2863,10 @@ def merge_subtitle(video: Path, subtitle: Path, mode: str, out: Path | None = No
     """把字幕合进视频，产物另存，绝不覆盖原视频。
 
     mode：
-        external —— 只把字幕整理成外挂文件（不改视频），返回字幕路径；
-        soft     —— 封成 MKV（一条字幕轨，可开关，不重新编码）；
-        hard     —— 烧进画面（重新编码，慢，但任何播放器都看得见）。
+        soft —— 封成 MKV（一条字幕轨，可开关，不重新编码）；
+        hard —— 烧进画面（重新编码，慢，但任何播放器都看得见）。
+
+    out 是“输出文件夹”：留空时产物放在原视频旁边；也可以直接给一个文件名（命令行兼容）。
     """
     video = Path(video).expanduser()
     subtitle = Path(subtitle).expanduser()
@@ -2874,8 +2875,8 @@ def merge_subtitle(video: Path, subtitle: Path, mode: str, out: Path | None = No
     if not subtitle.is_file():
         raise DownloadError(f"字幕文件不存在：{subtitle}")
     mode = (mode or "soft").lower()
-    if mode not in {"external", "soft", "hard"}:
-        raise DownloadError("保存方式只能是 external / soft / hard")
+    if mode not in {"soft", "hard"}:
+        raise DownloadError("保存方式只能是 soft / hard")
 
     temp_dir: Path | None = None
     try:
@@ -2890,19 +2891,16 @@ def merge_subtitle(video: Path, subtitle: Path, mode: str, out: Path | None = No
             width, height = probe_media_size(video)
             write_danmaku_ass(lines, ass, width, height, video.stem, strict=False)
 
-        if mode == "external":
-            dest = Path(out).expanduser() if out else video.with_name(video.stem + ".sub.ass")
-        elif mode == "soft":
-            dest = Path(out).expanduser() if out else video.with_name(video.stem + ".sub.mkv")
+        default_name = video.stem + (".sub.mkv" if mode == "soft" else ".sub.mp4")
+        if out:
+            target = Path(out).expanduser()
+            # 给的是文件夹就按默认名放进去；直接给文件名（老命令行用法）则原样使用
+            dest = target if (target.suffix and not target.is_dir()) else target / default_name
         else:
-            dest = Path(out).expanduser() if out else video.with_name(video.stem + ".sub.mp4")
+            dest = video.with_name(default_name)
         if dest.resolve() == video.resolve():
             raise DownloadError("输出文件不能和原视频同名（会覆盖原视频）")
         dest.parent.mkdir(parents=True, exist_ok=True)
-
-        if mode == "external":
-            shutil.copy2(ass, dest)
-            return dest
 
         if mode == "soft":
             _ffmpeg_to_file(
@@ -3421,11 +3419,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="直接打开「录制直播」窗口（图形界面功能，命令行不录制直播）")
     parser.add_argument("--merge-sub", nargs=2, metavar=("VIDEO", "SUB"),
                         help="把字幕 / 弹幕合并进视频，产物另存，不覆盖原视频")
-    parser.add_argument("--sub-mode", choices=("external", "soft", "hard"), default="soft",
-                        help="字幕保存方式：external=外挂（只整理字幕文件），"
-                             "soft=软字幕（封装 MKV，可开关），hard=硬字幕（烧进画面，重新编码）")
+    parser.add_argument("--sub-mode", choices=("soft", "hard"), default="soft",
+                        help="字幕保存方式：soft=软字幕（封装 MKV，可开关），"
+                             "hard=硬字幕（烧进画面，重新编码）")
     parser.add_argument("--merge-out", default="",
-                        help="合并产物路径（默认在视频旁边生成 *.sub.mkv / *.sub.mp4）")
+                        help="输出文件夹（留空=与原视频同目录），产物按 <视频名>.sub.mkv / .sub.mp4 命名")
     parser.add_argument("-y", "--yes", action="store_true", help="不询问，直接开始")
     args = parser.parse_args(argv)
 
@@ -4688,11 +4686,18 @@ def run_gui(start_live: bool = False) -> int:
                        command=lambda: hide_to_tray()).pack(side="right", padx=(0, px(8)))
 
         # ---- 行为 ----
+        def mark_out_custom(*_args: object) -> None:
+            # 用户自己动过保存目录，之后读直播间就不再覆盖
+            live_state["out_custom"] = True
+
         def browse_live_out() -> None:
             chosen = filedialog.askdirectory(initialdir=out_var_live.get() or str(default_output()),
                                              title="选择直播保存目录", parent=win)
             if chosen:
+                mark_out_custom()
                 out_var_live.set(chosen)
+
+        out_entry.bind("<KeyRelease>", mark_out_custom)
 
         def on_quality_change() -> None:
             rec = live_state.get("rec")
@@ -4713,6 +4718,15 @@ def run_gui(start_live: bool = False) -> int:
             info_var.set(f"{room.get('uname') or ''}  ·  {room.get('title') or ''}\n"
                          f"{state_text}  ·  在线 {room.get('online') or 0}  ·  {room.get('area') or ''}")
             status_var_live.set(f"已读取（{state_text}）")
+            if not live_state.get("out_custom"):
+                # 默认落到 桌面\<直播间名称>\，录制时直接建好目录
+                name = clean_name(str(room.get("title") or f"直播间{room.get('ref_id')}"), 60)
+                folder = Path(default_output()) / (name or f"直播间{room.get('ref_id')}")
+                try:
+                    folder.mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    folder = Path(default_output())
+                out_var_live.set(str(folder))
             if room["live_status"] == 1:
                 refresh_preview(auto=True)
 
@@ -4768,10 +4782,16 @@ def run_gui(start_live: bool = False) -> int:
                 minutes = max(1, int(float(seg_var.get() or LIVE_SEGMENT_MINUTES)))
             except ValueError:
                 minutes = LIVE_SEGMENT_MINUTES
+            dest_dir = Path(out_var_live.get().strip() or default_output())
+            try:
+                dest_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                messagebox.showerror("保存目录不可用", short_error(exc, 300), parent=win)
+                return
             session, headers = live_http()
             try:
                 recorder = LiveRecorder(
-                    session, headers, room, out_dir=Path(out_var_live.get().strip() or default_output()),
+                    session, headers, room, out_dir=dest_dir,
                     qn=current_qn(), segment_minutes=minutes,
                     danmaku_light=light_var.get(), danmaku_full=full_var.get(),
                     keep_segments=keep_var.get(),
@@ -5050,19 +5070,41 @@ def run_gui(start_live: bool = False) -> int:
 
         row("视频", video_var, "选择视频", "*.mp4 *.mkv *.flv *.mov *.ts")
         row("字幕 / 弹幕", sub_var, "选择字幕或弹幕", "*.ass *.srt *.xml *.json")
-        row("输出路径", out_var_merge, "", "*.*")
+
+        def pick_folder() -> None:
+            start_dir = str(default_output())
+            raw = video_var.get().strip()
+            if raw:
+                try:
+                    start_dir = str(Path(raw).expanduser().parent)
+                except OSError:
+                    pass
+            chosen = filedialog.askdirectory(title="选择输出文件夹", parent=dlg,
+                                             initialdir=start_dir, mustexist=False)
+            if chosen:
+                out_var_merge.set(chosen)
+
+        out_line = tk.Frame(form, bg=GUI_CARD)
+        out_line.pack(fill="x", padx=px(12), pady=(px(8), 0))
+        tk.Label(out_line, text="输出文件夹", font=small_font, bg=GUI_CARD, fg=GUI_SUB,
+                 width=8, anchor="w").pack(side="left")
+        out_entry = tk.Entry(out_line, textvariable=out_var_merge, font=small_font,
+                             relief="flat", bg="#FFFFFF", fg=GUI_TEXT, highlightthickness=1,
+                             highlightbackground=GUI_BORDER, highlightcolor=GUI_ACCENT)
+        out_entry.pack(side="left", fill="x", expand=True, padx=px(6), ipady=px(3))
+        _RoundedButton(out_line, "浏览", kind="ghost", width=56, height=26,
+                       command=pick_folder).pack(side="right")
 
         mode_row = tk.Frame(form, bg=GUI_CARD)
         mode_row.pack(fill="x", padx=px(12), pady=(px(10), px(8)))
         tk.Label(mode_row, text="保存方式", font=small_font, bg=GUI_CARD, fg=GUI_SUB,
                  width=8, anchor="w").pack(side="left")
-        for text, value in (("外挂（只整理字幕文件）", "external"),
-                            ("软字幕（MKV，可开关）", "soft"),
+        for text, value in (("软字幕（MKV，可开关）", "soft"),
                             ("硬字幕（烧进画面，较慢）", "hard")):
             ttk.Radiobutton(mode_row, text=text, value=value, variable=mode_var).pack(
                 side="left", padx=(0, px(8)))
 
-        hint_var = tk.StringVar(value="")
+        hint_var = tk.StringVar(value="输出文件夹留空 = 与原视频同目录，产物名 ＜视频名＞.sub.mkv / .sub.mp4")
         tk.Label(dlg, textvariable=hint_var, font=small_font, bg=GUI_BG, fg=GUI_SUB,
                  justify="left", anchor="w").pack(fill="x", padx=px(18))
 
@@ -5083,7 +5125,7 @@ def run_gui(start_live: bool = False) -> int:
                 return
             out = Path(out_var_merge.get().strip()).expanduser() if out_var_merge.get().strip() else None
             merge_btn.set_enabled(False)
-            hint_var.set("正在处理…（软字幕 / 外挂是秒级，硬字幕要重新编码整段视频）")
+            hint_var.set("正在处理…（软字幕是秒级，硬字幕要重新编码整段视频）")
 
             def worker() -> None:
                 try:

@@ -28,10 +28,12 @@
 ;    1. checks PATH *and* %USERPROFILE%\ffmpeg\bin before installing;
 ;    2. when it is missing, asks whether to download it, showing the size
 ;       that ffmpeg_setup.ps1 just read from the live URL (not a guess);
-;    3. on "yes", downloads it through a TDownloadWizardPage - a real
-;       progress page with speed and a stop button - then unpacks it into
-;       %USERPROFILE%\ffmpeg, adds that bin folder to the machine PATH and
-;       remembers the entry so the uninstaller removes exactly what it added.
+;    3. on "yes", ffmpeg_setup.ps1 downloads it itself: 8 parallel range
+;       requests into part files, shown in its own small window with total
+;       progress, total speed and a stop button, then the parts are merged and
+;       unpacked into %USERPROFILE%\ffmpeg and that bin folder is added to the
+;       machine PATH. The PATH entry is deliberately kept on uninstall, so a
+;       later reinstall (or any other tool) still finds ffmpeg.
 ;  Declining is allowed - the app then runs in a degraded mode (it can still
 ;  download raw streams, but cannot merge/export MP3/embed danmaku).
 ;
@@ -41,7 +43,7 @@
 
 #define AppName        "Bilibili Downloader"
 #define AppShortName   "bilibili-downloader"
-#define AppVersion     "2.1.0"
+#define AppVersion     "2.1.1"
 #define AppPublisher   "zyq1223334444"
 #define AppURL         "https://github.com/zyq1223334444/bilibili-downloader"
 #define ExeName        "bilibili_downloader.exe"
@@ -148,19 +150,15 @@ const
   BackupValue    = 'OriginalPath';
 
 var
-  DownloadPage: TDownloadWizardPage;
   FfmpegSourcePage: TInputOptionWizardPage;
   FfmpegSource: string;
 
-{ 下载页用 Inno 6.2+ 自带的 TDownloadWizardPage：它有原生进度条、速度和
-  停止按钮，比"后台脚本静默下载 + 一个假进度提示框"可靠得多。
+{ 下载不再用 TDownloadWizardPage：它的下载器是单线程的。ffmpeg_setup.ps1
+  自己开 8 个 runspace 分段下载，并弹出自己的进度窗口（总进度 + 总速度 +
+  停止），这里只等它的退出码。
   源选择单独一页（官方 / ghfast.top 镜像），只在真的缺 ffmpeg 时出现。 }
 procedure InitializeWizard;
 begin
-  DownloadPage := CreateDownloadPage(ExpandConstant('{cm:FfmpegPageTitle}'),
-                                     ExpandConstant('{cm:FfmpegPageDesc}'), nil);
-  DownloadPage.ShowBaseNameInsteadOfUrl := True;
-
   { 源选择页必须排在 wpReady 之前：真正的下载由 NextButtonClick(wpReady) 触发，
     页面若挂在 wpReady 之后，用户选完源点"安装"时这一步已经过去了。 }
   FfmpegSourcePage := CreateInputOptionPage(wpSelectDir,
@@ -367,8 +365,8 @@ end;
 procedure TryInstallFfmpeg();
 var
   Size: Int64;
-  SizeText, Url, Zip, BinPath, Err, Other: string;
-  Downloaded: Boolean;
+  SizeText, Zip, BinPath, Err, Other, StatusFile: string;
+  Code: Integer;
 begin
   if FfmpegOnPath() then
     exit;
@@ -402,55 +400,42 @@ begin
   end;
 
   Zip := ExpandConstant('{tmp}\ffmpeg-essentials.zip');
+  StatusFile := ExpandConstant('{tmp}\ffmpeg_download.txt');
   while True do
   begin
-    Url := ResolveFfmpegUrl(FfmpegSource);
-    if Url = '' then
-    begin
-      MsgBox(ExpandConstant('{cm:FfmpegFailed}'), mbError, MB_OK);
-      exit;
-    end;
-
+    { 下载整个交给脚本：8 线程分段 + 自己的进度窗口。
+      退出码 0 = 成功，3 = 用户点了停止，其它 = 出错（原因写在 StatusFile） }
     DeleteFile(Zip);
-    DownloadPage.Clear;
-    { 第三个参数是期望的 SHA256（空串则不校验内容），不是大小 }
-    DownloadPage.Add(Url, 'ffmpeg-essentials.zip', '');
-    DownloadPage.Show;
-    Downloaded := False;
-    try
-      try
-        DownloadPage.Download;
-        Downloaded := True;
-      except
-        Err := GetExceptionMessage;
-        Other := OtherSource(FfmpegSource);
-        if DownloadPage.AbortedByUser then
-        begin
-          { 用户按了"停止"：这就是下载途中的换源入口 }
-          if MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegSwitchAsk}'), [SourceLabel(Other)]),
-                    mbConfirmation, MB_YESNO) = IDYES then
-            FfmpegSource := Other
-          else
-            exit;
-        end
-        else
-        begin
-          if MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegRetryAsk}'), [SourceLabel(FfmpegSource), Err, SourceLabel(Other)]),
-                    mbConfirmation, MB_YESNO) = IDYES then
-            FfmpegSource := Other
-          else
-          begin
-            MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegFailDetail}'), [Err]), mbError, MB_OK);
-            exit;
-          end;
-        end;
-      end;
-    finally
-      DownloadPage.Hide;
-    end;
-
-    if Downloaded then
+    DeleteFile(StatusFile);
+    Code := RunSetupScript('-Mode Download -Source ' + FfmpegSource +
+                           ' -Zip "' + Zip + '" -Threads 8 -OutFile "' + StatusFile + '"');
+    if (Code = 0) and FileExists(Zip) then
       Break;
+
+    Err := ReadFirstLine(StatusFile);
+    if Err = '' then
+      Err := 'exit code ' + IntToStr(Code);
+    Other := OtherSource(FfmpegSource);
+    if Code = 3 then
+    begin
+      { 用户按了"停止"：这就是下载途中的换源入口 }
+      if MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegSwitchAsk}'), [SourceLabel(Other)]),
+                mbConfirmation, MB_YESNO) = IDYES then
+        FfmpegSource := Other
+      else
+        exit;
+    end
+    else
+    begin
+      if MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegRetryAsk}'), [SourceLabel(FfmpegSource), Err, SourceLabel(Other)]),
+                mbConfirmation, MB_YESNO) = IDYES then
+        FfmpegSource := Other
+      else
+      begin
+        MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegFailDetail}'), [Err]), mbError, MB_OK);
+        exit;
+      end;
+    end;
   end;
 
   if not ExtractFfmpeg(Zip) then
@@ -460,9 +445,9 @@ begin
   end;
 
   BinPath := ExpandConstant('{%USERPROFILE}\ffmpeg\bin');
+  { PATH 里只加不改：卸载时保留这一条（见 CurUninstallStepChanged），
+    用户之后重装或别的工具还能直接用 ffmpeg }
   EnvAddPath(BinPath);
-  { 只记下我们自己加的这一条：用户可能本来就有别的 ffmpeg，卸载不能乱删 }
-  RegWriteStringValue(HKEY_CURRENT_USER, 'SOFTWARE\{#AppShortName}', 'FfmpegBin', BinPath);
   MsgBox(FmtMessage(ExpandConstant('{cm:FfmpegDone}'), [BinPath]), mbInformation, MB_OK);
 end;
 { 点"安装"（Ready 页的下一步）时先把 ffmpeg 处理掉，再进入正式复制文件。
@@ -490,19 +475,13 @@ begin
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
-var
-  BinPath: string;
 begin
   if CurUninstallStep <> usPostUninstall then
     exit;
 
+  { 只摘掉程序自己的目录；ffmpeg 的目录、文件和它的 PATH 条目全部保留，
+    用户装过一次可能还要用，删了会让别的工具也跟着坏 }
   EnvRemovePath(ExpandConstant('{app}'));
-  { ffmpeg 的目录和文件保留：用户装过一次可能还要用，只把 PATH 条目摘掉 }
-  if RegQueryStringValue(HKEY_CURRENT_USER, 'SOFTWARE\{#AppShortName}', 'FfmpegBin', BinPath) then
-  begin
-    EnvRemovePath(BinPath);
-    RegDeleteValue(HKEY_CURRENT_USER, 'SOFTWARE\{#AppShortName}', 'FfmpegBin');
-  end;
 end;
 
 
