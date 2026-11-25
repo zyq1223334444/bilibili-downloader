@@ -316,7 +316,7 @@ var
 begin
   Result := -1;
   if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
-              '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}\ffmpeg_setup.ps1') + '" ' + Params,
+              '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + ExpandConstant('{tmp}\ffmpeg_setup.ps1') + '" -HideConsole ' + Params,
               '', SW_HIDE, ewWaitUntilTerminated, Code) then
     exit;
   Result := Code;

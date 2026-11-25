@@ -39,11 +39,24 @@ param(
     [string]$Dest = '',
     [string]$OutFile = '',
     [string]$IconFile = '',
-    [int]$Threads = 8
+    [int]$Threads = 8,
+    # 安装器调用时传进来：本进程的控制台窗口要从一开始就是不可见的
+    [switch]$HideConsole
 )
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# 安装器那边虽然已经用 SW_HIDE + -WindowStyle Hidden 起本进程，PowerShell 仍会先
+# 建一个控制台窗口，在部分机器上能看到黑框一直挂在下载窗后面。装完就藏掉：
+# 没有控制台（已经在隐藏状态下启动）时 GetConsoleWindow 返回 0，什么都不做。
+if ($HideConsole) {
+    Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class WinCon{[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int n);}'
+    try {
+        $cw = [WinCon]::GetConsoleWindow()
+        if ($cw -ne [IntPtr]::Zero) { [void][WinCon]::ShowWindow($cw, 0) }   # 0 = SW_HIDE
+    } catch { }
+}
 
 # gyan.dev is the upstream release page, but it served ~30 KB/s here, so the URL
 # is resolved through the GitHub API first (same archive, an order of magnitude faster).
