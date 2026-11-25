@@ -350,49 +350,135 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
 
+    # 配色：白底 + B 站粉，尽量贴近 Win11 的观感
+    $pink  = [System.Drawing.Color]::FromArgb(251, 114, 153)
+    $ink   = [System.Drawing.Color]::FromArgb(31, 35, 41)
+    $muted = [System.Drawing.Color]::FromArgb(138, 144, 153)
+    $edge  = [System.Drawing.Color]::FromArgb(217, 222, 229)
+
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = '正在下载 ffmpeg'
-    $form.FormBorderStyle = 'FixedDialog'
+    $form.Text = '下载 ffmpeg'
+    $form.FormBorderStyle = 'FixedSingle'
     $form.StartPosition = 'CenterScreen'
     $form.MaximizeBox = $false
     $form.MinimizeBox = $false
     $form.TopMost = $true
-    $form.ClientSize = New-Object System.Drawing.Size(520, 190)
+    $form.ClientSize = New-Object System.Drawing.Size(520, 206)
+    $form.BackColor = [System.Drawing.Color]::White
     $form.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
 
     $title = New-Object System.Windows.Forms.Label
     $title.Text = '正在获取文件信息…'
     $title.AutoSize = $true
-    $title.Location = New-Object System.Drawing.Point(18, 16)
+    $title.Location = New-Object System.Drawing.Point(18, 18)
+    $title.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 12.5, [System.Drawing.FontStyle]::Bold)
+    $title.ForeColor = $ink
     $form.Controls.Add($title)
 
-    $bar = New-Object System.Windows.Forms.ProgressBar
-    $bar.Minimum = 0
-    $bar.Maximum = 1000
-    $bar.Location = New-Object System.Drawing.Point(18, 48)
-    $bar.Size = New-Object System.Drawing.Size(484, 22)
-    $form.Controls.Add($bar)
+    # 副标题：线程数 / 总大小，信息量够但不去抢标题的注意力
+    $sub = New-Object System.Windows.Forms.Label
+    $sub.Text = '正在连接下载服务器…'
+    $sub.AutoSize = $true
+    $sub.Location = New-Object System.Drawing.Point(19, 53)
+    $sub.ForeColor = $muted
+    $form.Controls.Add($sub)
+
+    # 自绘进度条：WinForms 自带的 ProgressBar 是 XP 时代的方块条，改手绘圆角胶囊
+    $track = New-Object System.Windows.Forms.Panel
+    $track.Location = New-Object System.Drawing.Point(18, 82)
+    $track.Size = New-Object System.Drawing.Size(484, 12)
+    $track.BackColor = [System.Drawing.Color]::White
+    $track.Tag = [double]0
+    $track.Add_Paint({
+        param($sndr, $ev)
+        $g = $ev.Graphics
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $gw = [single]$sndr.Width
+        $gh = [single]$sndr.Height
+        $gr = [single]($gh / 2)
+        $gp = New-Object System.Drawing.Drawing2D.GraphicsPath
+        $gp.AddArc(0, 0, 2 * $gr, 2 * $gr, 180, 90)
+        $gp.AddArc($gw - 2 * $gr, 0, 2 * $gr, 2 * $gr, 270, 90)
+        $gp.AddArc($gw - 2 * $gr, $gh - 2 * $gr, 2 * $gr, 2 * $gr, 0, 90)
+        $gp.AddArc(0, $gh - 2 * $gr, 2 * $gr, 2 * $gr, 90, 90)
+        $gp.CloseFigure()
+        $g.FillPath((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(238, 240, 243))), $gp)
+        $ratio = [double]$sndr.Tag
+        if ($ratio -gt 0) {
+            $fw = [single]($gw * $ratio)
+            if ($fw -lt (2 * $gr)) { $fw = 2 * $gr }
+            $fp = New-Object System.Drawing.Drawing2D.GraphicsPath
+            $fp.AddArc(0, 0, 2 * $gr, 2 * $gr, 180, 90)
+            $fp.AddArc($fw - 2 * $gr, 0, 2 * $gr, 2 * $gr, 270, 90)
+            $fp.AddArc($fw - 2 * $gr, $gh - 2 * $gr, 2 * $gr, 2 * $gr, 0, 90)
+            $fp.AddArc(0, $gh - 2 * $gr, 2 * $gr, 2 * $gr, 90, 90)
+            $fp.CloseFigure()
+            $fb = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
+                (New-Object System.Drawing.Point(0, 0)),
+                (New-Object System.Drawing.Point([int]$fw, 0)),
+                [System.Drawing.Color]::FromArgb(251, 114, 153),
+                [System.Drawing.Color]::FromArgb(255, 168, 194))
+            $g.FillPath($fb, $fp)
+            $fb.Dispose()
+            $fp.Dispose()
+        }
+        $gp.Dispose()
+    })
+    $form.Controls.Add($track)
 
     $detail = New-Object System.Windows.Forms.Label
     $detail.Text = '正在连接下载服务器，请稍候…'
     $detail.AutoSize = $true
-    $detail.Location = New-Object System.Drawing.Point(18, 82)
+    $detail.Location = New-Object System.Drawing.Point(18, 101)
+    $detail.ForeColor = $ink
     $form.Controls.Add($detail)
+
+    $percent = New-Object System.Windows.Forms.Label
+    $percent.Text = ''
+    $percent.AutoSize = $false
+    $percent.Size = New-Object System.Drawing.Size(120, 20)
+    $percent.Location = New-Object System.Drawing.Point(382, 101)
+    $percent.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+    $percent.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9, [System.Drawing.FontStyle]::Bold)
+    $percent.ForeColor = $pink
+    $form.Controls.Add($percent)
 
     $speed = New-Object System.Windows.Forms.Label
     $speed.Text = '总速度 0.0 MB/s'
     $speed.AutoSize = $true
-    $speed.Location = New-Object System.Drawing.Point(18, 108)
+    $speed.Location = New-Object System.Drawing.Point(18, 125)
+    $speed.ForeColor = $muted
     $form.Controls.Add($speed)
+
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.Text = '下载完成后自动继续安装'
+    $hint.AutoSize = $true
+    $hint.Location = New-Object System.Drawing.Point(18, 162)
+    $hint.ForeColor = [System.Drawing.Color]::FromArgb(170, 176, 185)
+    $form.Controls.Add($hint)
 
     $stopBtn = New-Object System.Windows.Forms.Button
     $stopBtn.Text = '停止'
-    $stopBtn.Size = New-Object System.Drawing.Size(96, 30)
-    $stopBtn.Location = New-Object System.Drawing.Point(406, 140)
+    $stopBtn.Size = New-Object System.Drawing.Size(96, 32)
+    $stopBtn.Location = New-Object System.Drawing.Point(406, 154)
+    $stopBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $stopBtn.FlatAppearance.BorderSize = 1
+    $stopBtn.FlatAppearance.BorderColor = $edge
+    $stopBtn.FlatAppearance.MouseOverBackColor = $pink
+    $stopBtn.BackColor = [System.Drawing.Color]::White
+    $stopBtn.ForeColor = $ink
+    $stopBtn.Cursor = [System.Windows.Forms.Cursors]::Hand
     $form.Controls.Add($stopBtn)
     $form.AcceptButton = $stopBtn
-    $form.CancelButton = $stopBtn
-    $stopBtn.Add_Click({ [FfDl]::Stop = $true; $stopBtn.Enabled = $false })
+    $stopBtn.Add_MouseEnter({ $stopBtn.ForeColor = [System.Drawing.Color]::White; $stopBtn.FlatAppearance.BorderColor = $pink })
+    $stopBtn.Add_MouseLeave({ $stopBtn.ForeColor = $ink; $stopBtn.FlatAppearance.BorderColor = $edge })
+    $stopBtn.Add_Click({
+        [FfDl]::Stop = $true
+        $stopBtn.Enabled = $false
+        $stopBtn.Text = '正在停止…'
+        $stopBtn.FlatAppearance.MouseOverBackColor = $edge
+    })
 
     # 先把窗口亮出来：抓远端大小可能要十几秒，不能让它看起来像卡死。
     # 安装器是用 SW_HIDE 起的进程，Windows 会把"首个窗口"按隐藏状态处理，
@@ -415,9 +501,13 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
     $work = Join-Path $env:TEMP ('bili_dl_' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $work -Force | Out-Null
 
-    $title.Text = ('共 {0}，{1} 线程并行下载' -f (Format-Mb $total), $Threads)
-    $detail.Text = '0.0 MB / 0.0 MB（0%）'
+    $title.Text = '正在下载 ffmpeg'
+    $sub.Text = ('{0} 线程并行 · 共 {1} · 断了会自己续传' -f $Threads, (Format-Mb $total))
+    $detail.Text = ('0.0 MB / {0}' -f (Format-Mb $total))
+    $percent.Text = '0%'
     $speed.Text = '总速度 0.0 MB/s'
+    $track.Tag = [double]0
+    $track.Invalidate()
     [System.Windows.Forms.Application]::DoEvents()
 
     [FfDl]::Begin($Target, $total, $work, $ZipPath, $Threads, $useRanges)
@@ -445,9 +535,23 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
                 if ($rate -lt 0) { $rate = 0 }
                 $pct = 0
                 if ($total -gt 0) { $pct = [int][Math]::Floor($done * 100 / $total) }
-                $bar.Value = [Math]::Min(1000, [int]($pct * 10))
-                $detail.Text = ('{0} / {1}（{2}%）' -f (Format-Mb $done), (Format-Mb $total), $pct)
-                $speed.Text = ('总速度 {0}/s' -f (Format-Mb $rate))
+                if ($total -gt 0) { $track.Tag = [double]($done / $total) }
+                $track.Invalidate()
+                $detail.Text = ('{0} / {1}' -f (Format-Mb $done), (Format-Mb $total))
+                $percent.Text = ('{0}%' -f $pct)
+                $eta = ''
+                # 速度已经掉到 0 的时候别拿它算剩余时间，否则会冒出"剩余 86 分 41 秒"这种鬼话
+                if ($rate -ge 102400 -and $total -gt $done) {
+                    $left = [int][Math]::Ceiling(($total - $done) / $rate)
+                    if ($left -ge 60) { $eta = (' · 剩余约 {0} 分 {1} 秒' -f [int]($left / 60), ($left % 60)) }
+                    else { $eta = (' · 剩余约 {0} 秒' -f $left) }
+                }
+                if ([FfDl]::Stop) {
+                    $speed.Text = '已停止，正在收尾…'
+                }
+                else {
+                    $speed.Text = ('总速度 {0}/s{1}' -f (Format-Mb $rate), $eta)
+                }
                 $lastDone = $done
                 $lastTick = $now
             }

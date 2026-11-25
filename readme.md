@@ -567,7 +567,8 @@ same switch. The size shown in the prompt is the real byte count queried at that
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). 2.1.2 fixes how the installer treats ffmpeg: detection only looks at the PATH
+See [CHANGELOG.md](CHANGELOG.md). 2.1.3 redoes the installer's ffmpeg download window (rounded gradient bar, time left, flat stop button);
+2.1.2 fixes how the installer treats ffmpeg: detection only looks at the PATH
 env var, the bin folder is appended to the user PATH, and uninstall never touches ffmpeg; 2.1.1 downloads ffmpeg with 8 threads in the installer (total progress + total
 speed, stoppable, resumes after a dropped connection), keeps only soft / hard subtitle merging and picks a folder
 for output, defaults live recordings to `Desktop\<room title>\`, and no longer removes the ffmpeg PATH entry on
