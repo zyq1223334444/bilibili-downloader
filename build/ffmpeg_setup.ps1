@@ -355,12 +355,6 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
     Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class WinDpi{[DllImport("user32.dll")]public static extern bool SetProcessDpiAwarenessContext(System.IntPtr v);[DllImport("user32.dll")]public static extern uint GetDpiForSystem();}'
     try { [void][WinDpi]::SetProcessDpiAwarenessContext([IntPtr]-4) } catch { }
 
-    # 缩放不是 100% 时，让控件按真实像素自己放大，而不是让 DWM 把整窗位图拉伸
-    $sf = [single]1
-    try {
-        $sf = [single]([WinDpi]::GetDpiForSystem() / 96.0)
-        if ($sf -lt 1) { $sf = [single]1 }
-    } catch { }
 
     # GDI+ 兼容文本渲染（UseCompatibleTextRendering）的边缘是硬锯齿；关掉它走 GDI+Uniscribe 混合路径才有 ClearType
     try { [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false) } catch { }
@@ -378,15 +372,14 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
     $form.MaximizeBox = $false
     $form.MinimizeBox = $false
     $form.TopMost = $true
-    $form.ClientSize = New-Object System.Drawing.Size(520, 206)
     $form.BackColor = [System.Drawing.Color]::White
     $form.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
     $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
+    $form.ClientSize = New-Object System.Drawing.Size(520, 220)
 
     $title = New-Object System.Windows.Forms.Label
     $title.Text = '正在获取文件信息…'
     $title.AutoSize = $true
-    $title.Location = New-Object System.Drawing.Point(18, 18)
     $title.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 12.5, [System.Drawing.FontStyle]::Bold)
     $title.ForeColor = $ink
     $form.Controls.Add($title)
@@ -395,14 +388,11 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
     $sub = New-Object System.Windows.Forms.Label
     $sub.Text = '正在连接下载服务器…'
     $sub.AutoSize = $true
-    $sub.Location = New-Object System.Drawing.Point(19, 53)
     $sub.ForeColor = $muted
     $form.Controls.Add($sub)
 
     # 自绘进度条：WinForms 自带的 ProgressBar 是 XP 时代的方块条，改手绘圆角胶囊
     $track = New-Object System.Windows.Forms.Panel
-    $track.Location = New-Object System.Drawing.Point(18, 82)
-    $track.Size = New-Object System.Drawing.Size(484, 12)
     $track.BackColor = [System.Drawing.Color]::White
     $track.Tag = [double]0
     $track.Add_Paint({
@@ -447,15 +437,13 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
     $detail = New-Object System.Windows.Forms.Label
     $detail.Text = '正在连接下载服务器，请稍候…'
     $detail.AutoSize = $true
-    $detail.Location = New-Object System.Drawing.Point(18, 101)
     $detail.ForeColor = $ink
     $form.Controls.Add($detail)
 
     $percent = New-Object System.Windows.Forms.Label
     $percent.Text = ''
     $percent.AutoSize = $false
-    $percent.Size = New-Object System.Drawing.Size(120, 20)
-    $percent.Location = New-Object System.Drawing.Point(382, 101)
+
     $percent.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
     $percent.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9, [System.Drawing.FontStyle]::Bold)
     $percent.ForeColor = $pink
@@ -464,21 +452,18 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
     $speed = New-Object System.Windows.Forms.Label
     $speed.Text = '总速度 0.0 MB/s'
     $speed.AutoSize = $true
-    $speed.Location = New-Object System.Drawing.Point(18, 125)
     $speed.ForeColor = $muted
     $form.Controls.Add($speed)
 
     $hint = New-Object System.Windows.Forms.Label
     $hint.Text = '下载完成后自动继续安装'
     $hint.AutoSize = $true
-    $hint.Location = New-Object System.Drawing.Point(18, 162)
     $hint.ForeColor = [System.Drawing.Color]::FromArgb(170, 176, 185)
     $form.Controls.Add($hint)
 
     $stopBtn = New-Object System.Windows.Forms.Button
     $stopBtn.Text = '停止'
-    $stopBtn.Size = New-Object System.Drawing.Size(96, 32)
-    $stopBtn.Location = New-Object System.Drawing.Point(406, 154)
+
     $stopBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
     $stopBtn.FlatAppearance.BorderSize = 1
     $stopBtn.FlatAppearance.BorderColor = $edge
@@ -497,21 +482,6 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
         if ($c -is [System.Windows.Forms.Label]) { $c.UseCompatibleTextRendering = $false }
     }
 
-    # 控件坐标都是按 96 DPI 摆的，这里按真实缩放整体放大一次
-    if ($sf -ne 1) {
-        $form.Scale((New-Object System.Drawing.SizeF($sf, $sf)))
-        $form.ClientSize = New-Object System.Drawing.Size([int](520 * $sf), [int](206 * $sf))
-        # Scale() 只放大了控件框，字号还是 96 DPI 那套，得一起放大，不然字会显得瘪
-        foreach ($c in $form.Controls) {
-            try {
-                $cf = $c.Font
-                if ($cf) {
-                    $c.Font = New-Object System.Drawing.Font($cf.FontFamily, [single]($cf.SizeInPoints * $sf), $cf.Style, $cf.Unit)
-                }
-            }
-            catch { }
-        }
-    }
     $stopBtn.Add_Click({
         [FfDl]::Stop = $true
         $stopBtn.Enabled = $false
@@ -526,6 +496,54 @@ function Invoke-ParallelDownload([string]$Target, [string]$ZipPath, [int]$Thread
     Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class WinShow{[DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr h,int n);}'
     [void][WinShow]::ShowWindow($form.Handle, 5)
     $form.Activate()
+    [System.Windows.Forms.Application]::DoEvents()
+
+    # 排版：不猜缩放比例，先 Show 拿到真实 DeviceDpi，再按倍数摆位置和固定尺寸。
+    # 字号交给 GDI 按点数渲染，这里绝不再对 Font 二次放大 —— 那正是 200% 下
+    # 字比框还大、糊成一团的原因。
+    $sc = [single]1
+    try { $sc = [single]($form.DeviceDpi / 96.0) } catch { }
+    if ($sc -lt 1) { $sc = [single]1 }
+
+    $pad  = [int][Math]::Round(18 * $sc)
+    $pctW = [int][Math]::Round(96 * $sc)
+    $btnW = [int][Math]::Round(96 * $sc)
+    $btnH = [int][Math]::Round(32 * $sc)
+    $gap  = [int][Math]::Round(16 * $sc)
+
+    $innerW = [int][Math]::Round(484 * $sc)
+    foreach ($need in @(($detail.PreferredSize.Width + $pctW + $gap),
+                        ($hint.PreferredSize.Width + $btnW + $gap),
+                        ($title.PreferredSize.Width))) {
+        if ($need -gt $innerW) { $innerW = [int]$need }
+    }
+
+    $y = [int][Math]::Round(16 * $sc)
+    $title.Location = New-Object System.Drawing.Point($pad, $y)
+    $y += $title.PreferredSize.Height + [int][Math]::Round(6 * $sc)
+    $sub.Location = New-Object System.Drawing.Point($pad, $y)
+    $y += $sub.PreferredSize.Height + [int][Math]::Round(12 * $sc)
+
+    $barH = [int][Math]::Round(12 * $sc)
+    $track.Location = New-Object System.Drawing.Point($pad, $y)
+    $track.Size = New-Object System.Drawing.Size($innerW, $barH)
+    $y += $barH + [int][Math]::Round(12 * $sc)
+
+    $rowH = [Math]::Max($detail.PreferredSize.Height, $percent.PreferredSize.Height)
+    $detail.Location = New-Object System.Drawing.Point($pad, ($y + [int][Math]::Round(($rowH - $detail.PreferredSize.Height) / 2)))
+    $percent.Size = New-Object System.Drawing.Size($pctW, $rowH)
+    $percent.Location = New-Object System.Drawing.Point(($pad + $innerW - $pctW), $y)
+    $y += $rowH + [int][Math]::Round(6 * $sc)
+
+    $speed.Location = New-Object System.Drawing.Point($pad, ($y + [int][Math]::Round(($rowH - $speed.PreferredSize.Height) / 2)))
+    $y += $speed.PreferredSize.Height + [int][Math]::Round(14 * $sc)
+
+    $hint.Location = New-Object System.Drawing.Point($pad, ($y + [int][Math]::Round(($btnH - $hint.PreferredSize.Height) / 2)))
+    $stopBtn.Size = New-Object System.Drawing.Size($btnW, $btnH)
+    $stopBtn.Location = New-Object System.Drawing.Point(($pad + $innerW - $btnW), $y)
+    $y += $btnH
+
+    $form.ClientSize = New-Object System.Drawing.Size(($innerW + 2 * $pad), ($y + [int][Math]::Round(14 * $sc)))
     [System.Windows.Forms.Application]::DoEvents()
 
     $meta = Get-RemoteMeta $Target
