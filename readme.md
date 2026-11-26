@@ -222,6 +222,10 @@ bash build/build_unix.sh          # single file + tar.gz folder build
 **The GUI does not open (Linux)**: usually no display server or no `python3-tk`. Over SSH the program
 prints a hint and exits instead of throwing.
 
+**Linux build says `GLIBC_2.38 not found`**: that symbol only exists on 24.04 and newer. The release
+binary is now built on ubuntu 22.04 (glibc 2.35 floor), so 22.04 / 24.04 and Debian 12 all run it;
+older distributions should run it from source.
+
 **Double-click does nothing**: that is the single-instance guard. On Windows the existing window is raised;
 if no window appears, wait a moment (a previous instance may still be shutting down) or end the stray process.
 
