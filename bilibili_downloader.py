@@ -117,6 +117,40 @@ def apply_window_icon(win) -> None:
     except Exception:
         pass
 
+
+_hicon_cache: dict[int, int] = {}
+
+
+def app_hicon(size: int = 0) -> int:
+    """把 assets/app.ico 直接载成 HICON。
+
+    Tk 的 iconbitmap 只换窗口标题栏，托盘图标和气泡提示走的是 Shell_NotifyIcon 的
+    hIcon，以前两处都写着 LoadIconW(None, IDI_APPLICATION)，所以托盘和通知里一直是
+    系统默认的空白窗口图标。size=0 表示按当前 DPI 取小图标尺寸。
+    """
+    if os.name != "nt":
+        return 0
+    if size in _hicon_cache:
+        return _hicon_cache[size]
+    hicon = 0
+    icon = app_icon_path()
+    if icon is not None:
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            user32.LoadImageW.restype = wintypes.HICON
+            user32.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR,
+                                          wintypes.UINT, ctypes.c_int, ctypes.c_int,
+                                          wintypes.UINT]
+            px = size or user32.GetSystemMetrics(49)      # SM_CXSMICON
+            hicon = int(user32.LoadImageW(None, str(icon), 1, px, px, 0x10) or 0)
+        except Exception:
+            hicon = 0
+    _hicon_cache[size] = hicon
+    return hicon
+
 # WBI 签名用的混淆表（来自 B 站 web 端实现，顺序不可改）
 MIXIN_KEY_ENC_TAB = (
     46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
@@ -2998,9 +3032,11 @@ class _TrayIcon:
 
             nid = NOTIFYICONDATAW.from_buffer_copy(self._nid)
             nid.uFlags = 0x10 | 0x2 | 0x1          # NIF_INFO | NIF_ICON | NIF_MESSAGE
+            nid.hIcon = app_hicon() or nid.hIcon
             nid.szInfo = message[:250]
             nid.szInfoTitle = title[:60]
-            nid.dwInfoFlags = 0x1                   # NIIF_INFO
+            nid.dwInfoFlags = 0x4                   # NIIF_USER：气泡用我们自己的图标
+            nid.hBalloonIcon = app_hicon(32) or nid.hIcon
             ctypes.windll.shell32.Shell_NotifyIconW(1, ctypes.byref(nid))
         except Exception:
             pass
@@ -3114,7 +3150,7 @@ class _TrayIcon:
         window_class = WNDCLASSW()
         window_class.lpfnWndProc = proc
         window_class.hInstance = instance
-        window_class.hIcon = user32.LoadIconW(None, IDI_APPLICATION)
+        window_class.hIcon = app_hicon(32) or user32.LoadIconW(None, IDI_APPLICATION)
         window_class.lpszClassName = f"BiliDownloaderTray_{os.getpid()}"
         if not user32.RegisterClassW(ctypes.byref(window_class)):
             return
@@ -3129,7 +3165,7 @@ class _TrayIcon:
         nid.uID = 1
         nid.uFlags = 0x1 | 0x2 | 0x4                       # MESSAGE | ICON | TIP
         nid.uCallbackMessage = self.WM_TRAY
-        nid.hIcon = user32.LoadIconW(None, IDI_APPLICATION)
+        nid.hIcon = app_hicon() or user32.LoadIconW(None, IDI_APPLICATION)
         nid.szTip = self.tooltip
         self._nid = bytes(nid)
         shell32.Shell_NotifyIconW(0, ctypes.byref(nid))     # NIM_ADD
