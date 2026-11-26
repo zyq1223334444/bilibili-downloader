@@ -1,33 +1,39 @@
 #!/usr/bin/env python3
 r"""
-B 站视频 / 分P / 合集 下载器（DASH 分流下载 + ffmpeg 合并）
+B 站视频 / 分P / 合集 下载器（DASH 分流下载 + ffmpeg 合并），Windows / macOS / Linux 同一份代码
 
 依赖：
     pip install -r requirements.txt        # requests, tqdm
-    系统需安装 ffmpeg 并加入 PATH
+    另需 ffmpeg（合并音视频、导出 MP3、封装或烧录弹幕）：
+        Windows      下载安装包时自带安装流程，或 bilibili_downloader --install-ffmpeg
+        macOS        brew install ffmpeg
+        Linux        sudo apt install ffmpeg  /  sudo dnf install ffmpeg
 
-登录凭证（可选，用于 1080P+ / 4K / 8K / 无损音频）：
-    读取顺序：① 环境变量 BILI_SESSDATA  ② 脚本目录下的 sessdata.txt 或 ~/.config 下的副本
-    都没读到时会**交互式询问一次**（输入不回显），校验后自动保存到 Windows 用户环境变量，
-    下次运行会直接读取（也会直查注册表，所以旧终端窗口同样有效）。
-    启动时会校验凭证：失效会明确提示，并可直接回车前的 [Y/n] 当场重新输入。
+登录凭证（可选，决定画质上限：1080P+ / 4K / 8K / 无损音频）：
+    读取顺序：① 环境变量 BILI_SESSDATA  ② 程序目录下的 sessdata.txt
+              ③ 用户配置目录（Windows 注册表用户变量 / macOS、Linux 的
+                 ~/.config/bilibili-downloader/sessdata）
+    都没有时会**交互式询问一次**（输入不回显），校验通过后按当前系统的方式保存：
+    Windows 写用户环境变量（并直查注册表，旧终端窗口也能读到），
+    macOS / Linux 写用户配置文件（0600）。
     更换账号或凭证过期：加 --reset-sessdata 重新输入。
-    手动设置（PowerShell，永久）：setx BILI_SESSDATA "你的SESSDATA"
+    手动设置：Windows  setx BILI_SESSDATA "..."     macOS / Linux  export BILI_SESSDATA=...
     获取方法：浏览器登录 B 站 → F12 → Application → Cookies → bilibili.com → 复制 SESSDATA
     ⚠️ SESSDATA 等同账号登录凭证：不要写进源码、不要提交仓库、不要发给别人。
        一旦怀疑泄露，立刻到 B 站「设置 → 安全隐私 → 退出所有设备」使旧凭证失效。
 
-保存结构（默认保存到桌面）：
-    单视频      桌面\<视频标题>\<视频标题>.mp4 / .mp3
-    多P视频     桌面\<视频标题>\P01 <分P标题>\P01 <分P标题>.mp4 / .mp3
-    合集        桌面\<合集标题>\<视频标题>\<视频标题>.mp4 / .mp3
-    合集内的多P 桌面\<合集标题>\<视频标题>\P01 <分P标题>\P01 <分P标题>.mp4
+保存结构（默认保存到桌面，路径分隔符按系统走）：
+    单视频      桌面/<视频标题>/<视频标题>.mp4 / .mp3
+    多P视频     桌面/<视频标题>/P01 <分P标题>/P01 <分P标题>.mp4 / .mp3
+    合集        桌面/<合集标题>/<视频标题>/<视频标题>.mp4 / .mp3
+    合集内的多P 桌面/<合集标题>/<视频标题>/P01 <分P标题>/P01 <分P标题>.mp4
     弹幕        与视频同目录：<名字>.danmaku.xml（原始弹幕）/ <名字>.danmaku.ass（可直接挂载）
 
     把弹幕放进视频：--danmaku-video soft → <名字>.mkv（字幕轨，可开关）；hard → <名字>.mp4（烧进画面）
 
 图形界面：
-    不带参数运行（或加 --gui）打开图形界面，所有选项都在界面上，最后一行提示命令行帮助入口。
+    不带参数运行（或加 --gui）打开图形界面，所有选项都在界面上，底部有「帮助」按钮。
+    图形界面同一时间只允许一个实例；带参数的命令行调用不受此限制，可以并发跑。
 
 用法：
     python bilibili_downloader.py                                   # 打开图形界面
@@ -38,7 +44,7 @@ B 站视频 / 分P / 合集 下载器（DASH 分流下载 + ffmpeg 合并）
     python bilibili_downloader.py BV1xx411c7mD -j 4                # 4 个文件同时下（默认）
     python bilibili_downloader.py BV1xx411c7mD -j 1                # 串行，显示实时进度条
     python bilibili_downloader.py BV1xx411c7mD --danmaku full --danmaku-video soft
-    python bilibili_downloader.py --install-ffmpeg                 # 下载 ffmpeg 到 ~\ffmpeg 并加进 PATH
+    python bilibili_downloader.py --install-ffmpeg                 # 仅 Windows：装到 ~/ffmpeg 并加进 PATH
     python bilibili_downloader.py --install-ffmpeg --ffmpeg-source mirror   # 走 ghfast.top 镜像
       源可选 auto（默认，官方→镜像→gyan 依次回退）/ official / mirror
 """
@@ -97,38 +103,89 @@ USER_AGENT = (
 
 APP_DIR = Path(__file__).resolve().parent
 
+# ================= 平台 =================
+#
+# 三套系统共用一份逻辑，差异只在这里收口：字体名、图标格式、配置目录、
+# 打开文件夹的方式、单实例锁。别的地方一律只问 IS_WIN / IS_MAC / IS_LINUX，
+# 不要再散落 os.name == "nt" 的临时判断——那种判断漏掉一处，就是"Windows 修好了、
+# 换个系统又坏"的老毛病。
+
+IS_WIN = os.name == "nt"
+IS_MAC = sys.platform == "darwin"
+IS_LINUX = not IS_WIN and not IS_MAC
+PLATFORM_NAME = "Windows" if IS_WIN else ("macOS" if IS_MAC else "Linux")
+
+# 中文字体：三套系统各有各的默认字体名，写死一个在别的系统上会退回点阵字体
+GUI_FONT_FAMILY = (
+    "Microsoft YaHei UI" if IS_WIN else ("PingFang SC" if IS_MAC else "Noto Sans CJK SC")
+)
+MONO_FONT_FAMILY = "Consolas" if IS_WIN else ("Menlo" if IS_MAC else "DejaVu Sans Mono")
+GUI_FONT_FALLBACK = "Arial" if IS_WIN else ("Helvetica Neue" if IS_MAC else "DejaVu Sans")
+
+
+def user_config_dir() -> Path:
+    """用户配置目录：Windows 用 %APPDATA%，macOS / Linux 用 ~/.config。
+
+    程序目录在 Program Files / /usr 下通常不可写，配置和凭证都得落到这里，
+    否则预约任务、直播设置会在下次启动时静默丢失。
+    """
+    if IS_WIN:
+        base = os.environ.get("APPDATA") or str(Path.home())
+        return Path(base) / "bilibili-downloader"
+    return Path.home() / ".config" / "bilibili-downloader"
+
 
 def app_icon_path() -> Path | None:
-    """assets/app.ico，源码运行时在仓库里，打包后跟着 exe 在一起。"""
+    """程序图标：Windows 用 .ico（Tk 与 Shell 都认），macOS / Linux 用 .png。
+
+    源码运行时在仓库 assets/ 里，打包后跟着 exe / app 放在一起。
+    """
+    names = ("app.ico", "app.png") if IS_WIN else ("app.png", "app.ico")
     for base in (APP_DIR, Path(sys.argv[0]).resolve().parent):
-        icon = base / "assets" / "app.ico"
-        if icon.is_file():
-            return icon
+        for name in names:
+            icon = base / "assets" / name
+            if icon.is_file():
+                return icon
     return None
 
 
+_icon_cache: dict[int, object] = {}
+
+
 def apply_window_icon(win) -> None:
-    """把 Tk 默认的羽毛图标换成自己的（非 Windows 或图标缺失时静默跳过）。"""
+    """给窗口换图标。
+
+    Windows 走 iconbitmap(.ico)；macOS / Linux 的 Tk 不认 .ico，必须用
+    iconphoto + PhotoImage(.png)。PhotoImage 会被 GC 回收导致图标消失，
+    所以挂在窗口对象上留一份引用。图标缺失或 Tk 不支持时静默跳过。
+    """
     icon = app_icon_path()
     if icon is None:
         return
     try:
-        win.iconbitmap(str(icon))
+        if IS_WIN:
+            win.iconbitmap(str(icon))
+            return
+        import tkinter as tk
+
+        key = id(win)
+        photo = _icon_cache.get(key)
+        if photo is None:
+            photo = tk.PhotoImage(file=str(icon))
+            _icon_cache[key] = photo
+        win.iconphoto(True, photo)
+        win._bd_icon = photo                    # 防 GC
     except Exception:
         pass
 
 
-_hicon_cache: dict[int, int] = {}
-
-
 def app_hicon(size: int = 0) -> int:
-    """把 assets/app.ico 直接载成 HICON。
+    """把 assets/app.ico 载成 HICON（仅 Windows 托盘用）。
 
-    Tk 的 iconbitmap 只换窗口标题栏，托盘图标和气泡提示走的是 Shell_NotifyIcon 的
-    hIcon，以前两处都写着 LoadIconW(None, IDI_APPLICATION)，所以托盘和通知里一直是
-    系统默认的空白窗口图标。size=0 表示按当前 DPI 取小图标尺寸。
+    托盘的隐藏窗口类和 Shell_NotifyIcon 的 hIcon 都不走 Tk，必须自己载；
+    size=0 表示按当前 DPI 取小图标尺寸。其他系统没有这个概念，返回 0。
     """
-    if os.name != "nt":
+    if not IS_WIN:
         return 0
     if size in _hicon_cache:
         return _hicon_cache[size]
@@ -150,6 +207,80 @@ def app_hicon(size: int = 0) -> int:
             hicon = 0
     _hicon_cache[size] = hicon
     return hicon
+
+
+_hicon_cache: dict[int, int] = {}
+
+
+def open_path(path) -> None:
+    """用系统默认程序打开文件或文件夹（三平台统一入口）。"""
+    target = str(path)
+    if IS_WIN:
+        os.startfile(target)                     # type: ignore[attr-defined]
+    elif IS_MAC:
+        subprocess.Popen(["open", target])
+    else:
+        subprocess.Popen(["xdg-open", target])
+
+
+def _single_instance_handle():
+    """跨平台单实例锁：拿到锁返回句柄，已有实例在跑返回 None。
+
+    Windows 用命名互斥体（Local\\ 作用域，只在本登录会话内互斥）；
+    macOS / Linux 用 flock 锁一个用户配置目录下的文件——进程退出时系统自动释放，
+    不会留下"上次崩溃了所以永远打不开"的死锁。
+    """
+    try:
+        if IS_WIN:
+            import ctypes
+            from ctypes import wintypes
+
+            # 必须 use_last_error=True：windll 不保证 GetLastError 是本次调用的结果，
+            # 读到上一条无关错误就会出现"明明没人开却提示已经在运行"。
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateMutexW.restype = wintypes.HANDLE
+            kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+            handle = kernel32.CreateMutexW(None, False, "Local\\BilibiliDownloaderGui")
+            if not handle:
+                return object()                  # 拿不到互斥体就别拦住用户
+            # ERROR_ALREADY_EXISTS = 183：说明别的进程已经创建并持有它
+            if ctypes.get_last_error() == 183:
+                kernel32.CloseHandle(handle)
+                return None
+            return handle
+
+        import fcntl
+
+        path = user_config_dir() / "gui.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "a+")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return None
+        return handle
+    except Exception:
+        return object()                          # 锁不可用时宁可放行，也不要打不开界面
+
+
+def _focus_existing_window(title: str) -> bool:
+    """已经有一个界面实例时，尽力把它拉到前台（Windows 能精确找窗口，其他系统只提示）。"""
+    if not IS_WIN:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        hwnd = user32.FindWindowW(None, title)
+        if not hwnd:
+            return False
+        user32.ShowWindow(hwnd, 9)               # SW_RESTORE
+        user32.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        return False
 
 # WBI 签名用的混淆表（来自 B 站 web 端实现，顺序不可改）
 MIXIN_KEY_ENC_TAB = (
@@ -194,7 +325,7 @@ SLOW_MIN_ELAPSED = 20.0            # 至少已下载这么久才开始判定（�
 SLOW_MIN_REF = 256 * 1024          # 参考速度低于此值说明本来就慢，重连也没意义
 SLOW_MIN_ETA = 10.0                # 预计剩余时间小于该值（秒）就继续下，别重连
 DEFAULT_MAX_RECONNECTS = 5         # 单个流最多因"变慢"重开几次连接
-PATH_LIMIT = 235         # Windows 整条路径的安全上限（MAX_PATH=260，留出余量）
+PATH_LIMIT = 235 if IS_WIN else 3800   # Windows MAX_PATH 留余量；POSIX 整条路径上限约 4096
 PART_SUFFIX = ".part"
 
 ENV_NAME = "BILI_SESSDATA"
@@ -237,12 +368,13 @@ def _app_dir() -> Path:
 
 
 def desktop_dir() -> Path:
-    """用户桌面目录（Windows 上要顺着注册表走，OneDrive 会把桌面挪走）。
+    """用户桌面目录。
 
-    直接写 ~/Desktop 在开了 OneDrive 备份的机器上会落到一个空目录里，
-    用户在自己的桌面上根本看不到下载的东西。
+    Windows 上不能直接写 ~/Desktop：开了 OneDrive 备份的机器，桌面被挪走，
+    下载完用户在自己的桌面上根本看不到。macOS / Linux 直接按 XDG 习惯找，
+    找不到就退回主目录。
     """
-    if os.name == "nt":
+    if IS_WIN:
         try:
             import winreg
 
@@ -254,16 +386,17 @@ def desktop_dir() -> Path:
                 return resolved
         except OSError:
             pass
-    return Path.home() / "Desktop"
+    desktop = Path.home() / "Desktop"
+    return desktop if desktop.is_dir() else Path.home()
 
 
 def default_output() -> Path:
-    """默认保存根目录：桌面（需求明确要求默认落到桌面上）。"""
+    """默认保存根目录：桌面。"""
     return desktop_dir()
 
 
 SESSDATA_FILE = _app_dir() / "sessdata.txt"
-SESSDATA_HOME_FILE = Path.home() / ".config" / "bilibili-downloader" / "sessdata"
+SESSDATA_HOME_FILE = user_config_dir() / "sessdata"
 
 
 class DownloadError(RuntimeError):
@@ -283,6 +416,9 @@ _ABORT = threading.Event()
 
 # GUI 注册的选择回调：有它时代替终端里的 input()（主线程弹窗，工作线程等结果）
 _SELECTION_CALLBACK: Callable[[int, Sequence["Item"]], list[int] | None] | None = None
+
+# 单实例锁句柄：必须活到进程退出（局部变量被回收时锁就没了）
+_INSTANCE_HANDLE: list[object] = []
 
 # 接口调用串行化 + 最小间隔，避免多线程同时打接口触发风控
 _API_LOCK = threading.Lock()
@@ -376,20 +512,32 @@ def _setup_console() -> None:
 
 
 def clean_name(name: str, limit: int = NAME_LIMIT) -> str:
-    """清洗成合法文件名：去掉 Windows 非法字符、首尾空格与点、限制长度。"""
-    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", str(name))
+    """清洗成合法文件名。
+
+    Windows 的非法字符集合是 `\\ / : * ? " < > |` 加控制字符，还额外禁掉
+    CON/PRN 这类设备名；macOS / Linux 只禁 `/` 和 NUL（冒号在 HFS+ 上曾经
+    有问题，现在也一并换掉，省得同一个视频在两个系统上名字不一样）。
+    """
+    if IS_WIN:
+        name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", str(name))
+    else:
+        name = re.sub(r"[/:\x00-\x1f]", "_", str(name))
     name = re.sub(r"\s+", " ", name).strip(" .")
     if len(name) > limit:
         name = name[:limit].rstrip(" .")
     if not name:
         return "untitled"
-    if name.split(".")[0].upper() in WINDOWS_RESERVED:
+    if IS_WIN and name.split(".")[0].upper() in WINDOWS_RESERVED:
         name = "_" + name
     return name
 
 
 def fit_path(path: Path, limit: int = PATH_LIMIT) -> Path:
-    """整条路径过长时，从最深的组件开始缩短（补短哈希防重名），规避 Windows MAX_PATH。"""
+    """整条路径过长时，从最深的组件开始缩短（补短哈希防重名）。
+
+    Windows 是 MAX_PATH 260 的硬限制；macOS / Linux 单条路径能到 4096、
+    单个组件 255 字节，正常不会触发，这个函数在那边基本是直通。
+    """
     if len(str(path)) <= limit:
         return path
 
@@ -504,7 +652,7 @@ def _windows_user_env(name: str | None = None) -> str:
     已经打开的终端、常驻服务进程持有的是启动时的环境副本，os.environ 里可能
     读不到刚设置的变量（Windows 只在进程启动时注入环境变量），所以这里直查注册表兜底。
     """
-    if os.name != "nt":
+    if not IS_WIN:
         return ""
     try:
         import winreg
@@ -589,7 +737,7 @@ def check_sessdata(session: requests.Session, headers: dict,
 
 def _broadcast_env_change() -> None:
     """best-effort：通知资源管理器环境变量已变更。"""
-    if os.name != "nt":
+    if not IS_WIN:
         return
     try:
         import ctypes
@@ -611,7 +759,7 @@ def save_sessdata(value: str) -> str:
     if not value:
         return "未保存（空值）"
 
-    if os.name == "nt":
+    if IS_WIN:
         try:
             import winreg
 
@@ -1312,30 +1460,44 @@ def download_stream(session: requests.Session, stream: dict, dest: Path, desc: s
 
 
 def ffmpeg_bin_name() -> str:
-    return "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    return "ffmpeg.exe" if IS_WIN else "ffmpeg"
 
 
 def ffmpeg_local_bin() -> Path:
-    """本地 ffmpeg 目录：~\ffmpeg\bin（安装包与 --install-ffmpeg 都装这里）。"""
+    """本地 ffmpeg 目录：~/ffmpeg/bin（Windows 安装包与 --install-ffmpeg 装这里）。"""
     return Path.home() / "ffmpeg" / "bin"
 
 
 @lru_cache(maxsize=1)
 def find_ffmpeg() -> str:
+    """找 ffmpeg：先看 PATH，再看本地安装目录，最后按平台给出安装命令。
+
+    macOS 的 Homebrew（Apple Silicon / Intel）和 Linux 的 snap、/usr/local/bin
+    不一定都在 PATH 里，所以额外补几处常见路径，省得"装好了却找不到"。
+    """
     exe = shutil.which("ffmpeg")
     if not exe:
-        # 安装包/--install-ffmpeg 会把 ffmpeg 放在 ~\ffmpeg\bin，但 PATH 要新开进程才生效；
+        # 安装包 / --install-ffmpeg 会把 ffmpeg 放在 ~/ffmpeg/bin，但 PATH 要新开进程才生效；
         # 这里再直接找一遍，省得用户重启终端才发现"明明装好了却找不到"。
         local = ffmpeg_local_bin() / ffmpeg_bin_name()
         if local.is_file():
             exe = str(local)
+    if not exe and not IS_WIN:
+        for folder in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/snap/bin"):
+            candidate = Path(folder) / "ffmpeg"
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                exe = str(candidate)
+                break
     if not exe:
+        hint = {
+            "Windows": "bilibili_downloader --install-ffmpeg（自动装到 ~\\ffmpeg 并加进 PATH）\n"
+                       "             或 choco install ffmpeg / scoop install ffmpeg",
+            "macOS": "brew install ffmpeg",
+            "Linux": "sudo apt install ffmpeg（Debian/Ubuntu）/ sudo dnf install ffmpeg（Fedora）",
+        }[PLATFORM_NAME]
         raise DownloadError(
             "未找到 ffmpeg，缺少它无法合并音视频、导出 MP3、烧录弹幕\n"
-            "    Windows: bilibili_downloader --install-ffmpeg（自动装到 ~\\ffmpeg 并加进 PATH）\n"
-            "             或 choco install ffmpeg / scoop install ffmpeg\n"
-            "    macOS:   brew install ffmpeg\n"
-            "    Linux:   sudo apt install ffmpeg"
+            f"    {PLATFORM_NAME}: {hint}"
         )
     return exe
 
@@ -1388,8 +1550,17 @@ def _download_with_progress(url: str, dest: Path, *, label: str,
 
 
 def _add_user_path(directory: Path) -> bool:
-    """把目录追加到 Windows 用户 PATH（幂等，大小写不敏感）。"""
-    if os.name != "nt":
+    """把目录追加到用户 PATH（幂等，大小写不敏感）。
+
+    Windows 写 HKCU\\Environment（并广播 WM_SETTINGCHANGE，新的终端才知道）；
+    macOS / Linux 不擅自改 shell 启动脚本——用户的 .zshrc / .bashrc 各有各的写法，
+    硬改很容易改坏，所以只保证当前进程能用，长期生效在 README 里给命令。
+    """
+    if not IS_WIN:
+        entry = str(Path(directory).resolve())
+        parts = os.environ.get("PATH", "").split(os.pathsep)
+        if entry not in parts:
+            os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + entry
         return False
     entry = str(Path(directory).resolve())
     try:
@@ -1504,15 +1675,22 @@ def _download_ffmpeg_archive(dest: Path, size: int, source: str | None = None) -
 
 
 def install_ffmpeg(target: Path | None = None, source: str | None = None) -> str:
-    """下载 ffmpeg 到 ~\ffmpeg 并加入用户 PATH（Windows）。
+    """下载 ffmpeg 到 ~/ffmpeg 并加入用户 PATH（仅 Windows）。
 
     用 gyan.dev 的 essentials 构建：libmp3lame / libx264 / libass 都在里面，
-    体积又比 gpl 全家桶小一半。下载源由 source 决定（auto/official/mirror），
+    体积又比 gpl 全家桶小一半。下载源由 source 决定（auto / official / mirror），
     和安装包里的选择页走同一份包，两边行为一致。
+
+    macOS / Linux 不做"自动下载二进制"：那边的包管理器已经把 ffmpeg 管得很好，
+    硬塞一份到 ~/ffmpeg 反而会和系统版本打架，所以这里只给出对应命令。
     """
-    if os.name != "nt":
-        raise DownloadError("自动安装只支持 Windows；"
-                            "Linux 用 sudo apt install ffmpeg，macOS 用 brew install ffmpeg")
+    if not IS_WIN:
+        raise DownloadError(
+            f"{PLATFORM_NAME} 请用系统包管理器安装 ffmpeg：\n"
+            "    macOS: brew install ffmpeg\n"
+            "    Linux: sudo apt install ffmpeg（Debian/Ubuntu）"
+            " / sudo dnf install ffmpeg（Fedora）"
+        )
 
     source = source or FFMPEG_SOURCE
     source_label = {"auto": "自动选择", "official": "官方源", "mirror": "镜像源"}.get(source, source)
@@ -2125,7 +2303,7 @@ def probe_media_size(video: Path) -> tuple[int, int]:
     """取视频分辨率给弹幕排版用；取不到就按 1920×1080（ASS 会按 PlayRes 缩放）。"""
     try:
         ffmpeg = find_ffmpeg()
-        probe = Path(ffmpeg).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe")
+        probe = Path(ffmpeg).with_name("ffprobe.exe" if IS_WIN else "ffprobe")
         if probe.is_file():
             proc = subprocess.run(
                 [str(probe), "-v", "error", "-select_streams", "v:0",
@@ -2150,32 +2328,31 @@ _LIVE_CONFIG_CACHE: Path | None = None
 def live_config_path() -> Path:
     """直播配置（画质、分段、预约任务）该写到哪。
 
-    装在 Program Files 时程序目录不可写，直接写会静默失败、预约任务下次启动就丢；
-    这种情况下退到 %APPDATA%\\bilibili-downloader\\，源码/绿色版仍然留在程序旁边。
+    程序目录可写时（源码运行、绿色版、装在自己目录里的单文件版）就留在程序旁边，
+    方便整目录拷走；装到 Program Files / /usr / /Applications 这类只读位置时，
+    退到用户配置目录（%APPDATA% 或 ~/.config），否则配置会静默写失败、
+    预约任务下次启动就丢。
     """
     global _LIVE_CONFIG_CACHE
     if _LIVE_CONFIG_CACHE is not None:
         return _LIVE_CONFIG_CACHE
     app_dir = _app_dir()
     app_file = app_dir / LIVE_CONFIG_NAME
-    if os.name == "nt":
+    try:
+        probe = app_dir / ".write_test"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+        _LIVE_CONFIG_CACHE = app_file
+        return app_file
+    except OSError:
+        base = user_config_dir()
         try:
-            probe = app_dir / ".write_test"
-            probe.write_text("", encoding="utf-8")
-            probe.unlink()
+            base.mkdir(parents=True, exist_ok=True)
+        except OSError:
             _LIVE_CONFIG_CACHE = app_file
             return app_file
-        except OSError:
-            base = Path(os.environ.get("APPDATA") or Path.home()) / "bilibili-downloader"
-            try:
-                base.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                _LIVE_CONFIG_CACHE = app_file
-                return app_file
-            _LIVE_CONFIG_CACHE = base / LIVE_CONFIG_NAME
-            return _LIVE_CONFIG_CACHE
-    _LIVE_CONFIG_CACHE = app_file
-    return app_file
+        _LIVE_CONFIG_CACHE = base / LIVE_CONFIG_NAME
+        return _LIVE_CONFIG_CACHE
 
 
 def load_live_config() -> dict:
@@ -2973,7 +3150,7 @@ def merge_subtitle(video: Path, subtitle: Path, mode: str, out: Path | None = No
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-# ---- 系统托盘（零依赖：ctypes 直接调 Shell_NotifyIcon）----
+# ---- 系统托盘（仅 Windows；零依赖，用 ctypes 直接调 Shell_NotifyIcon）----
 
 class _TrayIcon:
     """最小化到托盘：图标 + 右键菜单（显示主界面 / 录制直播 / 退出）。
@@ -2994,7 +3171,7 @@ class _TrayIcon:
         self._nid = None
 
     def available(self) -> bool:
-        return os.name == "nt"
+        return IS_WIN
 
     def start(self) -> None:
         if not self.available() or self._thread:
@@ -3433,9 +3610,46 @@ def ask_selection(total: int, attempts: int = 3) -> list[int] | None:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """命令行参数。
+
+    帮助文本按平台拼：ffmpeg 怎么装、凭证存哪儿、界面能不能开，三套系统答案不一样，
+    写死一份等于让另外两个系统的用户自己猜。
+    """
+    if IS_WIN:
+        ffmpeg_help = ("安装 ffmpeg 到 ~/ffmpeg 并写入用户 PATH（仅 Windows；"
+                       "macOS / Linux 请用包管理器）")
+        examples = (
+            "示例：\n"
+            "  bilibili_downloader                       打开图形界面\n"
+            "  bilibili_downloader BV1xx411c7mD          下载单个视频\n"
+            "  bilibili_downloader BV1xx411c7mD --single 只下当前分P\n"
+            "  bilibili_downloader BV1xx411c7mD --dry-run\n"
+            "  bilibili_downloader BV1xx411c7mD -q 720p --no-mp3\n"
+            "  bilibili_downloader BV1xx411c7mD --danmaku full --danmaku-video soft\n"
+            "  bilibili_downloader --install-ffmpeg --ffmpeg-source mirror\n"
+        )
+    else:
+        pkg = "brew install ffmpeg" if IS_MAC else "sudo apt install ffmpeg"
+        ffmpeg_help = f"自动安装 ffmpeg（仅 Windows；{PLATFORM_NAME} 用 {pkg}）"
+        examples = (
+            "示例：\n"
+            "  bilibili_downloader                       打开图形界面\n"
+            "  bilibili_downloader BV1xx411c7mD          下载单个视频\n"
+            "  bilibili_downloader BV1xx411c7mD --single 只下当前分P\n"
+            "  bilibili_downloader BV1xx411c7mD --dry-run\n"
+            "  bilibili_downloader BV1xx411c7mD -q 720p --no-mp3\n"
+            "  bilibili_downloader BV1xx411c7mD --danmaku full --danmaku-video soft\n"
+            f"  {pkg}" + ("" if IS_MAC else "   # 先装 ffmpeg") + "\n"
+        )
+    class _HelpFormatter(argparse.RawDescriptionHelpFormatter,
+                         argparse.ArgumentDefaultsHelpFormatter):
+        """保留 epilog 里的换行（示例要一行一条，不能被 argparse 压成一段）。"""
+
     parser = argparse.ArgumentParser(
-        description="B 站视频 / 分P / 合集下载器（DASH 分流 + ffmpeg 合并 + 弹幕）",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=(f"B 站视频 / 分P / 合集下载器（DASH 分流 + ffmpeg 合并 + 弹幕）"
+                     f" · 当前系统 {PLATFORM_NAME}"),
+        epilog=examples + "图形界面同一时间只跑一个实例；带参数的命令行调用不受限制，可并发。",
+        formatter_class=_HelpFormatter,
     )
     parser.add_argument("inputs", nargs="*",
                         help="视频链接 / BV 号 / av 号，可给多个；不填则交互式输入")
@@ -3466,8 +3680,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--retries", type=int, default=2, help="每个节点重试次数")
     parser.add_argument("--timeout", type=float, default=15.0, help="网络超时（秒）")
     parser.add_argument("--dry-run", action="store_true", help="只列出计划，不下载")
-    parser.add_argument("--install-ffmpeg", action="store_true",
-                        help="下载 ffmpeg 到 ~\\ffmpeg 并加入用户 PATH（仅 Windows）")
+    parser.add_argument("--install-ffmpeg", action="store_true", help=ffmpeg_help)
     parser.add_argument("--ffmpeg-source", choices=FFMPEG_SOURCES, default="auto",
                         help="ffmpeg 下载源：auto=官方→镜像→gyan 依次回退（默认），"
                              "official=只走 GitHub 官方，mirror=走 ghfast.top 镜像")
@@ -3509,25 +3722,28 @@ def _handle_missing_ffmpeg(args: argparse.Namespace) -> None:
     """没有 ffmpeg 时先打招呼：能装就当场问一句，不能装就给出可复制的命令。
 
     以前只在合并那一步报错，用户已经下完几百 MB 的流才发现白干；
-    现在一开始就说清楚"没有它会缺哪些功能"，并且复用 --install-ffmpeg 的同一套下载逻辑。
+    现在一开始就说清楚"没有它会缺哪些功能"，Windows 上复用 --install-ffmpeg 的逻辑，
+    macOS / Linux 直接给出包管理器命令（不再白跑一次网络探测）。
     """
     if args.dry_run:
         return                                  # 只看计划，不需要 ffmpeg
-    _, size = resolve_ffmpeg_archive()
-    shown = human_size(size) if size else f"约 {FFMPEG_FALLBACK_MB} MB"
     print("[!] 没有检测到 ffmpeg。缺少它无法合并音视频、导出 MP3，也无法把弹幕放进视频"
           "（下载只会留下分离的 .m4s 流文件）。")
-    if os.name != "nt":
-        print("    请先安装：Linux sudo apt install ffmpeg / macOS brew install ffmpeg")
+    if not IS_WIN:
+        hint = ("brew install ffmpeg" if IS_MAC else
+                "sudo apt install ffmpeg（Debian/Ubuntu）/ sudo dnf install ffmpeg（Fedora）")
+        print(f"    请先安装：{hint}")
         return
 
+    _, size = resolve_ffmpeg_archive()
+    shown = human_size(size) if size else f"约 {FFMPEG_FALLBACK_MB} MB"
     if not _is_interactive(args):
-        print(f"    可运行 bilibili_downloader --install-ffmpeg 自动安装到 ~\\ffmpeg"
+        print(f"    可运行 bilibili_downloader --install-ffmpeg 自动安装到 ~/ffmpeg"
               f"（大小：{shown}），或手动安装后重跑。")
         return
 
     try:
-        answer = input(f"    现在下载安装到 ~\\ffmpeg（大小：{shown}）？[Y/n] ").strip().lower()
+        answer = input(f"    现在下载安装到 ~/ffmpeg（大小：{shown}）？[Y/n] ").strip().lower()
     except EOFError:
         answer = "n"
     if answer in {"n", "no"}:
@@ -3540,15 +3756,25 @@ def _handle_missing_ffmpeg(args: argparse.Namespace) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """入口：不带参数 → 图形界面；带参数 → 原来的命令行流程（一个功能都没少）。
+    """入口：不带参数 → 图形界面；带参数 → 命令行流程（一个功能都没少）。
 
-    Ctrl+C 统一收成退出码 130；任何意外错误也只给人话，不打 traceback。
+    图形界面加了单实例互斥：同一时间只允许一个界面（Windows 用命名互斥体，
+    macOS / Linux 用 flock），避免两个实例抢同一个直播录制任务、写坏配置文件。
+    **带参数的命令行调用不受限制**——批处理里一次起十个下载任务是完全正常的用法。
     """
     raw = list(sys.argv[1:] if argv is None else argv)
-    if not raw or raw == ["--gui"]:
-        return run_gui()
-    if raw and all(item in ("--live", "--gui") for item in raw) and "--live" in raw:
-        return run_gui(start_live=True)
+    gui_only = (not raw) or raw == ["--gui"]
+    gui_live = bool(raw) and all(item in ("--live", "--gui") for item in raw) and "--live" in raw
+    if gui_only or gui_live:
+        handle = _single_instance_handle()
+        if handle is None:
+            if _focus_existing_window("B 站视频下载器"):
+                print("[提示] 已经有一个界面在运行，已为你切回那个窗口。")
+            else:
+                print("[提示] 已经有一个界面在运行；请先关掉它，或从托盘图标唤回。")
+            return 0
+        _INSTANCE_HANDLE.append(handle)      # 句柄要活到进程结束，不能提前释放
+        return run_gui(start_live=gui_live)
     try:
         return _main_impl(raw)
     except KeyboardInterrupt:
@@ -3632,7 +3858,7 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
             shown = item.out_dir.relative_to(root)
         except ValueError:
             shown = item.out_dir
-        print(f"  {index:>3}. {shown}\\{item.label}")
+        print(f"  {index:>3}. {shown}{os.sep}{item.label}")
 
     if args.dry_run:
         print("\n（--dry-run：未下载）")
@@ -3838,26 +4064,67 @@ GUI_HELP_TEXT = """B 站视频下载器 · 图形界面帮助
 【凭证 SESSDATA】
 可选，决定的是"画质上限"，不是速度：不填就是游客，通常最高 480P/720P、没有无损音频；
 填了才能按账号权限拿 1080P+ / 4K / 8K / HDR 和 Hi-Res。
-点"保存并校验"会写进 Windows 用户环境变量，并立刻用账号接口校验一次，以后所有终端和新开的
-程序都能自动读取（输入框可以留空）。卡片里的黑色区域像终端一样显示当前状态：
-游客模式（没读到凭证）/ 已读取待校验 / 已登录有效 / 凭证已失效（下载会自动回退游客画质）。
+点"保存并校验"会按当前系统的方式保存——Windows 写用户环境变量，macOS / Linux 写
+~/.config/bilibili-downloader/sessdata（权限 600），并立刻用账号接口校验一次，
+以后所有终端和新开的程序都能自动读取（输入框可以留空）。
+卡片里的黑色区域像终端一样显示当前状态：游客模式（没读到凭证）/ 已读取待校验 /
+已登录有效 / 凭证已失效（下载会自动回退游客画质）。
 已经读到有效凭证时，输入框会收起，改成"更换 / 清除"两个按钮。
 获取方法：浏览器登录 B 站 → F12 → Application → Cookies → bilibili.com → 复制 SESSDATA。
 它等同账号登录凭证，不要发给别人；怀疑泄露就去 B 站"退出所有设备"。
 
 【ffmpeg】
 合并音视频、导出 MP3、给视频加弹幕都依赖 ffmpeg。窗口里会显示是否已找到；
-没有时点"安装 ffmpeg"，会先把实际大小告诉你，再让你选下载源（官方源 / ghfast.top 镜像源），
-装到 ~\\ffmpeg 并加入用户 PATH。首选源连不上会自动换另一个，不会白等。
-也可以命令行运行 bilibili_downloader --install-ffmpeg [--ffmpeg-source mirror]。
+没有时点"安装 ffmpeg"：Windows 会先把实际大小告诉你，再让你选下载源
+（官方源 / ghfast.top 镜像源），装到 ~/ffmpeg 并加入用户 PATH；首选源连不上会自动换另一个。
+macOS / Linux 不做自动下载，点这个按钮会给出对应的 brew / apt / dnf 命令。
+也可以命令行运行 bilibili_downloader --install-ffmpeg（仅 Windows）。
 
 【保存结构】
-默认保存到桌面：桌面\\<视频标题>\\<视频标题>.mp4（软字幕模式则是 .mkv）、.mp3、
+默认保存到桌面：<桌面>/<视频标题>/<视频标题>.mp4（软字幕模式则是 .mkv）、.mp3、
 .danmaku.xml、.danmaku.ass；多 P 和合集会多一层目录，规则与命令行完全一致。
+路径分隔符随系统（Windows 是反斜杠，macOS / Linux 是斜杠），文件名里不合法的字符会自动替换。
 
 【界面没有的东西】
 本界面覆盖了全部下载选项；脚本/批处理场景请用命令行。
+同一时间只允许一个界面实例（再次双击会提醒你已经开着）；带参数的命令行调用不受限制。
+
 使用 -h/--help 查看命令行帮助"""
+
+
+def gui_help_text() -> str:
+    """图形界面帮助正文：通用部分 + 当前系统专属的一段。
+
+    帮助里最容易被漏掉的就是"这段话只说 Windows"——macOS / Linux 用户照着找环境变量、
+    照着重启资源管理器，只会更糊涂。所以平台相关的几行单独拼在末尾。
+    """
+    if IS_WIN:
+        extra = (
+            "\n【当前系统：Windows】\n"
+            "· 控制台默认 GBK，日志里的特殊字符会降级成 ?，不影响下载。\n"
+            "· 最小化到托盘后，双击托盘图标或右键「显示主界面」都能把窗口叫回来。\n"
+            "· 凭证保存在用户环境变量 BILI_SESSDATA（命令行 setx 也能改）。\n"
+            "· ffmpeg 可以在界面里一键下载安装，装到 ~/ffmpeg 并写入用户 PATH。\n"
+        )
+    elif IS_MAC:
+        extra = (
+            "\n【当前系统：macOS】\n"
+            "· 关闭窗口等于退出；想让后台继续跑，用「最小化到托盘」旁边的系统黄点最小化。\n"
+            "· 凭证保存在 ~/.config/bilibili-downloader/sessdata（权限 600）。\n"
+            "· ffmpeg 用 Homebrew 安装：brew install ffmpeg。\n"
+            "· 首次运行若提示“无法验证开发者”，右键应用 → 打开，或在"
+            "「系统设置 → 隐私与安全性」里放行。\n"
+        )
+    else:
+        extra = (
+            "\n【当前系统：Linux】\n"
+            "· 托盘图标取决于桌面环境（GNOME 需要 AppIndicator 扩展）；没有托盘时"
+            "「最小化到托盘」按钮退化为普通最小化。\n"
+            "· 凭证保存在 ~/.config/bilibili-downloader/sessdata（权限 600）。\n"
+            "· ffmpeg 用包管理器安装：sudo apt install ffmpeg / sudo dnf install ffmpeg。\n"
+            "· 无图形环境（纯 SSH）时请直接用命令行，界面会提示 tkinter 不可用。\n"
+        )
+    return GUI_HELP_TEXT + extra
 
 
 class _GuiStream:
@@ -3897,7 +4164,7 @@ def _enable_dpi_awareness() -> None:
     不开这个开关时 Windows 会把进程按 96dpi 虚拟化，Tk 以为自己是 1588 逻辑像素宽，
     实际只映射到 1073 物理像素，右边和底部的控件就被切掉了。
     """
-    if os.name != "nt":
+    if not IS_WIN:
         return
     try:
         import ctypes
@@ -3926,12 +4193,14 @@ _enable_dpi_awareness()
 
 
 def run_gui(start_live: bool = False) -> int:
-    """不带参数运行时的图形界面（Win11 风格 + 分集预览）。
+    """不带参数运行时的图形界面（浅色圆角风格 + 分集预览）。
 
     界面只负责"收集参数"和"挑要下哪几集"，真正的下载、弹幕、ffmpeg 仍然走 _main_impl；
     分集清单用 build_plan 预先取一次，勾选结果通过 _SELECTION_CALLBACK 原样交回去，
     所以不会出现"界面一套逻辑、命令行另一套"的问题。
 
+    三套系统共用这一份界面：字体名、图标格式、托盘能力在平台段里定，
+    这里只根据 IS_WIN / IS_MAC / IS_LINUX 决定"能不能开、藏到哪里"。
     start_live=True 时（--live 启动参数）只把「录制直播」窗口打开，主界面收起来。
     """
     try:
@@ -3944,7 +4213,13 @@ def run_gui(start_live: bool = False) -> int:
         print("    命令行功能不受影响：bilibili_downloader -h", file=sys.stderr)
         return 2
 
-    if os.name == "nt":                          # 高分屏下别让界面糊成一片
+    if IS_LINUX and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        # 纯 SSH / 无头服务器：Tk 连不上显示服务，再往下走只会抛 "no display name"
+        print("[!] 当前没有图形环境（DISPLAY / WAYLAND_DISPLAY 都没有设置）", file=sys.stderr)
+        print("    纯命令行用法：bilibili_downloader <链接> -o <目录>", file=sys.stderr)
+        return 2
+
+    if IS_WIN:                          # 高分屏下别让界面糊成一片
         try:
             import ctypes
 
@@ -3984,13 +4259,13 @@ def run_gui(start_live: bool = False) -> int:
         box.pack(fill="both", expand=True)
         return holder
 
-    body_font = ("Microsoft YaHei UI", -px(14))
-    small_font = ("Microsoft YaHei UI", -px(12))
-    bold_font = ("Microsoft YaHei UI", -px(14), "bold")
-    title_font = ("Microsoft YaHei UI", -px(24), "bold")
-    mono_font = ("Consolas", -px(12))
+    body_font = (GUI_FONT_FAMILY, -px(14))
+    small_font = (GUI_FONT_FAMILY, -px(12))
+    bold_font = (GUI_FONT_FAMILY, -px(14), "bold")
+    title_font = (GUI_FONT_FAMILY, -px(24), "bold")
+    mono_font = (MONO_FONT_FAMILY, -px(12))
 
-    # ---- Win11 风格的小部件：tkinter 没有圆角，这里自己画 ----
+    # ---- 浅色圆角小部件：tkinter 没有圆角，这里自己画（配色沿用 Win11，三平台一致）----
 
     GUI_BG = "#F3F3F3"          # 窗口底色（Win11 浅色模式的"云母"近似色）
     GUI_CARD = "#FFFFFF"        # 卡片
@@ -4175,7 +4450,7 @@ def run_gui(start_live: bool = False) -> int:
                     foreground=GUI_TEXT, borderwidth=0, rowheight=px(32),
                     font=small_font)
     style.configure("Win.Treeview.Heading", background="#FFFFFF", foreground=GUI_SUB,
-                    relief="flat", font=("Microsoft YaHei UI", -px(12), "bold"),
+                    relief="flat", font=(GUI_FONT_FAMILY, -px(12), "bold"),
                     padding=(px(6), px(5)))
     style.map("Win.Treeview", background=[("selected", GUI_SELECT)],
               foreground=[("selected", GUI_TEXT)])
@@ -4229,7 +4504,15 @@ def run_gui(start_live: bool = False) -> int:
                                             auto_left_bar()))
 
     def left_wheel(event):
-        """滚轮落在左栏任意控件上时滚动左栏（高缩放下需要滑动才能看到凭证卡片）。"""
+        """滚轮落在左栏任意控件上时滚动左栏（高缩放下需要滑动才能看到凭证卡片）。
+
+        三套系统的滚轮事件不一样：Windows / macOS 走 <MouseWheel>（delta 有正负、
+        macOS 是触摸板惯性小数值），Linux X11 走 <Button-4>/<Button-5>，没有 delta。
+        所以这里把"向上滚"统一成 +1，事件绑定时各自换算好再进来。
+        """
+        step = getattr(event, "_bd_step", 0)
+        if not step:
+            step = 1 if event.delta > 0 else -1
         widget = root.winfo_containing(event.x_root, event.y_root)
         inside = False
         while widget is not None:
@@ -4239,10 +4522,17 @@ def run_gui(start_live: bool = False) -> int:
             widget = getattr(widget, "master", None)
         if not inside:
             return None
-        left_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        left_canvas.yview_scroll(-step, "units")
         return "break"
 
     root.bind_all("<MouseWheel>", left_wheel, add="+")
+    if IS_LINUX:                     # X11 的滚轮是按键事件，不补上就滚不动
+        def wheel_button(event, step):
+            event._bd_step = step
+            return left_wheel(event)
+
+        root.bind_all("<Button-4>", lambda e: wheel_button(e, 1), add="+")
+        root.bind_all("<Button-5>", lambda e: wheel_button(e, -1), add="+")
     right = tk.Frame(main, bg=GUI_BG)
     right.grid(row=0, column=1, sticky="nsew")
 
@@ -4678,7 +4968,7 @@ def run_gui(start_live: bool = False) -> int:
         btn_row = tk.Frame(left, bg=GUI_BG)
         btn_row.pack(fill="x", pady=(0, px(8)))
         start_btn_live = _RoundedButton(btn_row, "开始录制", kind="accent", width=110, height=36,
-                                        font=("Microsoft YaHei UI", 10, "bold"),
+                                        font=(GUI_FONT_FAMILY, 10, "bold"),
                                         command=lambda: start_record())
         start_btn_live.pack(side="left")
         stop_btn = _RoundedButton(btn_row, "停止", kind="secondary", width=76, height=36,
@@ -4779,7 +5069,7 @@ def run_gui(start_live: bool = False) -> int:
                          f"{state_text}  ·  在线 {room.get('online') or 0}  ·  {room.get('area') or ''}")
             status_var_live.set(f"已读取（{state_text}）")
             if not live_state.get("out_custom"):
-                # 默认落到 桌面\<直播间名称>\，录制时直接建好目录
+                # 默认落到 <桌面>/<直播间名称>/，录制时直接建好目录
                 name = clean_name(str(room.get("title") or f"直播间{room.get('ref_id')}"), 60)
                 folder = Path(default_output()) / (name or f"直播间{room.get('ref_id')}")
                 try:
@@ -4966,7 +5256,7 @@ def run_gui(start_live: bool = False) -> int:
                 try:
                     dest = Path(tempfile.gettempdir()) / "bd_live_sample.flv"
                     live_sample_clip(session, headers, room["ref_id"], current_qn(), dest, 10)
-                    if os.name == "nt":
+                    if IS_WIN:
                         os.startfile(str(dest))
                     elif sys.platform == "darwin":
                         subprocess.Popen(["open", str(dest)])
@@ -5172,7 +5462,7 @@ def run_gui(start_live: bool = False) -> int:
         buttons = tk.Frame(dlg, bg=GUI_BG)
         buttons.pack(fill="x", padx=px(18), pady=(px(8), px(12)))
         merge_btn = _RoundedButton(buttons, "开始合并", kind="accent", width=104, height=34,
-                                   font=("Microsoft YaHei UI", 10, "bold"),
+                                   font=(GUI_FONT_FAMILY, 10, "bold"),
                                    command=lambda: run_merge())
         merge_btn.pack(side="right")
         _RoundedButton(buttons, "关闭", kind="ghost", width=70, height=34,
@@ -5271,7 +5561,7 @@ def run_gui(start_live: bool = False) -> int:
     foot = tk.Frame(bottom, bg=GUI_BG)
     foot.pack(fill="x", pady=(px(8), 0))
     start_btn = _RoundedButton(foot, "开始下载", kind="accent", width=112, height=34,
-                               font=("Microsoft YaHei UI", 10, "bold"), command=lambda: start())
+                               font=(GUI_FONT_FAMILY, 10, "bold"), command=lambda: start())
     start_btn.pack(side="right")
     cancel_btn = _RoundedButton(foot, "取消", kind="secondary", width=76, height=34,
                                 enabled=False, command=lambda: cancel())
@@ -5320,7 +5610,7 @@ def run_gui(start_live: bool = False) -> int:
         target = Path((path or "").strip() or str(default_output())).expanduser()
         try:
             target.mkdir(parents=True, exist_ok=True)
-            if os.name == "nt":
+            if IS_WIN:
                 os.startfile(str(target))
             elif sys.platform == "darwin":
                 subprocess.Popen(["open", str(target)])
@@ -5379,7 +5669,7 @@ def run_gui(start_live: bool = False) -> int:
         sess_entry.focus_set()
 
     def clear_cred() -> None:
-        if os.name == "nt":
+        if IS_WIN:
             try:
                 import winreg
 
@@ -5449,6 +5739,18 @@ def run_gui(start_live: bool = False) -> int:
 
     def install_clicked() -> None:
         global FFMPEG_SOURCE
+        if not IS_WIN:                 # macOS / Linux 交给系统包管理器，别硬塞一份二进制
+            if IS_MAC:
+                hint = "brew install ffmpeg"
+            else:
+                hint = ("sudo apt install ffmpeg        # Debian / Ubuntu\n"
+                        "sudo dnf install ffmpeg        # Fedora")
+            messagebox.showinfo(
+                "安装 ffmpeg",
+                f"当前系统（{PLATFORM_NAME}）请使用包管理器安装：\n\n{hint}\n\n"
+                "装好后重新打开本程序即可识别；已经装过但仍提示找不到时，"
+                "检查 ffmpeg 是否在 PATH 里（终端执行 ffmpeg -version）。")
+            return
         _, size = resolve_ffmpeg_archive()
         shown = human_size(size) if size else f"约 {FFMPEG_FALLBACK_MB} MB"
         # 三态：是=镜像源，否=官方源，取消=不装（auto 会在失败时自动换源，这里先给个倾向）
@@ -5744,7 +6046,7 @@ def run_gui(start_live: bool = False) -> int:
         body.configure(yscrollcommand=bar.set)
         body.grid(row=0, column=0, sticky="nsew")
         bar.grid(row=0, column=1, sticky="ns")
-        body.insert("1.0", GUI_HELP_TEXT)
+        body.insert("1.0", gui_help_text())
         body.configure(state="disabled")
         _RoundedButton(wrap, "关闭", kind="secondary", width=80, height=32,
                        command=win.destroy).pack(side="right", pady=(px(10), 0))
@@ -5864,9 +6166,13 @@ def run_gui(start_live: bool = False) -> int:
     tray = _TrayIcon("B 站视频下载器", tray_events.put)
 
     def hide_to_tray() -> None:
-        # 没有托盘（非 Windows / 托盘起不来）时不能把窗口藏起来，否则就找不回来了
+        # 托盘只有 Windows 有（macOS 的菜单栏图标需要 PyObjC，Linux 要看桌面环境）。
+        # 没有托盘时不能把窗口藏起来，否则用户找不回来——直接走系统的最小化
         if not (tray and tray.available() and tray._thread):
-            root.destroy()
+            try:
+                root.iconify()
+            except tk.TclError:
+                pass
             return
         root.withdraw()
         tray.notify("B 站视频下载器", "已最小化到托盘；右键托盘图标可以显示窗口或退出。")

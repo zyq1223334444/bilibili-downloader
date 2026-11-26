@@ -99,10 +99,11 @@ python -m nuitka --standalone --onefile --msvc=latest ^
     --include-package-data=certifi ^
     --windows-icon-from-ico="%ROOT%\assets\app.ico" ^
     --include-data-files="%ROOT%\assets\app.ico=assets/app.ico" ^
+    --include-data-files="%ROOT%\assets\app.png=assets/app.png" ^
     --windows-console-mode=attach ^
     --company-name="zyq1223334444" ^
     --product-name="Bilibili Downloader" ^
-    --file-version=2.1.8.0 --product-version=2.1.8.0 ^
+    --file-version=2.2.0.0 --product-version=2.2.0.0 ^
     --file-description="Bilibili video / multi-part / collection downloader (DASH + ffmpeg + danmaku)" ^
     "%ROOT%\bilibili_downloader.py"
 if errorlevel 1 goto build_failed
