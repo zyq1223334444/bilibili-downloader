@@ -2614,8 +2614,9 @@ class _LiveDanmakuClient(threading.Thread):
             response += data
             if len(response) > 8192:
                 break
-        if b" 101 " not in response.split(b"\r\n")[0]:
-            raise DownloadError(f"弹幕握手失败：{response.split(b'\r\n')[0][:80]!r}")
+        first_line = response.split(b"\r\n")[0]
+        if b" 101 " not in first_line:
+            raise DownloadError(f"弹幕握手失败：{first_line[:80]!r}")
         return sock
 
     def _session_once(self) -> None:
@@ -3771,7 +3772,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if _focus_existing_window("B 站视频下载器"):
                 print("[提示] 已经有一个界面在运行，已为你切回那个窗口。")
             else:
-                print("[提示] 已经有一个界面在运行；请先关掉它，或从托盘图标唤回。")
+                print("[提示] 已经有一个界面在运行；请先关掉它，或切回已经打开的那个窗口。")
             return 0
         _INSTANCE_HANDLE.append(handle)      # 句柄要活到进程结束，不能提前释放
         return run_gui(start_live=gui_live)
@@ -4388,6 +4389,10 @@ def run_gui(start_live: bool = False) -> int:
                                               anchor="nw", window=self.body)
             self.bind("<Configure>", self._on_resize)
 
+        def need_height(self):
+            """卡片内容真正需要的高度（含上下内边距）。"""
+            return self.body.winfo_reqheight() + self._padding * 2
+
         def fit(self):
             """把画布尺寸收到内容实际需要的大小（tk 画布默认宽度会撑爆布局）。
 
@@ -4409,6 +4414,11 @@ def run_gui(start_live: bool = False) -> int:
             pad = self._padding
             self.itemconfigure(self._window, width=max(1, w - pad * 2),
                                height=max(1, h - pad * 2))
+            # 屏幕矮、字体大时 grid 会把卡片压得比内容还低，正文就被切掉
+            # （凭证卡片的终端窗只剩一条）。这里让卡片跟着内容自己要高。
+            need_h = self.need_height()
+            if need_h > h + 1:
+                self.configure(height=need_h)
 
     root.title("B 站视频下载器")
     apply_window_icon(root)
@@ -4500,8 +4510,23 @@ def run_gui(start_live: bool = False) -> int:
         except tk.TclError:
             pass
 
-    left.bind("<Configure>", lambda event: (left_canvas.configure(scrollregion=left_canvas.bbox("all")),
-                                            auto_left_bar()))
+    def sync_left(_event=None) -> None:
+        """让左栏保持内容要的高度，矮屏幕交给滚动条，不让 grid 把卡片压扁。
+
+        grid 的短板是"空间不够就按权重砍行高"，卡片一被砍，里面的终端窗、输入框
+        就被裁掉半截（高缩放 / 小屏尤其明显）。这里直接把画布窗口撑到内容高度，
+        多出来的部分由滚动条负责。
+        """
+        try:
+            need = left.winfo_reqheight()
+            if left.winfo_height() + 1 < need:
+                left_canvas.itemconfigure(left_window, height=need)
+        except tk.TclError:
+            return
+        left_canvas.configure(scrollregion=left_canvas.bbox("all"))
+        auto_left_bar()
+
+    left.bind("<Configure>", sync_left)
 
     def left_wheel(event):
         """滚轮落在左栏任意控件上时滚动左栏（高缩放下需要滑动才能看到凭证卡片）。
@@ -5546,7 +5571,7 @@ def run_gui(start_live: bool = False) -> int:
     # ---------------- 底部 ----------------
     bottom = tk.Frame(root, bg=GUI_BG)
     bottom.pack(side="bottom", fill="x", padx=px(18), pady=(px(8), px(12)))
-    progress = ttk.Progressbar(bottom, mode="indeterminate",
+    progress = ttk.Progressbar(bottom, mode="determinate", value=0,
                                style="Win.Horizontal.TProgressbar")
     progress.pack(fill="x", pady=(0, px(6)))
 
@@ -6117,6 +6142,7 @@ def run_gui(start_live: bool = False) -> int:
         start_btn.set_enabled(False)
         read_btn.set_enabled(False)
         cancel_btn.set_enabled(True)
+        progress.configure(mode="indeterminate")
         progress.start(12)
         if preview["labels"] and preview["chosen"]:
             status_var.set(f"开始下载：已选 {len(preview['chosen'])}/{len(preview['labels'])} 项")
@@ -6150,6 +6176,7 @@ def run_gui(start_live: bool = False) -> int:
     def finished() -> None:
         state["running"] = False
         progress.stop()
+        progress.configure(mode="determinate", value=0)   # 停下后别留半截蓝块
         start_btn.set_enabled(True)
         read_btn.set_enabled(True)
         cancel_btn.set_enabled(False)
