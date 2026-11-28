@@ -64,6 +64,7 @@ import ssl
 import struct
 import re
 import shutil
+import atexit
 import subprocess
 import sys
 import tempfile
@@ -2966,6 +2967,8 @@ class LiveRecorder:
         self._qn_notice: set[int] = set()      # 同一次降档只提示一次，别每重连一次刷一行
         self._danmaku: _LiveDanmakuClient | None = None
         self._lock = threading.Lock()
+        self._finish_lock = threading.Lock()
+        self._finish_result: dict | None = None
 
     # ---- 状态 ----
 
@@ -2982,7 +2985,7 @@ class LiveRecorder:
 
     def qn_label(self, qn: int | None = None) -> str:
         value = int(self._qn_now if qn is None else qn)
-        return LIVE_QN_DESC.get(value, str(value))
+        return live_qn_label(value)
 
     # ---- 生命周期 ----
 
@@ -3013,7 +3016,15 @@ class LiveRecorder:
         return not self.running
 
     def finish(self) -> dict:
-        """停线程 → 导出弹幕 → 拼段。返回产物信息（失败也返回，由调用方展示）。"""
+        """停线程 → 导出弹幕 → 拼段。可重复调用（第二次直接返回上一次的结果）。"""
+        with self._finish_lock:
+            if self._finish_result is not None:
+                return self._finish_result
+            result = self._finish_once()
+            self._finish_result = result
+            return result
+
+    def _finish_once(self) -> dict:
         self._stop.set()
         if self._thread:
             self._thread.join(20)
@@ -3055,8 +3066,12 @@ class LiveRecorder:
     # ---- 录制 ----
 
     def _run(self) -> None:
+        attempt = 0
         while not self._stop.is_set():
+            attempt += 1
             try:
+                self.log(f"[直播] 第 {attempt} 次取流：请求 {self.qn_label(self._want_qn)}"
+                         f"（qn={self._want_qn}）")
                 play = live_play_info(self.session, self.headers, self.room["ref_id"], self._want_qn)
                 got = int(play["qn"])
                 self._qn_now = got
@@ -3065,19 +3080,25 @@ class LiveRecorder:
                     self.log(f"[直播] 请求 {self.qn_label(self._want_qn)}"
                              f"（{self._want_qn}），服务端给到 {self.qn_label(got)}"
                              f"（{got}），按后者录制")
+                self.log(f"[直播] 拿到 {len(play.get('urls') or [])} 个播放节点，"
+                         f"编码 {str(play.get('codec') or '?').upper()}，"
+                         f"实际画质 {self.qn_label(got)}")
                 self._stream(play)
                 self.failures = 0
             except Aborted:
+                self.log("[直播] 收到停止信号，录制线程退出")
                 break
             except Exception as exc:
                 if self._stop.is_set():
                     break
                 self.failures += 1
-                self.log(f"[直播] 录制中断：{short_error(exc)}，2 秒后重连")
+                self.log(f"[直播] 第 {attempt} 次取流失败（连续第 {self.failures} 次）："
+                         f"{short_error(exc)}；2 秒后重连，已录 "
+                         f"{human_size(self.total_bytes)} / {len(self.segments)} 段")
                 if self._stop.wait(2):
                     break
                 if self.auto_stop_offline and self.failures >= 2 and self._looks_offline():
-                    self.log("[直播] 直播间已下播，自动结束录制")
+                    self.log("[直播] 直播间已下播，自动结束录制并合并分段")
                     break
 
     def _looks_offline(self) -> bool:
@@ -3096,18 +3117,26 @@ class LiveRecorder:
 
     def _stream(self, play: dict) -> None:
         last_error: Exception | None = None
-        for url in play["urls"][:4]:
+        nodes = list(play["urls"][:4])
+        for index, url in enumerate(nodes, 1):
             if self._stop.is_set() or self._switch.is_set():
                 return
             resp = None
             try:
+                host = urllib.parse.urlsplit(url).netloc or "?"
+                self.log(f"[直播] 连接节点 {index}/{len(nodes)}：{host}")
                 resp = self.session.get(url, headers=live_headers(self.headers),
                                         stream=True, timeout=(10, 35))
                 if resp.status_code != 200:
                     raise DownloadError(f"HTTP {resp.status_code}")
+                self.log(f"[直播] 节点 {index} 已连上（HTTP {resp.status_code}，"
+                         f"{host}）")
                 path, writer = self._open_segment()
-                self.log(f"[直播] 录制中：{path.name}（{self.qn_label()} / {play['codec'].upper()}）")
+                self.log(f"[直播] 新分段开始：{path.name}（{self.qn_label()} / "
+                         f"{play['codec'].upper()}）")
                 started = time.monotonic()
+                last_report = started
+                read_bytes = 0
                 cutting = False
                 overshoot = 0
                 try:
@@ -3121,6 +3150,14 @@ class LiveRecorder:
                                 cutting = True
                         leftover = writer.write(chunk, stop_at_boundary=cutting)
                         self.total_bytes += len(chunk) - len(leftover)
+                        read_bytes += len(chunk) - len(leftover)
+                        now = time.monotonic()
+                        if now - last_report >= 30:
+                            speed = read_bytes / max(1e-6, now - started) / 1024
+                            self.log(f"[直播] 进度 {human_size(self.total_bytes)}"
+                                     f"（本段 {human_size(read_bytes)}，{speed:.0f} KB/s，"
+                                     f"{len(self.segments)} 段）")
+                            last_report = now
                         if leftover:
                             # 已经停在完整标签处：这一段到此为止，尾巴跟着重连进下一段
                             break
@@ -3131,6 +3168,15 @@ class LiveRecorder:
                                 break
                 finally:
                     writer.close()
+                    elapsed = time.monotonic() - started
+                    try:
+                        size = path.stat().st_size
+                    except OSError:
+                        size = 0
+                    self.log(f"[直播] 分段收尾：{path.name}  {fmt_duration(elapsed)}  "
+                             f"{human_size(size)}"
+                             f"{'（切画质）' if self._switch.is_set() else ''}"
+                             f"{'（停止）' if self._stop.is_set() else '（断流）'}")
                 if self._switch.is_set():
                     self._switch.clear()
                 return
@@ -3138,7 +3184,8 @@ class LiveRecorder:
                 last_error = exc
                 if self._stop.is_set():
                     return
-                self.log(f"[直播] 这条流断开（{short_error(exc)}），换节点重试")
+                self.log(f"[直播] 节点 {index}/{len(nodes)} 断开：{short_error(exc)}；"
+                         f"换下一个节点（已录 {human_size(self.total_bytes)}）")
             finally:
                 try:
                     if resp is not None:
@@ -3146,6 +3193,7 @@ class LiveRecorder:
                 except Exception:
                     pass
         if last_error is not None:
+            self.log(f"[直播] {len(nodes)} 个节点都连不上，交给上层重连")
             raise last_error
 
     # ---- 结束处理 ----
@@ -3209,34 +3257,59 @@ class LiveRecorder:
             shutil.rmtree(work, ignore_errors=True)
 
     def _merge_segments(self, result: dict) -> list[Path]:
-        """拼段必须核对时长：ffmpeg 碰到坏尾巴会安静截断并返回 0，只看"文件非空"会丢整场。"""
+        """拼段并核对时长：ffmpeg 碰到坏尾巴会安静截断却返回 0，只看"文件非空"会整场丢掉。
+
+        三种拼法都试，谁的成片最长就用谁（断网截断的尾巴各拼法丢的量不一样）。
+        """
         out = self.base.with_name(f"{self.base.name}.mp4")
         expected = self._expected_seconds()
         choices = []
         if len(self.segments) == 1:
             choices.append(("单段封装", self._remux_one))     # 只有一段时没必要转 TS
         choices += [("TS 中转", self._concat_via_ts), ("直接拼接", self._concat)]
-        for label, merge in choices:
+        # 断网/强退时最后半截包必然丢掉，容 10 秒；短视频按一半算，
+        # 但长视频照样能抓出"只拼出前 10 分钟"这种真丢段
+        low = max(expected - 10.0, expected * 0.5)
+        best: tuple[float, Path] | None = None
+        for index, (label, merge) in enumerate(choices):
+            tmp = out.with_name(f"{out.stem}.candidate{index}.mp4")
             try:
-                out.unlink(missing_ok=True)
-                merge(self.segments, out, "拼接直播分段失败")
-                got = probe_timespan_or_none(out) or 0.0
-                if expected >= 5 and not (expected * 0.92 <= got <= expected * 1.1 + 15):
+                tmp.unlink(missing_ok=True)
+                merge(self.segments, tmp, "拼接直播分段失败")
+                got = probe_timespan_or_none(tmp) or 0.0
+                if expected >= 5 and not (low <= got <= expected * 1.1 + 15):
                     raise DownloadError(f"只拼出 {got:.1f} 秒，应为 {expected:.1f} 秒")
-                if expected <= 0:
-                    self.log("[直播] 分段时间没测出来，拼接结果未经核对")
-                if got:
-                    self.log(f"[直播] 已合成 {len(self.segments)} 段，时长 {got / 60:.1f} 分钟")
-                if not self.keep_segments:
-                    for item in self.segments:
-                        item["path"].unlink(missing_ok=True)
-                return [out]
+                self.log(f"[直播] {label}拼出 {got / 60:.1f} 分钟")
+                if best is None or got > best[0]:
+                    if best is not None:
+                        best[1].unlink(missing_ok=True)
+                    best = (got, tmp)
+                else:
+                    tmp.unlink(missing_ok=True)
             except Exception as exc:
+                tmp.unlink(missing_ok=True)
                 self.log(f"[直播] {label}没成（{short_error(exc)}）")
+        if best is None:
+            out.unlink(missing_ok=True)
+            self.log(f"[直播] 分段没能合成一条，{len(self.segments)} 个原始 .flv 分段全部保留")
+            result["error"] = "分段没能合成一条，已保留原始 .flv 分段"
+            return [item["path"] for item in self.segments]
+        got, tmp = best
         out.unlink(missing_ok=True)
-        self.log(f"[直播] 分段没能合成一条，{len(self.segments)} 个原始 .flv 分段全部保留")
-        result["error"] = "分段没能合成一条，已保留原始 .flv 分段"
-        return [item["path"] for item in self.segments]
+        tmp.replace(out)
+        if expected <= 0:
+            self.log("[直播] 分段时间没测出来，拼接结果未经核对")
+        try:
+            size_text = human_size(out.stat().st_size)
+        except OSError:
+            size_text = "?"
+        self.log(f"[直播] 已合成 {len(self.segments)} 段，时长 {got / 60:.1f} 分钟，"
+                 f"文件 {size_text}（{out.name}）")
+        if not self.keep_segments:
+            for item in self.segments:
+                item["path"].unlink(missing_ok=True)
+        return [out]
+
 
 
 class LiveScheduler(threading.Thread):
@@ -3356,6 +3429,756 @@ def merge_subtitle(video: Path, subtitle: Path, mode: str, out: Path | None = No
     finally:
         if temp_dir is not None:
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# ---- 视频合并 / 压缩 / 转码（只在图形界面里用，不进命令行）----
+
+VIDEO_CONTAINERS: dict[str, dict] = {
+    "mp4": {"ext": ".mp4", "label": "MP4（最通用）", "soft_subs": True},
+    "mkv": {"ext": ".mkv", "label": "MKV（能装软字幕 / 多音轨）", "soft_subs": True},
+    "mov": {"ext": ".mov", "label": "MOV（苹果系）", "soft_subs": True},
+    "ts": {"ext": ".ts", "label": "TS（传输流）", "soft_subs": False},
+    "webm": {"ext": ".webm", "label": "WebM（网页）", "soft_subs": False},
+}
+
+VIDEO_CODECS: dict[str, dict] = {
+    "copy": {"label": "不重编码（直接复制，最快）", "enc": None},
+    "h264": {"label": "H.264 / AVC（兼容最好）", "enc": "libx264"},
+    "hevc": {"label": "H.265 / HEVC（同画质更小，慢）", "enc": "libx265"},
+    "av1": {"label": "AV1（最省体积，最慢）", "enc": "libsvtav1"},
+}
+
+
+def container_supports_soft_subs(container: str) -> bool:
+    """这个封装能不能装软字幕。"""
+    return bool(VIDEO_CONTAINERS.get(container, {}).get("soft_subs"))
+
+
+def codec_fits_container(codec: str, container: str) -> bool:
+    """编码和封装配不配（配不上就别让用户白等一场）。"""
+    if container == "webm":
+        return codec in {"copy", "av1"}
+    if container == "mov":
+        return codec in {"copy", "h264", "hevc"}
+    if container == "ts":
+        return codec in {"copy", "h264", "hevc"}
+    return True
+
+
+VIDEO_SUFFIXES = {".mp4", ".mkv", ".flv", ".mov", ".ts", ".webm", ".avi", ".m4v"}
+
+# 直播画质：界面按分辨率说话，底下对到 B 站的 qn（老接口的档位名不再露给用户）
+LIVE_RESOLUTION_CHOICES: list[tuple[str, int]] = [
+    ("360p", 80),
+    ("480p", 150),
+    ("720p", 250),
+    ("1080p", 400),
+    ("4K", 20000),
+    ("8K", 30000),
+    ("原画（最高）", 10000),
+]
+LIVE_RESOLUTION_BY_QN: dict[int, str] = {qn: label for label, qn in LIVE_RESOLUTION_CHOICES}
+LIVE_QUALITY_HEIGHT: dict[str, int] = {"360p": 360, "480p": 480, "720p": 720,
+                                       "1080p": 1080, "4K": 2160, "8K": 4320}
+LIVE_DEFAULT_LABEL = "原画（最高）"
+
+
+def live_qn_label(qn: int | None) -> str:
+    """qn → 分辨率说法（日志和下拉框都用这套）。"""
+    if not qn:
+        return "未知"
+    return LIVE_RESOLUTION_BY_QN.get(int(qn)) or LIVE_QN_DESC.get(int(qn)) or f"qn={qn}"
+
+
+def ffplay_path() -> Path | None:
+    """预览要用 ffplay（和 ffmpeg 同一个目录）。找不到就返回 None。"""
+    if sys.platform == "win32":
+        try:
+            exe = Path(find_ffmpeg()).with_name("ffplay.exe")
+            if exe.is_file():
+                return exe
+        except Exception:
+            pass
+    found = shutil.which("ffplay")
+    return Path(found) if found else None
+
+
+if sys.platform == "win32":
+    import ctypes as _ct
+    from ctypes import wintypes as _wt
+
+    _user32 = _ct.windll.user32
+    _EnumWindows = _user32.EnumWindows
+    _EnumProc = _ct.WINFUNCTYPE(_wt.BOOL, _wt.HWND, _wt.LPARAM)
+    _GetWindowTextW = _user32.GetWindowTextW
+    _GetWindowTextLengthW = _user32.GetWindowTextLengthW
+    _SetParent = _user32.SetParent
+    _GetWindowLongPtrW = _user32.GetWindowLongPtrW
+    _SetWindowLongPtrW = _user32.SetWindowLongPtrW
+    _SetWindowPos = _user32.SetWindowPos
+    _GetAsyncKeyState = _user32.GetAsyncKeyState
+
+    _GWL_STYLE = -16
+    _WS_CHILD = 0x40000000
+    _WS_POPUP = 0x80000000
+    _WS_CAPTION = 0x00C00000
+    _SWP_NOZORDER = 0x0004
+    _SWP_SHOWWINDOW = 0x0040
+
+    def find_window_by_title(title: str) -> int | None:
+        found: list[int] = []
+
+        def callback(hwnd, _lparam):
+            length = _GetWindowTextLengthW(hwnd)
+            if length:
+                buffer = _ct.create_unicode_buffer(length + 1)
+                _GetWindowTextW(hwnd, buffer, length + 1)
+                if buffer.value == title:
+                    found.append(hwnd)
+                    return False
+            return True
+
+        _EnumWindows(_EnumProc(callback), 0)
+        return found[0] if found else None
+
+    def make_click_through(hwnd: int) -> bool:
+        """WS_EX_TRANSPARENT：画面还在，鼠标事件透给下面的 Tk 窗口。"""
+        try:
+            GWL_EXSTYLE = -20
+            WS_EX_TRANSPARENT = 0x00000020
+            style = _ct.c_longlong(_GetWindowLongPtrW(hwnd, GWL_EXSTYLE)).value
+            _SetWindowLongPtrW(hwnd, GWL_EXSTYLE, _ct.c_longlong(style | WS_EX_TRANSPARENT))
+            return True
+        except Exception:
+            return False
+
+    def embed_window(hwnd: int, parent: int, width: int, height: int) -> bool:
+        """把外部窗口塞进 Tk 控件里：去掉边框和弹出样式，改成子窗口。"""
+        try:
+            style = _ct.c_longlong(_GetWindowLongPtrW(hwnd, _GWL_STYLE)).value
+            style = (style & ~_WS_POPUP & ~_WS_CAPTION) | _WS_CHILD
+            _SetWindowLongPtrW(hwnd, _GWL_STYLE, _ct.c_longlong(style))
+            _SetParent(hwnd, parent)
+            _SetWindowPos(hwnd, 0, 0, 0, int(width), int(height),
+                          _SWP_NOZORDER | _SWP_SHOWWINDOW)
+            make_click_through(hwnd)
+            try:
+                _ct.windll.user32.EnableWindow(hwnd, False)  # 禁用输入，鼠标消息交给父窗口
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
+    def window_rect(hwnd: int) -> tuple[int, int, int, int] | None:
+        try:
+            rect = _wt.RECT()
+            if _user32.GetWindowRect(hwnd, _ct.byref(rect)):
+                return (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
+        except Exception:
+            return None
+        return None
+
+    def cursor_pos() -> tuple[int, int]:
+        point = _wt.POINT()
+        _user32.GetCursorPos(_ct.byref(point))
+        return int(point.x), int(point.y)
+
+    def real_window_rect(hwnd: int, width: int = 0, height: int = 0) -> tuple[int, int, int, int] | None:
+        """Tk 的 winfo_id 有时是 1x1 的内层窗口，沿父链往上找真正有尺寸的那个。"""
+        for _ in range(6):
+            if not hwnd:
+                break
+            rect = window_rect(hwnd)
+            if rect and rect[2] > 20 and rect[3] > 20:
+                return rect
+            hwnd = _user32.GetParent(hwnd)
+        return None
+
+    def right_button_down() -> bool:
+        return bool(_GetAsyncKeyState(0x02) & 0x8000)
+
+    def left_button_down() -> bool:
+        return bool(_GetAsyncKeyState(0x01) & 0x8000)
+else:
+    def find_window_by_title(title: str) -> int | None:      # pragma: no cover - 非 Windows
+        return None
+
+    def make_click_through(hwnd: int) -> bool:
+        return False
+
+    def embed_window(hwnd: int, parent: int, width: int, height: int) -> bool:
+        return False
+
+    def window_rect(hwnd: int) -> tuple[int, int, int, int] | None:
+        return None
+
+    def cursor_pos() -> tuple[int, int]:
+        return (0, 0)
+
+    def real_window_rect(hwnd: int, width: int = 0, height: int = 0):
+        return None
+
+    def right_button_down() -> bool:
+        return False
+
+    def left_button_down() -> bool:
+        return False
+
+
+class EmbeddedPlayer:
+    """把 ffplay 的窗口塞进 Tk 控件：真视频、真声音、真直播，不逐帧转图片。
+
+    Windows 之外退化成"单独弹一个 ffplay 窗口"（不嵌），Linux/macOS 仍能预览。
+    """
+
+    def __init__(self, holder, post, log: Callable[[str], None] = lambda _t: None):
+        self.holder = holder
+        self.post = post
+        self.log = log
+        self.proc: subprocess.Popen | None = None
+        self.hwnd: int | None = None
+        self.title = f"bd-live-preview-{int(time.time() * 1000) % 1000000}-{id(self) % 97}"
+        self.url = ""
+        self.size = (640, 360)
+        self.vf_height: int | None = None
+        self.volume = 0
+        self.headers = ""
+        self._stamp = 0
+
+    @property
+    def alive(self) -> bool:
+        return bool(self.proc and self.proc.poll() is None)
+
+    def play(self, url: str, *, width: int, height: int,
+             vf_height: int | None = None, volume: int = 0, headers: str = "") -> bool:
+        self.stop()
+        exe = ffplay_path()
+        if exe is None:
+            self.log("[预览] 找不到 ffplay.exe（它和 ffmpeg 在同一个目录），实时预览不可用")
+            return False
+        self.url, self.size, self.vf_height, self.volume = url, (width, height), vf_height, volume
+        self.headers = headers
+        self._stamp += 1
+        stamp = self._stamp
+        # 注意：ffplay 没有 -nostdin（那是 ffmpeg 的参数），带上它会直接起不来
+        args = [str(exe), "-hide_banner", "-loglevel", "error"]
+        if headers:
+            args += ["-headers", headers]
+        args += ["-window_title", self.title, "-noborder",
+                "-x", str(int(width)), "-y", str(int(height)),
+                "-volume", str(int(volume)),
+                "-fflags", "nobuffer", "-flags", "low_delay"]
+        if vf_height:
+            args += ["-vf", f"scale=-2:{int(vf_height)}"]
+        args += ["-i", url]
+        env = os.environ.copy()
+        # SDL：未聚焦时点击直接透给下层窗口，Tk 才能收到拖动/右键
+        env["SDL_MOUSE_FOCUS_CLICKTHROUGH"] = "1"
+        env["SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH"] = "1"
+        try:
+            self.proc = subprocess.Popen(args, stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                         env=env, **child_proc_kwargs())
+            _track_player(self.proc)
+        except Exception as exc:
+            self.log(f"[预览] 起播失败：{short_error(exc)}")
+            return False
+
+        def waiter() -> None:
+            hwnd = None
+            for _ in range(60):
+                if self._stamp != stamp:
+                    return
+                if self.proc is None or self.proc.poll() is not None:
+                    break
+                hwnd = find_window_by_title(self.title)
+                if hwnd:
+                    break
+                time.sleep(0.1)
+            if hwnd is None:
+                self.post(lambda: self.log("[预览] 播放窗口没等出来（可能 ffplay 起不来）"))
+                return
+            self.post(lambda: self._attach(hwnd, stamp))
+
+        threading.Thread(target=waiter, name="live-preview-attach", daemon=True).start()
+        return True
+
+    def _attach(self, hwnd: int, stamp: int) -> None:
+        if stamp != self._stamp:
+            return
+        try:
+            parent = self.holder.winfo_id()
+        except Exception:
+            return
+        width, height = self.size
+        if not embed_window(hwnd, parent, width, height):
+            self.log("[预览] 这个平台不支持把播放窗口嵌进来，已改为独立窗口")
+        self.hwnd = hwnd
+        self.log(f"[预览] 已接入实时画面（{width}×{height}）")
+
+    def resize(self, width: int, height: int) -> None:
+        self.size = (int(width), int(height))
+        if self.hwnd:
+            _SetWindowPosSafe(self.hwnd, int(width), int(height))
+
+    def stop(self) -> None:
+        self._stamp += 1
+        proc, hwnd = self.proc, self.hwnd
+        self.proc, self.hwnd = None, None
+        if hwnd and sys.platform == "win32":
+            try:
+                _ct.windll.user32.ShowWindow(hwnd, 0)
+            except Exception:
+                pass
+        if proc is not None:
+            _untrack_player(proc)
+            force_kill_process(proc)
+
+
+_PLAYER_LOCK = threading.Lock()
+_PLAYER_PROCS: "list[subprocess.Popen]" = []
+
+
+def _track_player(proc) -> None:
+    with _PLAYER_LOCK:
+        _PLAYER_PROCS.append(proc)
+
+
+def _untrack_player(proc) -> None:
+    with _PLAYER_LOCK:
+        try:
+            _PLAYER_PROCS.remove(proc)
+        except ValueError:
+            pass
+
+
+def force_kill_process(proc, timeout: float = 3.0) -> None:
+    """ffplay 常常不认普通关闭，直接 TerminateProcess，再补一刀 taskkill /F /PID /T。"""
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=timeout)
+        return
+    except Exception:
+        pass
+    try:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        pass
+
+
+def kill_all_players() -> None:
+    with _PLAYER_LOCK:
+        procs = list(_PLAYER_PROCS)
+        _PLAYER_PROCS.clear()
+    for proc in procs:
+        force_kill_process(proc)
+
+
+atexit.register(kill_all_players)
+
+
+def header_blob(headers: dict) -> str:
+    """requests 的 headers → ffmpeg -headers 需要的 "K: V\r\n" 文本。"""
+    return "".join(f"{key}: {value}\r\n" for key, value in (headers or {}).items())
+
+
+def _SetWindowPosSafe(hwnd: int, width: int, height: int) -> None:
+    if sys.platform == "win32":
+        try:
+            _SetWindowPos(hwnd, 0, 0, 0, int(width), int(height),
+                          _SWP_NOZORDER | _SWP_SHOWWINDOW)
+        except Exception:
+            pass
+
+
+
+
+
+def fmt_duration(seconds: float | None) -> str:
+    """秒数变成 1:23:45 / 3:21。"""
+    if not seconds or seconds <= 0:
+        return "未知时长"
+    total = int(round(seconds))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def plan_subtitles(sources: Sequence[Path], container: str, work_dir: Path,
+                   out_path: Path, parent=None) -> tuple[str, list[Path]]:
+    """开工前先定字幕怎么办。
+
+    返回 ("none", []) / ("soft", [srt...]) / ("hard", [srt...])。
+    目标封装装不了软字幕时当面问用户：烧成硬字幕，还是单独抽出字幕文件。
+    """
+    tracks: list[Path] = []
+    for src in sources:
+        try:
+            if probe_video_info(src)["subs"]:
+                tracks = extract_subtitle_tracks(src, work_dir)
+                if tracks:
+                    break
+        except Exception:
+            continue
+    if not tracks:
+        return "none", []
+    if container_supports_soft_subs(container):
+        return "soft", tracks
+
+    from tkinter import messagebox
+    burn = messagebox.askyesno(
+        "软字幕怎么处理",
+        "目标格式不支持软字幕，是否将软字幕渲染为硬字幕保存？\n\n"
+        "提醒：渲染为硬字幕会直接烧进画面，保存后不可去除；而且要整条视频重新编码，速度慢很多。\n\n"
+        "选「否」：把字幕单独提取成 srt 文件保存，视频里不带字幕。",
+        parent=parent, icon="warning")
+    if burn:
+        return "hard", tracks
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    saved: list[Path] = []
+    for index, track in enumerate(tracks, 1):
+        dest = out_path.with_name(f"{out_path.stem}.sub{index}.srt")
+        shutil.copyfile(track, dest)
+        saved.append(dest)
+    messagebox.showinfo(
+        "字幕已单独保存",
+        "目标格式不支持软字幕，已把字幕单独提取出来：\n\n" + "\n".join(str(item) for item in saved),
+        parent=parent)
+    return "none", saved
+
+
+def probe_video_info(path: Path) -> dict:
+    """一次 ffprobe 拿全：时长 / 分辨率 / 帧率 / 编码 / 码率 / 字幕轨。"""
+    info = {"duration": 0.0, "width": 0, "height": 0, "fps": 0.0,
+            "vcodec": "", "acodec": "", "bitrate": 0, "subs": [], "audio": False}
+    try:
+        probe = Path(find_ffmpeg()).with_name("ffprobe.exe" if IS_WIN else "ffprobe")
+        if not probe.is_file():
+            return info
+        proc = subprocess.run(
+            [str(probe), "-v", "error", "-show_format", "-show_streams", "-of", "json", str(path)],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=120,
+            **child_proc_kwargs(),
+        )
+        data = json.loads(proc.stdout or "{}")
+    except Exception:
+        return info
+    fmt = data.get("format") or {}
+    try:
+        info["duration"] = float(fmt.get("duration") or 0.0)
+        info["bitrate"] = int(float(fmt.get("bit_rate") or 0.0))
+    except ValueError:
+        pass
+    for stream in data.get("streams") or []:
+        kind = stream.get("codec_type")
+        if kind == "video" and not info["vcodec"]:
+            info["vcodec"] = str(stream.get("codec_name") or "")
+            info["width"] = int(stream.get("width") or 0)
+            info["height"] = int(stream.get("height") or 0)
+            try:
+                info["fps"] = float(stream.get("avg_frame_rate", "0/0").split("/")[0]) / max(
+                    1.0, float(stream.get("avg_frame_rate", "0/1").split("/")[-1]))
+            except Exception:
+                info["fps"] = 0.0
+        elif kind == "audio":
+            info["audio"] = True
+            if not info["acodec"]:
+                info["acodec"] = str(stream.get("codec_name") or "")
+        elif kind == "subtitle":
+            info["subs"].append({"index": int(stream.get("index") or 0),
+                                 "codec": str(stream.get("codec_name") or ""),
+                                 "title": str((stream.get("tags") or {}).get("title") or "")})
+    return info
+
+
+def order_files_by_name(files: Sequence[Path]) -> list[Path]:
+    """按文件名排序（不区分大小写，纯字典序）。"""
+    return sorted(files, key=lambda item: (item.name.casefold(), item.name))
+
+
+def order_files_by_number(files: Sequence[Path]) -> list[Path]:
+    """序号排序：文件名里任意位置出现的连续数字当作序号，逐个比较后递增。
+
+    例如 `..._0049.flv` → (49)、`ep12 part 3.mp4` → (12, 3)；没有数字的文件排最后。
+    """
+    def key(item: Path):
+        numbers = re.findall(r"\d+", item.name)
+        if numbers:
+            return (0, tuple(int(value) for value in numbers), item.name.casefold())
+        return (1, (), item.name.casefold())
+    return sorted(files, key=key)
+
+
+def extract_subtitle_tracks(src: Path, work: Path, limit: int | None = None) -> list[Path]:
+    """把源视频里的软字幕逐条导出成 srt（时间轴原样保留）。"""
+    subs = probe_video_info(src)["subs"]
+    if limit is not None:
+        subs = subs[:limit]
+    work.mkdir(parents=True, exist_ok=True)
+    out: list[Path] = []
+    for order, item in enumerate(subs):
+        track = work / f"sub_{order}.srt"
+        try:
+            run_ffmpeg(["-i", str(src), "-map", f"0:s:{order}",
+                        "-c:s", "srt", str(track)], "导出字幕失败")
+            if track.exists() and track.stat().st_size > 0:
+                out.append(track)
+        except Exception:
+            continue
+    return out
+
+
+def run_ffmpeg_progress(args: list, total_seconds: float,
+                        on_percent: Callable[[float], None],
+                        err_msg: str, *, cwd: Path | None = None) -> None:
+    """跑 ffmpeg 并把进度百分比（0~100）回调出去；失败抛 DownloadError。"""
+    cmd = [find_ffmpeg(), "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+           "-progress", "pipe:1", *args]
+    errors: list[str] = []
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace",
+        cwd=str(cwd) if cwd else None, **child_proc_kwargs(),
+    )
+    try:
+        for line in proc.stdout or []:
+            line = line.strip()
+            if line.startswith("out_time_ms="):
+                try:
+                    done = int(line.split("=", 1)[1]) / 1_000_000
+                except ValueError:
+                    continue
+                if total_seconds > 0:
+                    on_percent(min(100.0, max(0.0, done / total_seconds * 100)))
+            elif line.startswith("out_time=") and total_seconds <= 0:
+                continue
+            elif line and not line.startswith(("frame=", "fps=", "bitrate=", "total_size=",
+                                               "out_time_us=", "out_time_ms=", "out_time=",
+                                               "dup_frames=", "drop_frames=", "speed=",
+                                               "progress=")):
+                errors.append(line)
+        proc.wait()
+    finally:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+    if proc.returncode != 0:
+        raise DownloadError(f"{err_msg}：{(chr(10).join(errors) or '').strip()[:800]}")
+
+
+def _video_encode_args(codec: str, *, height: int | None, rate_mode: str, crf: int,
+                       vbitrate: int | None, fps: float | None,
+                       burn_files: Sequence[str]) -> list:
+    """拼视频编码参数（过滤器里的字幕文件用相对名，调用方负责把 cwd 切到字幕目录）。"""
+    args: list = []
+    enc = VIDEO_CODECS.get(codec, {}).get("enc")
+    filters = []
+    if height and height > 0:
+        filters.append(f"scale=-2:{int(height)}")
+    for name in burn_files:
+        filters.append(f"subtitles={name}")
+    if filters:
+        args += ["-vf", ",".join(filters)]
+    if enc:
+        args += ["-c:v", enc]
+        if codec == "h264":
+            args += ["-preset", "veryfast"]
+        elif codec == "hevc":
+            args += ["-preset", "fast", "-x265-params", "log-level=error"]
+        elif codec == "av1":
+            args += ["-preset", "8"]
+        if rate_mode == "bitrate" and vbitrate:
+            args += ["-b:v", f"{int(vbitrate)}k"]
+        elif rate_mode == "crf":
+            args += ["-crf", str(int(crf))]
+    else:
+        args += ["-c:v", "copy"]
+    if fps and fps > 0:
+        args += ["-r", f"{fps:g}"]
+    return args
+
+
+def _audio_encode_args(mode: str, bitrate: int, container: str) -> list:
+    if mode == "none":
+        return ["-an"]
+    if mode == "copy":
+        return ["-c:a", "copy"]
+    if container == "webm":
+        return ["-c:a", "libopus", "-b:a", f"{int(bitrate)}k"]
+    return ["-c:a", "aac", "-b:a", f"{int(bitrate)}k"]
+
+
+def _mux_flags(container: str) -> list:
+    if container in {"mp4", "mov"}:
+        return ["-movflags", "+faststart"]
+    return []
+
+
+def mux_soft_subtitles(video: Path, out: Path, subs: Sequence[Path], container: str) -> None:
+    """把若干 srt 作为软字幕封进目标文件（mp4/mov 转 mov_text，mkv 保持 srt）。"""
+    args = ["-i", str(video)]
+    for sub in subs:
+        args += ["-i", str(sub)]
+    args += ["-map", "0"]
+    for index in range(1, len(subs) + 1):
+        args += ["-map", f"{index}:s"]
+    args += ["-c", "copy", "-c:s", "mov_text" if container in {"mp4", "mov"} else "srt"]
+    args += _mux_flags(container)
+    tmp = out.with_name(out.stem + ".subtmp" + out.suffix)
+    try:
+        run_ffmpeg([*args, str(tmp)], "封装软字幕失败")
+        if not tmp.exists() or tmp.stat().st_size == 0:
+            raise DownloadError("封装软字幕失败：输出为空")
+        tmp.replace(out)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def merge_videos(files: Sequence[Path], out: Path, *, container: str, video_codec: str,
+                 audio_codec: str = "copy", audio_bitrate: int = 192,
+                 height: int | None = None, rate_mode: str = "crf", crf: int = 23,
+                 vbitrate: int | None = None, fps: float | None = None,
+                 soft_subs: Sequence[Path] = (), burn_subs: Sequence[Path] = (),
+                 total_seconds: float = 0.0, on_percent: Callable[[float], None] = lambda _p: None,
+                 log: Callable[[str], None] = emit) -> Path:
+    """把多个视频按给定顺序拼成一个（默认不重编码；选编码就整条重编码）。
+
+    soft_subs：封成软字幕（目标封装支持时）；burn_subs：烧进画面（必须重编码）。
+    """
+    if not files:
+        raise DownloadError("没有要合并的视频")
+    for item in files:
+        if not item.is_file():
+            raise DownloadError(f"视频不存在：{item}")
+    if not codec_fits_container(video_codec, container):
+        raise DownloadError("这个编码放进这个封装播不了，换一个组合")
+
+    work = out.parent / f".bd_merge_{out.stem}"
+    work.mkdir(parents=True, exist_ok=True)
+    combined = work / "combined.ts"
+    try:
+        parts = []
+        for index, item in enumerate(files, 1):
+            part = work / f"{index:05d}.ts"
+            log(f"[合并] 读取第 {index}/{len(files)} 段：{item.name}")
+            run_ffmpeg(["-fflags", "+discardcorrupt", "-err_detect", "ignore_err",
+                        "-i", str(item), "-c", "copy", "-f", "mpegts", str(part)],
+                       f"第 {index} 段转换失败")
+            if part.exists() and part.stat().st_size > 0:
+                parts.append(part)
+        if not parts:
+            raise DownloadError("所有分段都读不出来")
+        list_file = work / "concat.txt"
+        list_file.write_text("\n".join(f"file '{part.as_posix()}'" for part in parts) + "\n",
+                             encoding="utf-8")
+        run_ffmpeg(["-f", "concat", "-safe", "0", "-i", str(list_file),
+                    "-c", "copy", "-f", "mpegts", str(combined)], "拼接分段失败")
+        if not combined.exists() or combined.stat().st_size == 0:
+            raise DownloadError("拼接分段失败：输出为空")
+
+        # 烧字幕要先把字幕抽成 srt，再把 ffmpeg 的 cwd 切到那个目录（过滤器的路径转义太脆）
+        burn_names: list[str] = []
+        burn_dir: Path | None = None
+        if burn_subs:
+            burn_dir = work / "subs"
+            burn_dir.mkdir(exist_ok=True)
+            for index, sub in enumerate(burn_subs, 1):
+                name = f"burn{index}.srt"
+                shutil.copyfile(sub, burn_dir / name)
+                burn_names.append(name)
+            if video_codec == "copy":
+                log("[合并] 要烧字幕就得重编码，已按 H.264 处理")
+                video_codec = "h264"
+
+        args: list = ["-i", str(combined)]
+        args += _video_encode_args(video_codec, height=height, rate_mode=rate_mode,
+                                   crf=crf, vbitrate=vbitrate, fps=fps,
+                                   burn_files=burn_names)
+        args += _audio_encode_args(audio_codec, audio_bitrate, container)
+        args += _mux_flags(container)
+        args += [str(out)]
+        log("[合并] 正在写出最终文件…")
+        run_ffmpeg_progress(args, total_seconds, on_percent, "写出最终文件失败",
+                            cwd=burn_dir)
+
+        if soft_subs and container_supports_soft_subs(container) and not burn_subs:
+            mux_soft_subtitles(out, out, soft_subs, container)
+        if not out.exists() or out.stat().st_size == 0:
+            raise DownloadError("合并失败：输出为空")
+        return out
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def transcode_video(src: Path, out: Path, *, container: str, video_codec: str,
+                    height: int | None = None, rate_mode: str = "crf", crf: int = 23,
+                    vbitrate: int | None = None, fps: float | None = None,
+                    audio_mode: str = "aac", audio_bitrate: int = 192,
+                    soft_subs: Sequence[Path] = (), burn_subs: Sequence[Path] = (),
+                    total_seconds: float = 0.0,
+                    on_percent: Callable[[float], None] = lambda _p: None,
+                    log: Callable[[str], None] = emit) -> Path:
+    """压缩 / 转码单个视频。copy 视频流时不允许改分辨率或烧字幕（会自动改成重编码）。"""
+    if not src.is_file():
+        raise DownloadError(f"视频不存在：{src}")
+    if not codec_fits_container(video_codec, container):
+        raise DownloadError("这个编码放进这个封装播不了，换一个组合")
+    if (height or burn_subs) and video_codec == "copy":
+        log("[压缩] 改了分辨率或要烧字幕，视频流必须重编码，已按 H.264 处理")
+        video_codec = "h264"
+
+    work = out.parent / f".bd_trans_{out.stem}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        burn_names: list[str] = []
+        burn_dir: Path | None = None
+        if burn_subs:
+            burn_dir = work / "subs"
+            burn_dir.mkdir(exist_ok=True)
+            for index, sub in enumerate(burn_subs, 1):
+                name = f"burn{index}.srt"
+                shutil.copyfile(sub, burn_dir / name)
+                burn_names.append(name)
+
+        args: list = ["-i", str(src)]
+        if video_codec != "copy":
+            args += _video_encode_args(video_codec, height=height, rate_mode=rate_mode,
+                                       crf=crf, vbitrate=vbitrate, fps=fps,
+                                       burn_files=burn_names)
+        elif burn_names:
+            args += _video_encode_args("h264", height=height, rate_mode=rate_mode,
+                                       crf=crf, vbitrate=vbitrate, fps=fps,
+                                       burn_files=burn_names)
+        else:
+            args += ["-c:v", "copy"]
+        args += _audio_encode_args(audio_mode, audio_bitrate, container)
+        args += _mux_flags(container)
+        args += [str(out)]
+        log("[压缩] 正在编码…（长视频慢慢等，进度条会动）")
+        run_ffmpeg_progress(args, total_seconds, on_percent, "转码失败", cwd=burn_dir)
+
+        if soft_subs and container_supports_soft_subs(container) and not burn_subs:
+            mux_soft_subtitles(out, out, soft_subs, container)
+        if not out.exists() or out.stat().st_size == 0:
+            raise DownloadError("转码失败：输出为空")
+        return out
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 # ---- 系统托盘（仅 Windows；零依赖，用 ctypes 直接调 Shell_NotifyIcon）----
@@ -5044,7 +5867,8 @@ def run_gui(start_live: bool = False) -> int:
     live_cfg = load_live_config()
     start_live_only = bool(start_live)
     live_state: dict = {"win": None, "rec": None, "room": None, "session": None,
-                        "headers": None, "preview_busy": False, "preview_auto": False, "auto_start": None}
+                        "headers": None, "preview_busy": False, "preview_auto": False, "auto_start": None,
+            "stop_requested": {"value": False}}
 
     def live_http() -> tuple[requests.Session, dict]:
         if live_state["session"] is None:
@@ -5080,6 +5904,7 @@ def run_gui(start_live: bool = False) -> int:
                      f"+{max(px(6), (screen_h - live_h) // 2 - px(28))}")
         win.minsize(min(px(880), screen_w - px(24)), min(px(620), screen_h - px(60)))
 
+        stop_requested = live_state["stop_requested"]
         quality = {"map": {}, "choices": []}
         qn_var = tk.StringVar()
         seg_var = tk.StringVar(value=str(live_cfg.get("segment_minutes") or LIVE_SEGMENT_MINUTES))
@@ -5119,30 +5944,30 @@ def run_gui(start_live: bool = False) -> int:
         def current_qn() -> int:
             return int(quality["map"].get(qn_var.get(), LIVE_DEFAULT_QN))
 
-        def set_quality_choices(choices: list[tuple[int, str]], granted: int = 0) -> None:
-            """填画质下拉框。默认选"服务端这次真给到的那一档"，也就是最高可用画质。"""
-            quality["map"] = {f"{desc}（{qn}）": qn for qn, desc in choices}
-            quality["choices"] = list(choices)
+        def set_quality_choices(choices=None, granted: int = 0) -> None:
+            """画质下拉框按分辨率说话；默认沿用上次选的，没有就挑最高。"""
+            quality["map"] = {label: qn for label, qn in LIVE_RESOLUTION_CHOICES}
+            quality["choices"] = list(LIVE_RESOLUTION_CHOICES)
             values = list(quality["map"].keys())
             qn_combo.configure(values=values)
             label = None
-            if granted:
+            want = int(live_cfg.get("qn") or 0)
+            if want:
+                label = next((key for key, value in quality["map"].items()
+                              if value == want), None)
+            if label is None and granted:
                 label = next((key for key, value in quality["map"].items()
                               if value == int(granted)), None)
             if label is None:
-                want = int(live_cfg.get("qn") or LIVE_DEFAULT_QN)
-                label = next((key for key, value in quality["map"].items() if value == want), None)
-            if label is None and values:
-                label = values[0]
-            if label:
-                qn_var.set(label)
+                label = LIVE_DEFAULT_LABEL if LIVE_DEFAULT_LABEL in quality["map"] else values[0]
+            qn_var.set(label)
 
         # ---- 顶部 ----
         head = tk.Frame(win, bg=GUI_BG)
         head.pack(fill="x", padx=px(16), pady=(px(10), px(6)))
         tk.Label(head, text="录制直播", font=title_font, bg=GUI_BG,
                  fg=GUI_TEXT).pack(side="left")
-        tk.Label(head, text="默认原画 · 中途可切画质 · 弹幕单独保存 · 预约开播自动录",
+        tk.Label(head, text="画质按分辨率选（360p~8K）· 实时预览 · 弹幕单独保存 · 预约开播自动录",
                  font=small_font, bg=GUI_BG, fg=GUI_SUB).pack(side="left", padx=px(12))
 
         body = tk.Frame(win, bg=GUI_BG)
@@ -5178,7 +6003,8 @@ def run_gui(start_live: bool = False) -> int:
         row1.pack(fill="x")
         tk.Label(row1, text="画质", font=small_font, bg=GUI_CARD, fg=GUI_SUB).pack(side="left")
         qn_combo = ttk.Combobox(row1, textvariable=qn_var, state="readonly",
-                                values=["原画（10000）"], width=14)
+                                values=[label for label, _qn in LIVE_RESOLUTION_CHOICES],
+                                width=14)
         qn_combo.pack(side="left", padx=(px(6), px(14)))
         qn_combo.bind("<<ComboboxSelected>>", lambda _e: on_quality_change())
         tk.Label(row1, text="分段", font=small_font, bg=GUI_CARD, fg=GUI_SUB).pack(side="left")
@@ -5218,24 +6044,26 @@ def run_gui(start_live: bool = False) -> int:
         _RoundedButton(btn_row, "打开目录", kind="ghost", width=88, height=36,
                        command=lambda: open_folder(out_var_live.get())).pack(side="left")
 
-        # ---- 预览 ----
-        prev_panel = make_panel(right, "预览")
+        # ---- 预览（实时画面：ffplay 直接嵌进来，本地压到 480p） ----
+        prev_panel = make_panel(right, "预览（实时 · 本地压到 480p）")
         prev_row = tk.Frame(prev_panel, bg=GUI_CARD)
         prev_row.pack(fill="both", expand=True)
-        holder = tk.Frame(prev_row, bg="#101418", width=px(236), height=px(132))
+        holder = tk.Frame(prev_row, bg="#101418", width=px(236), height=px(133))
         holder.pack(side="left")
         holder.pack_propagate(False)
-        preview_label = tk.Label(holder, text="暂无预览", font=small_font,
-                                 bg="#101418", fg="#8A8A8A")
-        preview_label.pack(fill="both", expand=True)
+        preview_hint = tk.Label(holder, text="暂无预览", font=small_font,
+                                bg="#101418", fg="#8A8A8A")
+        preview_hint.pack(fill="both", expand=True)
         side = tk.Frame(prev_row, bg=GUI_CARD)
         side.pack(side="left", fill="both", expand=True, padx=(px(10), 0))
         tk.Label(side, textvariable=status_var_live, font=small_font, bg=GUI_CARD,
-                 fg=GUI_TEXT, justify="left", anchor="w", wraplength=px(108)).pack(fill="x")
-        _RoundedButton(side, "刷新预览", kind="secondary", width=74, height=24,
-                       command=lambda: refresh_preview()).pack(anchor="w", pady=(px(8), px(4)))
-        _RoundedButton(side, "试看 10 秒", kind="ghost", width=74, height=24,
-                       command=lambda: sample_clip()).pack(anchor="w")
+                 fg=GUI_TEXT, justify="left", anchor="w", wraplength=px(104)).pack(fill="x")
+        zoom_btn = _RoundedButton(side, "放大预览", kind="secondary", width=80, height=26,
+                                  command=lambda: open_big_preview())
+        zoom_btn.pack(anchor="w", pady=(px(8), 0))
+        tk.Label(side, text="右键菜单里可以改预览 / 录制分辨率", font=small_font,
+                 bg=GUI_CARD, fg=GUI_SUB, wraplength=px(104), justify="left",
+                 anchor="w").pack(fill="x", pady=(px(6), 0))
 
         # ---- 预约任务 ----
         task_panel = make_panel(right, "预约直播（开播自动录）")
@@ -5293,6 +6121,7 @@ def run_gui(start_live: bool = False) -> int:
         def on_quality_change() -> None:
             rec = live_state.get("rec")
             qn = current_qn()
+            append_live_log(f"[直播] 画质选为 {qn_var.get()}（qn={qn}）")
             if rec and rec.running:
                 rec.switch_quality(qn)
             live_save(qn=qn)
@@ -5305,8 +6134,8 @@ def run_gui(start_live: bool = False) -> int:
                 got, want = int(play.get("qn") or 0), int(play.get("want_qn") or 0)
                 if got and want and got < want:
                     append_live_log(
-                        f"[直播] 请求 {want}（{LIVE_QN_DESC.get(want, want)}），"
-                        f"服务端只给到 {got}（{LIVE_QN_DESC.get(got, got)}）；"
+                        f"[直播] 请求 {live_qn_label(want)}（qn={want}），"
+                        f"服务端只给到 {live_qn_label(got)}（qn={got}）；"
                         f"没登录 SESSDATA 或账号权限不够时会被降档")
             else:
                 set_quality_choices(sorted(((qn, LIVE_QN_DESC.get(qn, str(qn)))
@@ -5315,6 +6144,17 @@ def run_gui(start_live: bool = False) -> int:
             info_var.set(f"{room.get('uname') or ''}  ·  {room.get('title') or ''}\n"
                          f"{state_text}  ·  在线 {room.get('online') or 0}  ·  {room.get('area') or ''}")
             status_var_live.set(f"已读取（{state_text}）")
+            append_live_log(f"[房间] {room.get('uname') or '?'} / 房间 {room.get('room_id')}："
+                            f"{room.get('title') or '（无标题）'}")
+            append_live_log(f"[房间] 状态 {state_text}，在线 {room.get('online') or 0}，"
+                            f"分区 {room.get('area') or '未知'}")
+            if play:
+                accept = play.get("accept_qn") or []
+                if accept:
+                    append_live_log("[房间] 服务端可用画质：" +
+                                    " / ".join(live_qn_label(int(qn)) for qn in accept))
+                append_live_log(f"[房间] 本次拿到的直播流：{live_qn_label(int(play.get('qn') or 0))}"
+                                f"，编码 {str(play.get('codec') or '?').upper()}")
             if not live_state.get("out_custom"):
                 # 默认落到 <桌面>/<直播间名称>/，录制时直接建好目录
                 name = clean_name(str(room.get("title") or f"直播间{room.get('ref_id')}"), 60)
@@ -5325,7 +6165,9 @@ def run_gui(start_live: bool = False) -> int:
                     folder = Path(default_output())
                 out_var_live.set(str(folder))
             if room["live_status"] == 1:
-                refresh_preview(auto=True)
+                start_preview()
+            else:
+                preview_hint.configure(text="未开播，没有预览")
 
         def fail_room(exc: Exception) -> None:
             read_btn.set_enabled(True)
@@ -5399,16 +6241,39 @@ def run_gui(start_live: bool = False) -> int:
                 return
             live_state["rec"] = recorder
             recorder.start()
+            stop_requested["value"] = False
+            threading.Thread(target=watch_self_end, args=(recorder,),
+                             name="live-self-end", daemon=True).start()
             start_btn_live.set_enabled(False)
             stop_btn.set_enabled(True)
-            append_live_log(f"[直播] 开始录制：{room.get('title') or room.get('ref_id')}")
+            stop_preview("录制中，预览已暂停（省带宽，避免和录制抢流）")
+            append_live_log(
+                f"[直播] 开始录制：{room.get('title') or room.get('ref_id')}  "
+                f"画质 {qn_var.get()}  分段 {minutes} 分钟  目录 {dest_dir}")
+            append_live_log(f"[直播] 弹幕：精简 {'开' if light_var.get() else '关'}"
+                            f" / 全部 {'开' if full_var.get() else '关'}"
+                            f" / 保留分段 {'开' if keep_var.get() else '关'}")
             live_save(last_link=room_var.get().strip(), qn=current_qn(),
                       segment_minutes=minutes, output=str(out_var_live.get()),
                       danmaku_light=light_var.get(), danmaku_full=full_var.get(),
                       keep_segments=keep_var.get())
             # 录制期间不取预览（见 refresh_preview）：省带宽，也不闪控制台
 
-        def after_stop(result: dict) -> None:
+        def watch_self_end(recorder: "LiveRecorder") -> None:
+            """录制线程自己停了（断网、下播、重连失败）也要收尾：合并分段、导出弹幕。"""
+            while recorder.running:
+                time.sleep(2)
+            if stop_requested["value"] or live_state.get("rec") is not recorder:
+                return                        # 用户点了停止，收尾由 stop_record 那条路负责
+            try:
+                result = recorder.finish()
+            except Exception as exc:
+                text = f"[直播] 中断后收尾失败：{short_error(exc)}\n（分段保留在原处，可用「合并视频」手动拼）"
+                ui_jobs.put(lambda value=text: append_live_log(value))
+                return
+            ui_jobs.put(lambda: after_stop(result, "[直播] 录制意外中断，已自动收尾合并\n"))
+
+        def after_stop(result: dict, note: str = "") -> None:
             live_state["rec"] = None
             start_btn_live.set_enabled(True)
             stop_btn.set_enabled(False)
@@ -5421,11 +6286,15 @@ def run_gui(start_live: bool = False) -> int:
             if result.get("error"):
                 lines.append(result["error"])
             body = "\n".join(lines) if lines else "没有产物（可能录得太短）"
-            append_live_log("[直播] 录制结束\n" + body)
+            append_live_log((note or "[直播] 录制结束\n") + body)
+            append_live_log(f"[直播] 本次录制时长 {fmt_duration(result.get('duration'))}，"
+                            f"写入 {human_size(int(result.get('bytes') or 0))}，"
+                            f"分段 {len(result.get('segments') or [])} 个")
             messagebox.showinfo("录制结束", "已保存：\n" + body, parent=win)
             try:
+
                 if win.winfo_exists():
-                    win.after(600, lambda: refresh_preview(auto=True))   # 停录后恢复定时预览
+                    win.after(600, lambda: start_preview())   # 停录后恢复实时预览
             except tk.TclError:
                 pass
 
@@ -5433,6 +6302,7 @@ def run_gui(start_live: bool = False) -> int:
             rec = live_state.get("rec")
             if not rec or not rec.running:
                 return
+            stop_requested["value"] = True
             stop_btn.set_enabled(False)
             status_var_live.set("正在收尾：停弹幕、拼分段…")
 
@@ -5442,91 +6312,361 @@ def run_gui(start_live: bool = False) -> int:
 
             threading.Thread(target=worker, name="live-finish", daemon=True).start()
 
-        def apply_preview(path: Path) -> None:
-            try:
-                image = tk.PhotoImage(file=str(path))
-                # 缩略图不超过预览框（按实际容器尺寸算，别按固定数字，否则高缩放下会溢出）
-                shrink = max(1, -(-image.width() // px(232)), -(-image.height() // px(128)))
-                if shrink > 1:
-                    image = image.subsample(shrink, shrink)
-                preview_label.configure(image=image, text="")
-                preview_label.image = image
-                rec = live_state.get("rec")
-                if not (rec and rec.running):
-                    status_var_live.set("预览已更新")
-            except Exception as exc:
-                preview_failed(exc)
+        player = EmbeddedPlayer(holder, post=ui_jobs.put,
+                                log=lambda text: append_live_log(text))
+        live_state["player"] = player
 
-        def preview_failed(exc: Exception) -> None:
-            status_var_live.set(f"预览失败：{short_error(exc, 80)}")
+        def preview_geometry() -> tuple[int, int]:
+            """嵌进来的播放窗口就占满预览框（物理像素）。"""
+            holder.update_idletasks()
+            width = holder.winfo_width() or px(236)
+            height = holder.winfo_height() or px(133)
+            return max(120, int(width)), max(68, int(height))
 
-        def refresh_preview(auto: bool = False) -> None:
+        def start_preview() -> None:
             room = live_state.get("room")
             if not room or int(room.get("live_status") or 0) != 1:
+                preview_hint.configure(text="未开播，没有预览")
                 return
-            if auto:
-                rec = live_state.get("rec")
-                if rec and rec.running:
-                    # 录制中不做定时预览：每 12 秒起 1~3 个 ffmpeg 只为抓一帧，
-                    # 既抢带宽又会在窗口模式下闪控制台；停录后自动恢复
-                    live_state["preview_auto"] = False
-                    return
-            if live_state["preview_busy"]:
-                return
-            live_state["preview_busy"] = True
-            live_state["preview_auto"] = bool(auto)
             rec = live_state.get("rec")
-            if not (rec and rec.running):
-                status_var_live.set("预览加载中…")
+            if rec and rec.running:
+                return                      # 录制期间不预览：省带宽，别和录制抢流
+            if live_state.get("preview_starting"):
+                return
+            live_state["preview_starting"] = True
+            qn = current_qn()
             session, headers = live_http()
+            preview_hint.configure(text="预览连接中…")
 
             def worker() -> None:
                 try:
-                    dest = Path(tempfile.gettempdir()) / "bd_live_preview.png"
-                    # 预览只要看得清，不必占原画带宽：取 150（高清），拿不到再由接口降级
-                    live_snapshot(session, headers, room["ref_id"], 150, dest)
-                    ui_jobs.put(lambda: apply_preview(dest))
+                    play = live_play_info(session, headers, room["ref_id"], qn)
+                    url = (play.get("urls") or [""])[0]
+                    if not url:
+                        raise DownloadError("拿不到直播播放地址")
+                    got = int(play.get("qn") or qn)
+                    ui_jobs.put(lambda: attach_preview(url, got, dict(headers)))
                 except Exception as exc:
                     ui_jobs.put(lambda: preview_failed(exc))
                 finally:
-                    live_state["preview_busy"] = False
-                    ui_jobs.put(_schedule_next_preview)
+                    live_state["preview_starting"] = False
 
-            threading.Thread(target=worker, name="live-preview", daemon=True).start()
+            threading.Thread(target=worker, name="live-preview-url", daemon=True).start()
 
-        def _schedule_next_preview() -> None:
-            """只在主线程里排下一次刷新，tkiner 的 after 不能从工作线程调。"""
-            if not live_state.get("preview_auto"):
+        def attach_preview(url: str, got_qn: int, headers: dict) -> None:
+            room = live_state.get("room")
+            rec = live_state.get("rec")
+            if not room or (rec and rec.running):
                 return
+            live_state["preview_url"] = url
+            live_state["preview_qn"] = got_qn
+            live_state["preview_headers"] = headers
+            width, height = preview_geometry()
+            preview_hint.configure(text="")
+            if player.play(url, width=width, height=height, vf_height=480, volume=0,
+                           headers=header_blob(headers)):
+                status_var_live.set(f"实时预览中 · {live_qn_label(got_qn)} → 本地压到 480p")
+                append_live_log(f"[预览] 已接入实时画面：源 {live_qn_label(got_qn)}，"
+                                f"本地压缩到 480p 播放")
+            else:
+                preview_hint.configure(text="预览不可用（缺 ffplay）")
+
+        def preview_failed(exc: Exception) -> None:
+            preview_hint.configure(text="预览失败")
+            status_var_live.set(f"预览失败：{short_error(exc, 80)}")
+            append_live_log(f"[预览] 拉流失败：{short_error(exc)}")
+
+        def stop_preview(note: str = "") -> None:
+            player.stop()
+            live_state["preview_url"] = ""
+            if note:
+                preview_hint.configure(text=note)
+                append_live_log(f"[预览] {note}")
+
+        def preview_watch() -> None:
+            """播放器自己挂了（地址过期 / 网络断）就自动重连，不回到"每 12 秒一张图"。"""
             try:
                 if not win.winfo_exists():
                     return
-            except tk.TclError:
+            except Exception:
                 return
-            win.after(12000, lambda: refresh_preview(True))
-
-        def sample_clip() -> None:
             room = live_state.get("room")
-            if not room or int(room.get("live_status") or 0) != 1:
-                messagebox.showinfo("提示", "直播间当前没有开播", parent=win)
+            rec = live_state.get("rec")
+            if (room and int(room.get("live_status") or 0) == 1
+                    and not (rec and rec.running)
+                    and not live_state.get("preview_starting")
+                    and not player.alive):
+                start_preview()
+            win.after(8000, preview_watch)
+
+        # ---- 放大预览：无边框全视频窗口，设置和关闭都在右键菜单里 ----
+        live_state.setdefault("big", None)
+        live_state.setdefault("big_player", None)
+        live_state.setdefault("big_volume", 60)
+        live_state.setdefault("big_height", 480)
+
+        def record_height_cap() -> int:
+            """录制分辨率上限：选了 1080p 就别拿 4K 去预览。"""
+            label = qn_var.get()
+            return LIVE_QUALITY_HEIGHT.get(label, 2160)
+
+        def screen_height_cap() -> int:
+            return max(240, screen_h - px(48))
+
+        def allowed_preview_heights() -> list[tuple[int, str]]:
+            cap = min(record_height_cap(), screen_height_cap())
+            items = [(360, "360p"), (480, "480p"), (720, "720p"),
+                     (1080, "1080p"), (1440, "1440p"), (2160, "4K")]
+            return [(h, label) for h, label in items if h <= cap]
+
+        def big_geometry(height: int) -> tuple[int, int]:
+            width = int(round(height * 16 / 9))
+            if width > screen_w - px(20):
+                width = max(320, screen_w - px(20))
+                height = int(round(width * 9 / 16))
+            return width, height
+
+        def close_big_preview() -> None:
+            big = live_state.get("big")
+            player2 = live_state.get("big_player")
+            if player2 is not None:
+                try:
+                    player2.stop()
+                except Exception:
+                    pass
+            live_state["big_player"] = None
+            if big is not None:
+                try:
+                    big.destroy()
+                except Exception:
+                    pass
+            live_state["big"] = None
+
+        def apply_big_layout(height: int) -> None:
+            big = live_state.get("big")
+            player2 = live_state.get("big_player")
+            if big is None or player2 is None:
                 return
+            width, height = big_geometry(height)
+            live_state["big_height"] = height
+            big.geometry(f"{width}x{height}+{(screen_w - width) // 2}+"
+                         f"{max(0, (screen_h - height) // 2 - px(20))}")
+            holder2 = live_state.get("big_holder")
+            if holder2 is not None:
+                holder2.configure(width=width, height=height)
+            player2.resize(width, height)
+            url = live_state.get("preview_url") or ""
+            if url:
+                player2.play(url, width=width, height=height, vf_height=height,
+                             volume=int(live_state.get("big_volume") or 0),
+                             headers=header_blob(live_state.get("preview_headers") or {}))
+            append_live_log(f"[预览] 放大窗口改为 {width}×{height}")
+
+        def start_big_stream() -> None:
+            big = live_state.get("big")
+            if big is None:
+                return
+            hint2 = live_state.get("big_hint")
+            room = live_state.get("room")
+            rec = live_state.get("rec")
+            if not room or int(room.get("live_status") or 0) != 1:
+                if hint2 is not None:
+                    hint2.configure(text="直播间没开播")
+                return
+            if rec and rec.running:
+                if hint2 is not None:
+                    hint2.configure(text="录制中，预览已暂停")
+                return
+            url = live_state.get("preview_url") or ""
+            height = int(live_state.get("big_height") or 480)
+            if url:
+                if hint2 is not None:
+                    hint2.configure(text="")
+                player2 = live_state.get("big_player")
+                if player2 is not None:
+                    width, height = big_geometry(height)
+                    player2.play(url, width=width, height=height, vf_height=height,
+                                 volume=int(live_state.get("big_volume") or 0),
+                                 headers=header_blob(live_state.get("preview_headers") or {}))
+                return
+            # 主预览还没起（或者刚开窗口）：自己拉一次地址
+            qn = current_qn()
             session, headers = live_http()
 
             def worker() -> None:
                 try:
-                    dest = Path(tempfile.gettempdir()) / "bd_live_sample.flv"
-                    live_sample_clip(session, headers, room["ref_id"], current_qn(), dest, 10)
-                    if IS_WIN:
-                        os.startfile(str(dest))
-                    elif sys.platform == "darwin":
-                        subprocess.Popen(["open", str(dest)])
-                    else:
-                        subprocess.Popen(["xdg-open", str(dest)])
+                    play = live_play_info(session, headers, room["ref_id"], qn)
+                    url2 = (play.get("urls") or [""])[0]
+                    if not url2:
+                        raise DownloadError("拿不到直播播放地址")
+                    live_state["preview_url"] = url2
+                    ui_jobs.put(lambda: start_big_stream())
                 except Exception as exc:
-                    ui_jobs.put(lambda: messagebox.showerror("试看失败", short_error(exc, 300),
-                                                            parent=win))
+                    ui_jobs.put(lambda: hint2.configure(text=f"拉流失败：{short_error(exc, 60)}")
+                                if hint2 is not None else None)
 
-            threading.Thread(target=worker, name="live-sample", daemon=True).start()
+            threading.Thread(target=worker, name="live-big-url", daemon=True).start()
+
+        def big_menu_popup() -> None:
+            big = live_state.get("big")
+            if big is None:
+                return
+            menu = tk.Menu(big, tearoff=0, font=small_font)
+
+            preview_menu = tk.Menu(menu, tearoff=0, font=small_font)
+            heights = allowed_preview_heights()
+            for value, label in heights:
+                preview_menu.add_command(
+                    label=f"{label}（{value}p）",
+                    command=lambda h=value: apply_big_layout(h))
+            if not heights:
+                preview_menu.add_command(label="（没有可用档位）", state="disabled")
+            menu.add_cascade(label="预览分辨率", menu=preview_menu)
+
+            rec_menu = tk.Menu(menu, tearoff=0, font=small_font)
+            for label, qn in LIVE_RESOLUTION_CHOICES:
+                rec_menu.add_command(
+                    label=label,
+                    command=lambda text=label, value=qn: (
+                        qn_var.set(text), on_quality_change(),
+                        apply_big_layout(min(int(live_state.get("big_height") or 480),
+                                             min(record_height_cap(), screen_height_cap())))))
+            menu.add_cascade(label="录制分辨率", menu=rec_menu)
+
+            sound_on = int(live_state.get("big_volume") or 0) > 0
+
+            def toggle_sound() -> None:
+                live_state["big_volume"] = 0 if sound_on else 60
+                apply_big_layout(int(live_state.get("big_height") or 480))
+
+            menu.add_command(label=f"声音：{'开' if sound_on else '关'}", command=toggle_sound)
+            menu.add_separator()
+            menu.add_command(label="关闭预览窗口", command=close_big_preview)
+            state = live_state.get("big_state") or {}
+
+            def _menu_closed(_event=None) -> None:
+                state["menu_open"] = False
+                try:
+                    menu.destroy()
+                except Exception:
+                    pass
+
+            menu.bind("<Unmap>", _menu_closed)
+            state["menu_open"] = True
+            try:
+                menu.tk_popup(big.winfo_pointerx(), big.winfo_pointery())
+            finally:
+                try:
+                    menu.grab_release()
+                except Exception:
+                    pass
+
+        def open_big_preview() -> None:
+            existing = live_state.get("big")
+            if existing is not None and existing.winfo_exists():
+                existing.lift()
+                return
+            room = live_state.get("room")
+            if not room:
+                messagebox.showinfo("提示", "先读取直播间", parent=win)
+                return
+            limit = min(record_height_cap(), screen_height_cap())
+            height = min(int(live_state.get("big_height") or 480), limit)
+            width, height = big_geometry(height)
+
+            big = tk.Toplevel(win)
+            big.overrideredirect(True)
+            big.configure(bg="#000000")
+            big.geometry(f"{width}x{height}+{(screen_w - width) // 2}+"
+                         f"{max(0, (screen_h - height) // 2 - px(20))}")
+            big.resizable(False, False)
+            try:
+                big.attributes("-topmost", True)
+            except Exception:
+                pass
+            holder2 = tk.Frame(big, bg="#000000", width=width, height=height)
+            holder2.pack(fill="both", expand=True)
+            holder2.pack_propagate(False)
+            hint2 = tk.Label(holder2, text="预览连接中…", font=small_font,
+                             bg="#000000", fg="#9A9A9A")
+            hint2.pack(fill="both", expand=True)
+
+            player2 = EmbeddedPlayer(holder2, post=ui_jobs.put,
+                                     log=lambda text: append_live_log(text))
+            live_state["big"] = big
+            live_state["big_player"] = player2
+            live_state["big_holder"] = holder2
+            live_state["big_hint"] = hint2
+            live_state["big_height"] = height
+
+            state = {"pressed": False, "menu_open": False, "drag": None, "left": False}
+            live_state["big_state"] = state
+
+            drag_state: dict = {}
+
+            def on_press(event) -> None:
+                drag_state["start"] = (event.x_root, event.y_root,
+                                       big.winfo_rootx(), big.winfo_rooty())
+
+            def on_drag(event) -> None:
+                if "start" not in drag_state:
+                    return
+                x0, y0, wx, wy = drag_state["start"]
+                big.geometry(f"+{wx + (event.x_root - x0)}+{wy + (event.y_root - y0)}")
+
+            def on_release(_event) -> None:
+                if "start" in drag_state:
+                    drag_state.pop("start", None)
+                    append_live_log(f"[预览] 放大窗口移到 +{big.winfo_rootx()}+{big.winfo_rooty()}")
+
+            for widget in (big, holder2, hint2):
+                widget.bind("<ButtonPress-1>", on_press)
+                widget.bind("<B1-Motion>", on_drag)
+                widget.bind("<ButtonRelease-1>", on_release)
+                widget.bind("<Button-3>", lambda _e: big_menu_popup())
+
+            def poll_right_click() -> None:
+                try:
+                    if not big.winfo_exists():
+                        return
+                except Exception:
+                    return
+                x_root, y_root = cursor_pos()
+                rect = real_window_rect(big.winfo_id(), big.winfo_width(), big.winfo_height())
+                if rect is None:
+                    try:
+                        gx, gy = big.geometry().split("+")[1:3]
+                        rect = (int(gx), int(gy), big.winfo_width(), big.winfo_height())
+                    except Exception:
+                        rect = (big.winfo_rootx(), big.winfo_rooty(),
+                                big.winfo_width(), big.winfo_height())
+                rx, ry, rw, rh = rect
+                inside = rx <= x_root < rx + rw and ry <= y_root < ry + rh
+
+                down = right_button_down()
+                if down and not state["pressed"] and inside:
+                    big_menu_popup()
+                state["pressed"] = down
+
+                # 拖动：无边框窗口没有标题栏，按住画面拖就行
+                left = left_button_down()
+                if left and not state["left"] and inside and not state["menu_open"]:
+                    state["drag"] = (x_root, y_root, rx, ry)
+                    append_live_log("[预览] 开始拖动放大窗口")
+                elif left and state["drag"]:
+                    x0, y0, wx, wy = state["drag"]
+                    big.geometry(f"+{wx + (x_root - x0)}+{wy + (y_root - y0)}")
+                elif not left and state["drag"]:
+                    state["drag"] = None
+                    rect2 = real_window_rect(big.winfo_id(), big.winfo_width(), big.winfo_height())
+                    if rect2:
+                        append_live_log(f"[预览] 放大窗口移到 +{rect2[0]}+{rect2[1]}")
+                state["left"] = left
+                big.after(60, poll_right_click)
+
+            poll_right_click()
+            start_big_stream()
+            append_live_log(f"[预览] 打开放大预览：{width}×{height}")
 
         def refresh_tasks() -> None:
             for item in task_tree.get_children():
@@ -5596,6 +6736,8 @@ def run_gui(start_live: bool = False) -> int:
                     tray.notify("直播录制中", "窗口已隐藏到托盘，录制继续。")
                 return
             live_state["win"] = None
+            stop_preview()
+            close_big_preview()
             win.destroy()
             if start_live_only:
                 quit_app()
@@ -5629,8 +6771,8 @@ def run_gui(start_live: bool = False) -> int:
         live_state["append"] = append_live_log
 
         # 打开窗口时的初始状态：有保存过的房间就顺手读一次
-        set_quality_choices(sorted(((qn, LIVE_QN_DESC.get(qn, str(qn)))
-                                    for qn in LIVE_QN_DESC), reverse=True))
+        set_quality_choices()
+        preview_watch()
         refresh_tasks()
         win.protocol("WM_DELETE_WINDOW", close_live_window)
         win.bind("<Unmap>", lambda _e: (win.after(30, lambda: win.state() == "iconic"
@@ -5758,6 +6900,578 @@ def run_gui(start_live: bool = False) -> int:
 
             threading.Thread(target=worker, name="merge-sub", daemon=True).start()
 
+    # ---------------- 视频合并（新窗口） ----------------
+
+    def open_concat_dialog() -> None:
+        dlg = tk.Toplevel(root)
+        dlg.title("合并视频")
+        apply_window_icon(dlg)
+        dlg.configure(bg=GUI_BG)
+        width = min(px(940), screen_w - px(30))
+        height = min(px(660), screen_h - px(70))
+        dlg.geometry(f"{width}x{height}+{max(px(10), (screen_w - width) // 2)}"
+                     f"+{max(px(10), (screen_h - height) // 2 - px(20))}")
+        if root.winfo_viewable():
+            dlg.transient(root)
+        dlg.deiconify()
+
+        tk.Label(dlg, text="把多个视频按顺序拼成一个（不覆盖原文件）", font=bold_font,
+                 bg=GUI_BG, fg=GUI_TEXT).pack(anchor="w", padx=px(16), pady=(px(12), px(4)))
+
+        footer = tk.Frame(dlg, bg=GUI_BG)
+        footer.pack(side="bottom", fill="x", padx=px(16), pady=(px(6), px(10)))
+        body = tk.Frame(dlg, bg=GUI_BG)
+        body.pack(fill="both", expand=True, padx=px(16), pady=(0, px(6)))
+
+        list_card = tk.Frame(body, bg=GUI_CARD, highlightbackground=GUI_BORDER,
+                             highlightthickness=1)
+        list_card.pack(fill="both", expand=True, pady=(0, px(8)))
+        list_head = tk.Frame(list_card, bg=GUI_CARD)
+        list_head.pack(fill="x", padx=px(10), pady=(px(8), px(4)))
+        tk.Label(list_head, text="视频列表", font=small_font, bg=GUI_CARD,
+                 fg=GUI_SUB).pack(side="left")
+        count_var = tk.StringVar(value="0 个文件")
+        tk.Label(list_head, textvariable=count_var, font=small_font, bg=GUI_CARD,
+                 fg=GUI_SUB).pack(side="right")
+
+        list_wrap = tk.Frame(list_card, bg=GUI_CARD)
+        list_wrap.pack(fill="both", expand=True, padx=px(10), pady=(0, px(6)))
+        box = tk.Listbox(list_wrap, font=small_font, selectmode="extended", height=10,
+                         bg="#FFFFFF", fg=GUI_TEXT, relief="flat",
+                         highlightthickness=1, highlightbackground=GUI_BORDER,
+                         activestyle="none")
+        scroll = ttk.Scrollbar(list_wrap, orient="vertical", command=box.yview)
+        box.configure(yscrollcommand=scroll.set)
+        box.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        items: list[Path] = []
+        sort_mode = tk.StringVar(value="import")
+        order_buttons: list = []
+
+        def refresh_list() -> None:
+            box.delete(0, "end")
+            for index, item in enumerate(items, 1):
+                box.insert("end", f"{index:03d}.  {item.name}    —  {item.parent}")
+            count_var.set(f"{len(items)} 个文件")
+            manual = sort_mode.get() == "manual"
+            for button in order_buttons:
+                button.set_enabled(manual)
+
+        def apply_sort() -> None:
+            nonlocal items
+            mode = sort_mode.get()
+            if mode == "name":
+                items = order_files_by_name(items)
+            elif mode == "number":
+                items = order_files_by_number(items)
+            refresh_list()
+
+        def add_paths(paths: Sequence[Path]) -> None:
+            for item in paths:
+                if item.is_file() and item.suffix.lower() in VIDEO_SUFFIXES:
+                    items.append(item)
+            if not out_var.get().strip() and items:
+                out_var.set(str(items[0].with_name(items[0].stem + "_合并.mp4")))
+            apply_sort()
+
+        def add_files() -> None:
+            chosen = filedialog.askopenfilenames(
+                title="选择要合并的视频", parent=dlg,
+                filetypes=[("视频", "*.mp4 *.mkv *.flv *.mov *.ts *.webm *.avi *.m4v"),
+                           ("全部文件", "*.*")])
+            if chosen:
+                add_paths([Path(item) for item in chosen])
+
+        def add_folder() -> None:
+            folder = filedialog.askdirectory(title="选择文件夹（把里面的视频全部加入）", parent=dlg)
+            if folder:
+                patterns = sorted(Path(folder).iterdir())
+                add_paths(patterns)
+
+        def remove_selected() -> None:
+            for index in reversed(box.curselection()):
+                if index < len(items):
+                    items.pop(index)
+            refresh_list()
+
+        def move(delta: int) -> None:
+            picked = list(box.curselection())
+            if not picked:
+                return
+            for index in picked:
+                target = index + delta
+                if 0 <= target < len(items):
+                    items[index], items[target] = items[target], items[index]
+            refresh_list()
+            for index in picked:
+                target = max(0, min(len(items) - 1, index + delta))
+                box.selection_set(target)
+
+        buttons_row = tk.Frame(list_card, bg=GUI_CARD)
+        buttons_row.pack(fill="x", padx=px(10), pady=(0, px(8)))
+        _RoundedButton(buttons_row, "添加文件", kind="secondary", width=86, height=28,
+                       command=add_files).pack(side="left")
+        _RoundedButton(buttons_row, "添加文件夹", kind="secondary", width=96, height=28,
+                       command=add_folder).pack(side="left", padx=px(6))
+        _RoundedButton(buttons_row, "移除", kind="ghost", width=64, height=28,
+                       command=remove_selected).pack(side="left")
+        _RoundedButton(buttons_row, "清空", kind="ghost", width=64, height=28,
+                       command=lambda: (items.clear(), refresh_list())).pack(side="left", padx=px(6))
+        up_btn = _RoundedButton(buttons_row, "上移", kind="ghost", width=60, height=28,
+                                command=lambda: move(-1))
+        up_btn.pack(side="right")
+        down_btn = _RoundedButton(buttons_row, "下移", kind="ghost", width=60, height=28,
+                                  command=lambda: move(1))
+        down_btn.pack(side="right", padx=(0, px(6)))
+        order_buttons.extend([up_btn, down_btn])
+
+        sort_row = tk.Frame(body, bg=GUI_CARD, highlightbackground=GUI_BORDER,
+                            highlightthickness=1)
+        sort_row.pack(fill="x", pady=(0, px(8)))
+        inner_sort = tk.Frame(sort_row, bg=GUI_CARD)
+        inner_sort.pack(fill="x", padx=px(10), pady=px(8))
+        tk.Label(inner_sort, text="排序", font=small_font, bg=GUI_CARD,
+                 fg=GUI_SUB, width=6, anchor="w").pack(side="left")
+        for text, value in (("导入顺序", "import"), ("名称排序", "name"),
+                            ("序号排序", "number"), ("手动排序（用上移 / 下移）", "manual")):
+            ttk.Radiobutton(
+                inner_sort, text=text, value=value, variable=sort_mode,
+                command=lambda mode=value: (refresh_list() if mode == "manual" else apply_sort())
+            ).pack(side="left", padx=(0, px(10)))
+
+        options = tk.Frame(body, bg=GUI_CARD, highlightbackground=GUI_BORDER,
+                           highlightthickness=1)
+        options.pack(fill="x", pady=(0, px(8)))
+        opt_inner = tk.Frame(options, bg=GUI_CARD)
+        opt_inner.pack(fill="x", padx=px(10), pady=px(8))
+
+        codec_labels = {f"{item['label']}": key for key, item in VIDEO_CODECS.items()}
+        container_labels = {f"{item['label']}": key for key, item in VIDEO_CONTAINERS.items()}
+        codec_var = tk.StringVar(value="不重编码（直接复制，最快）")
+        container_var = tk.StringVar(value=list(container_labels)[0])
+        audio_var = tk.StringVar(value="保留原音轨（复制）")
+        audio_rate_var = tk.StringVar(value="192")
+        rate_mode_var = tk.StringVar(value="crf")
+        crf_var = tk.StringVar(value="23")
+        vbitrate_var = tk.StringVar(value="3000")
+        height_var = tk.StringVar(value="原始分辨率")
+        fps_var = tk.StringVar(value="原始帧率")
+
+        def label(parent, text: str, width: int = 8) -> None:
+            tk.Label(parent, text=text, font=small_font, bg=GUI_CARD, fg=GUI_SUB,
+                     width=width, anchor="w").pack(side="left")
+
+        row1 = tk.Frame(opt_inner, bg=GUI_CARD)
+        row1.pack(fill="x")
+        label(row1, "视频编码")
+        codec_box = ttk.Combobox(row1, textvariable=codec_var, state="readonly", width=24,
+                                 values=list(codec_labels))
+        codec_box.pack(side="left", padx=(0, px(10)))
+        label(row1, "封装")
+        container_box = ttk.Combobox(row1, textvariable=container_var, state="readonly", width=20,
+                                     values=list(container_labels))
+        container_box.pack(side="left", padx=(0, px(10)))
+        label(row1, "声音")
+        audio_box = ttk.Combobox(row1, textvariable=audio_var, state="readonly", width=17,
+                                 values=["保留原音轨（复制）", "转成 AAC", "不要声音"])
+        audio_box.pack(side="left")
+
+        row2 = tk.Frame(opt_inner, bg=GUI_CARD)
+        row2.pack(fill="x", pady=(px(8), 0))
+        label(row2, "画质")
+        ttk.Radiobutton(row2, text="按质量（CRF）", value="crf", variable=rate_mode_var).pack(side="left")
+        tk.Entry(row2, textvariable=crf_var, width=6, font=small_font, relief="flat",
+                 bg="#FFFFFF", fg=GUI_TEXT, justify="center", highlightthickness=1,
+                 highlightbackground=GUI_BORDER).pack(side="left", padx=(px(4), px(12)), ipady=px(2))
+        ttk.Radiobutton(row2, text="按码率", value="bitrate", variable=rate_mode_var).pack(side="left")
+        tk.Entry(row2, textvariable=vbitrate_var, width=7, font=small_font, relief="flat",
+                 bg="#FFFFFF", fg=GUI_TEXT, justify="center", highlightthickness=1,
+                 highlightbackground=GUI_BORDER).pack(side="left", padx=(px(4), px(2)), ipady=px(2))
+        tk.Label(row2, text="kbps", font=small_font, bg=GUI_CARD, fg=GUI_SUB).pack(side="left")
+        label(row2, "音频码率", 7)
+        tk.Entry(row2, textvariable=audio_rate_var, width=6, font=small_font, relief="flat",
+                 bg="#FFFFFF", fg=GUI_TEXT, justify="center", highlightthickness=1,
+                 highlightbackground=GUI_BORDER).pack(side="left", padx=(0, px(2)), ipady=px(2))
+        tk.Label(row2, text="kbps", font=small_font, bg=GUI_CARD, fg=GUI_SUB).pack(side="left")
+        tk.Label(row2, text="（画质只在选了要重编码时生效）", font=small_font, bg=GUI_CARD,
+                 fg=GUI_SUB).pack(side="left", padx=px(8))
+
+        out_line = tk.Frame(body, bg=GUI_CARD, highlightbackground=GUI_BORDER, highlightthickness=1)
+        out_line.pack(fill="x", pady=(0, px(8)))
+        out_inner = tk.Frame(out_line, bg=GUI_CARD)
+        out_inner.pack(fill="x", padx=px(10), pady=px(8))
+        label(out_inner, "输出文件", 8)
+        out_var = tk.StringVar()
+        out_entry = tk.Entry(out_inner, textvariable=out_var, font=small_font, relief="flat",
+                             bg="#FFFFFF", fg=GUI_TEXT, highlightthickness=1,
+                             highlightbackground=GUI_BORDER, highlightcolor=GUI_ACCENT)
+        out_entry.pack(side="left", fill="x", expand=True, padx=(0, px(6)), ipady=px(3))
+
+        def pick_out() -> None:
+            ext = VIDEO_CONTAINERS[container_labels.get(container_var.get(), "mp4")]["ext"]
+            chosen = filedialog.asksaveasfilename(
+                title="保存为", parent=dlg, defaultextension=ext,
+                initialfile=(items[0].stem + "_合并" + ext) if items else ("合并" + ext),
+                filetypes=[("视频", "*.mp4 *.mkv *.mov *.ts *.webm"), ("全部文件", "*.*")])
+            if chosen:
+                out_var.set(chosen)
+
+        _RoundedButton(out_inner, "浏览", kind="ghost", width=56, height=26,
+                       command=pick_out).pack(side="right")
+
+        progress = ttk.Progressbar(body, mode="determinate", maximum=100,
+                                   style="Win.Horizontal.TProgressbar")
+        progress.pack(fill="x", pady=(0, px(4)))
+        status = tk.StringVar(value="等文件进列表，选好排序和输出就开始")
+        tk.Label(body, textvariable=status, font=small_font, bg=GUI_BG,
+                 fg=GUI_SUB, anchor="w").pack(fill="x")
+
+        log_box = tk.Text(body, height=7, font=small_font, relief="flat", bg="#FAFAFA",
+                          fg="#333333", highlightthickness=1, highlightbackground=GUI_BORDER)
+        log_box.pack(fill="both", expand=False, pady=(px(6), px(4)))
+        log_box.configure(state="disabled")
+
+        def write_log(text: str) -> None:
+            log_box.configure(state="normal")
+            log_box.insert("end", text + "\n")
+            log_box.see("end")
+            log_box.configure(state="disabled")
+
+        start_btn = _RoundedButton(footer, "开始合并", kind="accent", width=112, height=34,
+                                   font=(GUI_FONT_FAMILY, 10, "bold"),
+                                   command=lambda: start_merge())
+        start_btn.pack(side="right")
+        _RoundedButton(footer, "关闭", kind="ghost", width=70, height=34,
+                       command=lambda: dlg.destroy()).pack(side="right", padx=(0, px(8)))
+
+        def start_merge() -> None:
+            if not items:
+                messagebox.showinfo("提示", "先把要合并的视频加进列表", parent=dlg)
+                return
+            container = container_labels.get(container_var.get(), "mp4")
+            codec = codec_labels.get(codec_var.get(), "copy")
+            if not codec_fits_container(codec, container):
+                messagebox.showerror("组合不对", "这个编码放进这个封装播不了，换一个组合", parent=dlg)
+                return
+            out_text = out_var.get().strip()
+            if not out_text:
+                messagebox.showinfo("提示", "先选输出文件", parent=dlg)
+                return
+            out = Path(out_text).expanduser()
+            if out.suffix.lower().lstrip(".") != container:
+                out = out.with_suffix(VIDEO_CONTAINERS[container]["ext"])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            audio_mode = {"保留原音轨（复制）": "copy", "转成 AAC": "aac",
+                          "不要声音": "none"}.get(audio_var.get(), "copy")
+            try:
+                audio_rate = int(float(audio_rate_var.get() or 192))
+            except ValueError:
+                audio_rate = 192
+
+            work = Path(tempfile.mkdtemp(prefix="bd_concat_"))
+            sub_mode, subs = plan_subtitles([items[0]], container, work, out, dlg)
+            total = sum((probe_video_info(item)["duration"] or 0.0) for item in items)
+            start_btn.set_enabled(False)
+            status.set("正在合并…")
+            progress.configure(value=0)
+
+            def worker() -> None:
+                try:
+                    merge_videos(
+                        items, out, container=container, video_codec=codec,
+                        audio_codec=audio_mode, audio_bitrate=audio_rate,
+                        soft_subs=subs if sub_mode == "soft" else (),
+                        burn_subs=subs if sub_mode == "hard" else (),
+                        total_seconds=total,
+                        on_percent=lambda value: ui_jobs.put(
+                            lambda percent=value: progress.configure(value=percent)),
+                        log=lambda text: ui_jobs.put(lambda value=text: write_log(value)))
+                    def done() -> None:
+                        start_btn.set_enabled(True)
+                        progress.configure(value=100)
+                        status.set(f"完成：{out.name}")
+                        write_log(f"完成：{out}")
+                        messagebox.showinfo("合并完成", f"已保存到：\n{out}", parent=dlg)
+                    ui_jobs.put(done)
+                except Exception as exc:
+                    def failed() -> None:
+                        start_btn.set_enabled(True)
+                        status.set("失败")
+                        write_log(f"失败：{short_error(exc, 300)}")
+                        messagebox.showerror("合并失败", short_error(exc, 300), parent=dlg)
+                    ui_jobs.put(failed)
+                finally:
+                    shutil.rmtree(work, ignore_errors=True)
+
+            threading.Thread(target=worker, name="gui-concat", daemon=True).start()
+
+    # ---------------- 压缩 / 转码（新窗口） ----------------
+
+    def open_transcode_dialog() -> None:
+        dlg = tk.Toplevel(root)
+        dlg.title("压缩 / 转码")
+        apply_window_icon(dlg)
+        dlg.configure(bg=GUI_BG)
+        width = min(px(880), screen_w - px(30))
+        height = min(px(600), screen_h - px(70))
+        dlg.geometry(f"{width}x{height}+{max(px(10), (screen_w - width) // 2)}"
+                     f"+{max(px(10), (screen_h - height) // 2 - px(20))}")
+        if root.winfo_viewable():
+            dlg.transient(root)
+        dlg.deiconify()
+
+        tk.Label(dlg, text="压缩 / 转码单个视频（改分辨率、编码、码率都在这儿）", font=bold_font,
+                 bg=GUI_BG, fg=GUI_TEXT).pack(anchor="w", padx=px(16), pady=(px(12), px(4)))
+
+        footer = tk.Frame(dlg, bg=GUI_BG)
+        footer.pack(side="bottom", fill="x", padx=px(16), pady=(px(6), px(10)))
+        body = tk.Frame(dlg, bg=GUI_BG)
+        body.pack(fill="both", expand=True, padx=px(16), pady=(0, px(6)))
+
+        src_line = tk.Frame(body, bg=GUI_CARD, highlightbackground=GUI_BORDER, highlightthickness=1)
+        src_line.pack(fill="x", pady=(0, px(8)))
+        inner = tk.Frame(src_line, bg=GUI_CARD)
+        inner.pack(fill="x", padx=px(10), pady=px(8))
+        tk.Label(inner, text="源视频", font=small_font, bg=GUI_CARD, fg=GUI_SUB,
+                 width=8, anchor="w").pack(side="left")
+        src_var = tk.StringVar()
+        src_entry = tk.Entry(inner, textvariable=src_var, font=small_font, relief="flat",
+                             bg="#FFFFFF", fg=GUI_TEXT, highlightthickness=1,
+                             highlightbackground=GUI_BORDER, highlightcolor=GUI_ACCENT)
+        src_entry.pack(side="left", fill="x", expand=True, padx=(0, px(6)), ipady=px(3))
+
+        out_var = tk.StringVar()
+        info_var = tk.StringVar(value="选好源文件后会自动填目标文件名")
+        tk.Label(body, textvariable=info_var, font=small_font, bg=GUI_BG, fg=GUI_SUB,
+                 anchor="w").pack(fill="x", pady=(0, px(6)))
+
+        options = tk.Frame(body, bg=GUI_CARD, highlightbackground=GUI_BORDER, highlightthickness=1)
+        options.pack(fill="x", pady=(0, px(8)))
+        grid = tk.Frame(options, bg=GUI_CARD)
+        grid.pack(fill="x", padx=px(10), pady=px(8))
+
+        codec_labels = {item["label"]: key for key, item in VIDEO_CODECS.items()}
+        container_labels = {item["label"]: key for key, item in VIDEO_CONTAINERS.items()}
+        codec_var = tk.StringVar(value="H.264 / AVC（兼容最好）")
+        container_var = tk.StringVar(value="MP4（最通用）")
+        height_var = tk.StringVar(value="原始分辨率")
+        fps_var = tk.StringVar(value="原始帧率")
+        rate_mode_var = tk.StringVar(value="crf")
+        crf_var = tk.StringVar(value="23")
+        vbitrate_var = tk.StringVar(value="3000")
+        audio_var = tk.StringVar(value="转成 AAC")
+        audio_rate_var = tk.StringVar(value="192")
+
+        def mk_row(parent) -> tk.Frame:
+            row = tk.Frame(parent, bg=GUI_CARD)
+            row.pack(fill="x", pady=(0, px(6)))
+            return row
+
+        def lab(row, text: str, width: int = 8) -> None:
+            tk.Label(row, text=text, font=small_font, bg=GUI_CARD, fg=GUI_SUB,
+                     width=width, anchor="w").pack(side="left")
+
+        row = mk_row(grid)
+        lab(row, "视频编码")
+        ttk.Combobox(row, textvariable=codec_var, state="readonly", width=30,
+                     values=list(codec_labels)).pack(side="left", padx=(0, px(10)))
+        lab(row, "封装")
+        ttk.Combobox(row, textvariable=container_var, state="readonly", width=30,
+                     values=list(container_labels)).pack(side="left")
+
+        row = mk_row(grid)
+        lab(row, "分辨率")
+        ttk.Combobox(row, textvariable=height_var, state="readonly", width=18,
+                     values=["原始分辨率", "2160p (4K)", "1440p (2K)", "1080p", "720p", "480p"]
+                     ).pack(side="left", padx=(0, px(12)))
+        lab(row, "帧率")
+        ttk.Combobox(row, textvariable=fps_var, state="readonly", width=14,
+                     values=["原始帧率", "24", "30", "60"]).pack(side="left")
+
+        row = mk_row(grid)
+        lab(row, "画质")
+        ttk.Radiobutton(row, text="按质量（CRF）", value="crf",
+                        variable=rate_mode_var).pack(side="left")
+        tk.Entry(row, textvariable=crf_var, width=6, font=small_font, relief="flat",
+                 bg="#FFFFFF", fg=GUI_TEXT, justify="center", highlightthickness=1,
+                 highlightbackground=GUI_BORDER).pack(side="left", padx=(px(4), px(14)), ipady=px(2))
+        ttk.Radiobutton(row, text="按视频码率", value="bitrate",
+                        variable=rate_mode_var).pack(side="left")
+        tk.Entry(row, textvariable=vbitrate_var, width=8, font=small_font, relief="flat",
+                 bg="#FFFFFF", fg=GUI_TEXT, justify="center", highlightthickness=1,
+                 highlightbackground=GUI_BORDER).pack(side="left", padx=(px(4), px(2)), ipady=px(2))
+        tk.Label(row, text="kbps", font=small_font, bg=GUI_CARD, fg=GUI_SUB).pack(side="left")
+
+        row = mk_row(grid)
+        lab(row, "声音")
+        ttk.Combobox(row, textvariable=audio_var, state="readonly", width=16,
+                     values=["保留原音轨（复制）", "转成 AAC", "不要声音"]
+                     ).pack(side="left", padx=(0, px(10)))
+        lab(row, "音频码率", 8)
+        ttk.Entry(row, textvariable=audio_rate_var, width=6).pack(side="left")
+        tk.Label(row, text="kbps", font=small_font, bg=GUI_CARD, fg=GUI_SUB).pack(side="left")
+
+        out_line = tk.Frame(body, bg=GUI_CARD, highlightbackground=GUI_BORDER, highlightthickness=1)
+        out_line.pack(fill="x", pady=(0, px(8)))
+        out_inner = tk.Frame(out_line, bg=GUI_CARD)
+        out_inner.pack(fill="x", padx=px(10), pady=px(8))
+        tk.Label(out_inner, text="输出文件", font=small_font, bg=GUI_CARD, fg=GUI_SUB,
+                 width=8, anchor="w").pack(side="left")
+        out_entry = tk.Entry(out_inner, textvariable=out_var, font=small_font, relief="flat",
+                             bg="#FFFFFF", fg=GUI_TEXT, highlightthickness=1,
+                             highlightbackground=GUI_BORDER, highlightcolor=GUI_ACCENT)
+        out_entry.pack(side="left", fill="x", expand=True, padx=(0, px(6)), ipady=px(3))
+
+        def refresh_out_name() -> None:
+            raw = src_var.get().strip()
+            if not raw:
+                return
+            src = Path(raw)
+            container = container_labels.get(container_var.get(), "mp4")
+            out_var.set(str(src.with_name(src.stem + "_压缩" + VIDEO_CONTAINERS[container]["ext"])))
+            info = probe_video_info(src)
+            if info["duration"]:
+                info_var.set(f"{info['width']}×{info['height']}  {fmt_duration(info['duration'])}"
+                             f"  视频 {info['vcodec'] or '?'}  音频 {info['acodec'] or '无'}"
+                             f"  字幕轨 {len(info['subs'])}")
+            else:
+                info_var.set("读不出这个文件的媒体信息")
+
+        def pick_src() -> None:
+            chosen = filedialog.askopenfilename(
+                title="选择视频", parent=dlg,
+                filetypes=[("视频", "*.mp4 *.mkv *.flv *.mov *.ts *.webm *.avi *.m4v"),
+                           ("全部文件", "*.*")])
+            if chosen:
+                src_var.set(chosen)
+                refresh_out_name()
+
+        def pick_out() -> None:
+            container = container_labels.get(container_var.get(), "mp4")
+            chosen = filedialog.asksaveasfilename(
+                title="保存为", parent=dlg,
+                defaultextension=VIDEO_CONTAINERS[container]["ext"],
+                initialfile=Path(out_var.get()).name if out_var.get() else "压缩.mp4",
+                filetypes=[("视频", "*.mp4 *.mkv *.mov *.ts *.webm"), ("全部文件", "*.*")])
+            if chosen:
+                out_var.set(chosen)
+
+        _RoundedButton(inner, "浏览", kind="ghost", width=56, height=26,
+                       command=pick_src).pack(side="right")
+        _RoundedButton(out_inner, "浏览", kind="ghost", width=56, height=26,
+                       command=pick_out).pack(side="right")
+
+        progress = ttk.Progressbar(body, mode="determinate", maximum=100,
+                                   style="Win.Horizontal.TProgressbar")
+        progress.pack(fill="x", pady=(0, px(4)))
+        status = tk.StringVar(value="选源视频 → 选参数 → 开始")
+        tk.Label(body, textvariable=status, font=small_font, bg=GUI_BG,
+                 fg=GUI_SUB, anchor="w").pack(fill="x")
+
+        log_box = tk.Text(body, height=7, font=small_font, relief="flat", bg="#FAFAFA",
+                          fg="#333333", highlightthickness=1, highlightbackground=GUI_BORDER)
+        log_box.pack(fill="both", expand=True, pady=(px(6), px(4)))
+        log_box.configure(state="disabled")
+
+        def write_log(text: str) -> None:
+            log_box.configure(state="normal")
+            log_box.insert("end", text + "\n")
+            log_box.see("end")
+            log_box.configure(state="disabled")
+
+        start_btn = _RoundedButton(footer, "开始转换", kind="accent", width=112, height=34,
+                                   font=(GUI_FONT_FAMILY, 10, "bold"),
+                                   command=lambda: start_transcode())
+        start_btn.pack(side="right")
+        _RoundedButton(footer, "关闭", kind="ghost", width=70, height=34,
+                       command=lambda: dlg.destroy()).pack(side="right", padx=(0, px(8)))
+
+        def start_transcode() -> None:
+            raw = src_var.get().strip()
+            if not raw:
+                messagebox.showinfo("提示", "先选源视频", parent=dlg)
+                return
+            src = Path(raw).expanduser()
+            if not src.is_file():
+                messagebox.showerror("找不到文件", str(src), parent=dlg)
+                return
+            container = container_labels.get(container_var.get(), "mp4")
+            codec = codec_labels.get(codec_var.get(), "h264")
+            if not codec_fits_container(codec, container):
+                messagebox.showerror("组合不对", "这个编码放进这个封装播不了，换一个组合", parent=dlg)
+                return
+            out_text = out_var.get().strip()
+            if not out_text:
+                messagebox.showinfo("提示", "先选输出文件", parent=dlg)
+                return
+            out = Path(out_text).expanduser()
+            if out.suffix.lower().lstrip(".") != container:
+                out = out.with_suffix(VIDEO_CONTAINERS[container]["ext"])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            if out.resolve() == src.resolve():
+                messagebox.showerror("不能覆盖", "输出文件不能和源视频同名", parent=dlg)
+                return
+
+            heights = {"原始分辨率": None, "2160p (4K)": 2160, "1440p (2K)": 1440,
+                       "1080p": 1080, "720p": 720, "480p": 480}
+            height = heights.get(height_var.get())
+            fps_map = {"原始帧率": None, "24": 24.0, "30": 30.0, "60": 60.0}
+            fps = fps_map.get(fps_var.get())
+            audio_mode = {"保留原音轨（复制）": "copy", "转成 AAC": "aac",
+                          "不要声音": "none"}.get(audio_var.get(), "aac")
+            try:
+                audio_rate = int(float(audio_rate_var.get() or 192))
+            except ValueError:
+                audio_rate = 192
+            try:
+                crf = int(float(crf_var.get() or 23))
+            except ValueError:
+                crf = 23
+            try:
+                vbitrate = int(float(vbitrate_var.get() or 3000))
+            except ValueError:
+                vbitrate = 3000
+
+            info = probe_video_info(src)
+            work = Path(tempfile.mkdtemp(prefix="bd_trans_"))
+            sub_mode, subs = plan_subtitles([src], container, work, out, dlg)
+            start_btn.set_enabled(False)
+            status.set("正在转换…")
+            progress.configure(value=0)
+
+            def worker() -> None:
+                try:
+                    transcode_video(
+                        src, out, container=container, video_codec=codec,
+                        height=height, rate_mode=rate_mode_var.get(), crf=crf,
+                        vbitrate=vbitrate, fps=fps, audio_mode=audio_mode,
+                        audio_bitrate=audio_rate,
+                        soft_subs=subs if sub_mode == "soft" else (),
+                        burn_subs=subs if sub_mode == "hard" else (),
+                        total_seconds=info["duration"],
+                        on_percent=lambda value: ui_jobs.put(
+                            lambda percent=value: progress.configure(value=percent)),
+                        log=lambda text: ui_jobs.put(lambda value=text: write_log(value)))
+                    def done() -> None:
+                        start_btn.set_enabled(True)
+                        progress.configure(value=100)
+                        status.set(f"完成：{out.name}")
+                        write_log(f"完成：{out}")
+                        messagebox.showinfo("转换完成", f"已保存到：\n{out}", parent=dlg)
+                    ui_jobs.put(done)
+                except Exception as exc:
+                    def failed() -> None:
+                        start_btn.set_enabled(True)
+                        status.set("失败")
+                        write_log(f"失败：{short_error(exc, 300)}")
+                        messagebox.showerror("转换失败", short_error(exc, 300), parent=dlg)
+                    ui_jobs.put(failed)
+                finally:
+                    shutil.rmtree(work, ignore_errors=True)
+
+            threading.Thread(target=worker, name="gui-transcode", daemon=True).start()
+
     def auto_record(info: dict) -> None:
         """预约开播的自动录制：不依赖直播窗口是否打开，按配置直接开录，结束自动收尾。"""
         rec = live_state.get("rec")
@@ -5838,6 +7552,10 @@ def run_gui(start_live: bool = False) -> int:
                    command=lambda: open_merge_dialog()).pack(side="left")
     _RoundedButton(foot, "录制直播", kind="secondary", width=92, height=34,
                    command=lambda: open_live_window()).pack(side="left", padx=(0, px(8)))
+    _RoundedButton(foot, "合并视频", kind="secondary", width=92, height=34,
+                   command=lambda: open_concat_dialog()).pack(side="left", padx=(0, px(8)))
+    _RoundedButton(foot, "压缩 / 转码", kind="secondary", width=104, height=34,
+                   command=lambda: open_transcode_dialog()).pack(side="left", padx=(0, px(8)))
     main.pack(fill="both", expand=True, padx=px(18), pady=(0, px(4)))
 
 
@@ -6446,10 +8164,36 @@ def run_gui(start_live: bool = False) -> int:
     def quit_app() -> None:
         rec = live_state.get("rec")
         if rec and rec.running:
-            if not messagebox.askyesno("正在录制直播",
-                                       "录制还在进行，退出会停止录制并保留已经录下的分段。\n确定退出？"):
+            if not messagebox.askyesno(
+                    "正在录制直播",
+                    "录制还在进行。退出前会先把已经录下的分段合并成一个视频"
+                    "（分段多的话要等几十秒），完成后自动退出。\n\n确定退出？"):
                 return
+            # 先标记"用户要停"，免得自动收尾线程再跑一遍
+            live_state["stop_requested"]["value"] = True
             rec.stop()
+
+            def close_all() -> None:
+                if scheduler:
+                    scheduler.stop()
+                if tray:
+                    tray.stop()
+                root.destroy()
+
+            def finish_then_exit() -> None:
+                try:
+                    result = rec.finish()
+                    videos = [str(item) for item in (result.get("videos") or [])]
+                    text = ("[直播] 退出前已合并为：\n" + "\n".join(videos)) if videos \
+                        else "[直播] 退出前收尾：没有可合并的分段"
+                except Exception as exc:
+                    text = f"[直播] 退出前合并失败：{short_error(exc)}\n（分段都还在，下次可以手动合并）"
+                ui_jobs.put(lambda value=text: root.after(0, lambda: (append_log(value), close_all())))
+
+            append_log("[直播] 正在合并分段，完成后自动退出…")
+            threading.Thread(target=finish_then_exit, name="live-quit-finish",
+                             daemon=True).start()
+            return
         if scheduler:
             scheduler.stop()
         if tray:
