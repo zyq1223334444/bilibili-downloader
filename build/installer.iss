@@ -103,6 +103,8 @@ chinesesimplified.FfmpegFailDetail=ffmpeg 下载或安装失败：%1%n%n也可�
 chinesesimplified.FfmpegDone=ffmpeg 已安装到：%n%1%n%n该目录已加入用户 PATH，新开的命令行窗口里可以直接使用 ffmpeg。
 chinesesimplified.FfmpegFailed=ffmpeg 自动安装失败（可能是网络不通）。%n%n可以稍后运行 bilibili_downloader --install-ffmpeg 重试，%n或用 winget install Gyan.FFmpeg / choco install ffmpeg 手动安装。
 chinesesimplified.FfmpegSkip=已跳过 ffmpeg 安装。%n%n注意：没有 ffmpeg 时只能下载分离的音视频流，无法生成 MP4/MP3、也无法嵌入弹幕。%n稍后可以运行 bilibili_downloader --install-ffmpeg 补装。
+chinesesimplified.AppRunningOnUninstall=检测到 bilibili-downloader 正在运行，暂时不能卸载。%n%n请先退出 bilibili-downloader，再重新运行卸载程序。%n提示：它可能已经最小化到屏幕右下角的系统托盘里了 —— 右键托盘图标，选择“退出”即可。%n%n（卸载程序没有强制结束它，避免丢失正在录制的直播或正在下载的任务。）
+chinesesimplified.AppRunningOnInstall=检测到 bilibili-downloader 正在运行，暂时不能安装 / 覆盖升级。%n%n请先退出 bilibili-downloader 再继续。%n提示：它可能已经最小化到屏幕右下角的系统托盘里了 —— 右键托盘图标，选择“退出”即可。
 english.CreateDesktopIcon=Create a desktop shortcut
 english.AdditionalIcons=Additional icons:
 english.ModifyPath=Add the install folder to the system PATH (run bilibili_downloader from any terminal)
@@ -122,6 +124,8 @@ english.FfmpegFailDetail=ffmpeg download or installation failed: %1%n%nYou can a
 english.FfmpegDone=ffmpeg installed to:%n%1%n%nThat folder was added to the user PATH; a new terminal can run ffmpeg directly.
 english.FfmpegFailed=Automatic ffmpeg installation failed (probably no network).%n%nRun bilibili_downloader --install-ffmpeg later, or install manually with winget install Gyan.FFmpeg / choco install ffmpeg.
 english.FfmpegSkip=ffmpeg installation skipped.%n%nWithout ffmpeg only separate audio/video streams can be downloaded - no MP4/MP3 and no danmaku.%nYou can run bilibili_downloader --install-ffmpeg later.
+english.AppRunningOnUninstall=bilibili-downloader is still running, so it cannot be uninstalled right now.%n%nPlease close bilibili-downloader first, then run the uninstaller again.%nTip: it may be minimized to the notification area (system tray) at the bottom-right of the screen - right-click its tray icon and choose "Exit".%n%n(The uninstaller does not force-kill it, so a live recording or a running download is not lost.)
+english.AppRunningOnInstall=bilibili-downloader is still running, so it cannot be installed / upgraded right now.%n%nPlease close bilibili-downloader and try again.%nTip: it may be minimized to the notification area (system tray) at the bottom-right of the screen - right-click its tray icon and choose "Exit".
 
 [Tasks]
 Name: "modifypath"; Description: "{cm:ModifyPath}"; GroupDescription: "{cm:PathGroup}"
@@ -147,6 +151,51 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#ExeName}"; Tasks: desktopic
 Filename: "{sys}\cmd.exe"; Parameters: "/k ""{app}\{#ExeName}"" --help"; Description: "{cm:HelpShortcut}"; Flags: postinstall nowait skipifsilent unchecked
 
 [Code]
+
+{ 程序是不是还开着。用 tasklist 按映像名查，比找窗口标题可靠：
+  最小化到托盘时窗口是隐藏的，标题也可能随房间名变化，但进程一直在。 }
+function AppProcessRunning(): Boolean;
+var
+  Code: Integer;
+  TmpFile, Line: string;
+  Lines: TArrayOfString;
+  i: Integer;
+begin
+  Result := False;
+  TmpFile := ExpandConstant('{tmp}\tasklist_app.txt');
+  DeleteFile(TmpFile);
+  Exec(ExpandConstant('{cmd}'),
+       '/c tasklist /FI "IMAGENAME eq {#ExeName}" /NH > "' + TmpFile + '"',
+       '', SW_HIDE, ewWaitUntilTerminated, Code);
+  if LoadStringsFromFile(TmpFile, Lines) then
+    for i := 0 to GetArrayLength(Lines) - 1 do
+    begin
+      Line := Lowercase(Lines[i]);
+      if Pos(Lowercase('{#ExeName}'), Line) > 0 then
+        Result := True;
+    end;
+  DeleteFile(TmpFile);
+end;
+
+{ 卸载第一步：程序还在跑就直接拦下来，别把正在录制的文件删了 }
+function InitializeUninstall(): Boolean;
+begin
+  Result := True;
+  if AppProcessRunning() then
+  begin
+    MsgBox(ExpandConstant('{cm:AppRunningOnUninstall}'), mbError, MB_OK);
+    Result := False;
+  end;
+end;
+
+{ 安装 / 覆盖升级前也查一次：运行中的 exe 被占用，覆盖会失败 }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  if AppProcessRunning() then
+    Result := ExpandConstant('{cm:AppRunningOnInstall}');
+end;
+
 const
   EnvironmentKey = 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment';
   BackupKey      = 'SOFTWARE\{#AppShortName}';
