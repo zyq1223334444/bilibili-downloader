@@ -2263,12 +2263,27 @@ def live_play_info(session: requests.Session, headers: dict, room_id: int,
         raise DownloadError("这个直播间当前没有可用的播放地址（可能没开播，或需要登录）")
     best = min(candidates, key=lambda item: item["rank"])
     desc = []
+    labels: dict[int, str] = {}
     for item in play.get("g_qn_desc") or []:
         try:
-            desc.append((int(item.get("qn")), str(item.get("desc") or "")))
+            qn_value = int(item.get("qn"))
         except (TypeError, ValueError):
             continue
+        text = str(item.get("desc") or "")
+        detail = (((item.get("media_base_desc") or {}).get("detail_desc")) or {})
+        detail_text = str(detail.get("desc") or "")
+        tags = [str(tag) for tag in (detail.get("tag") or [])]
+        if detail_text:
+            text = detail_text
+        if "高帧率" in tags and "高帧率" not in text:
+            text = f"{text}（高帧率）"
+        attr = str(item.get("attr_desc") or "")
+        if attr and attr not in text:
+            text = f"{text} {attr}".strip()
+        desc.append((qn_value, text or LIVE_QN_DESC.get(qn_value, str(qn_value))))
+        labels[qn_value] = desc[-1][1]
     best["qn_desc"] = desc
+    best["qn_labels"] = labels
     if not best["accept_qn"]:
         best["accept_qn"] = [item[0] for item in desc]
     best["want_qn"] = int(qn)               # 我们请求的那一档，用来判断服务端有没有降档
@@ -2276,20 +2291,21 @@ def live_play_info(session: requests.Session, headers: dict, room_id: int,
 
 
 def live_quality_choices(play: dict) -> list[tuple[int, str]]:
-    """可切换的画质清单（从高到低）。
+    """这场直播真的能选的档位（从高到低），没有的档位不往界面塞。
 
-    accept_qn 只有一档时（游客最常见：只有原画）不能拿它当菜单，否则下拉框里
-    永远只有一项；这时退回标准五档。名字优先用 g_qn_desc 里的（原画 / 蓝光 / 超清 /
-    高清 / 流畅），服务端真给了 4K / 2K 就照实列出来。
+    档位来自 accept_qn；名字来自 g_qn_desc（会带上"1080P / 高帧率"这类信息）。
+    服务端实际给的 qn 也补进去，免得"能录的档位"在菜单里看不见。
     """
-    desc = {int(item[0]): str(item[1]) for item in (play.get("qn_desc") or [])}
-    accepted = [int(q) for q in (play.get("accept_qn") or []) if q]
-    pool = set(accepted) if len(set(accepted)) > 1 else set(LIVE_STANDARD_QN)
+    labels = {int(key): str(value) for key, value in (play.get("qn_labels") or {}).items()}
+    accepted = sorted({int(qn) for qn in (play.get("accept_qn") or []) if int(qn) > 0},
+                      reverse=True)
+    if not accepted:
+        accepted = sorted(labels, reverse=True)
     granted = int(play.get("qn") or 0)
-    if granted:
-        pool.add(granted)
-    return [(qn, desc.get(qn) or LIVE_QN_DESC.get(qn) or str(qn))
-            for qn in sorted(pool, reverse=True) if qn > 0]
+    if granted and granted not in accepted:
+        accepted.append(granted)
+        accepted.sort(reverse=True)
+    return [(qn, labels.get(qn) or live_qn_label(qn)) for qn in accepted]
 
 
 def live_snapshot(session: requests.Session, headers: dict, room_id: int, qn: int,
@@ -2965,6 +2981,7 @@ class LiveRecorder:
         self._switch = threading.Event()
         self._thread: threading.Thread | None = None
         self._qn_notice: set[int] = set()      # 同一次降档只提示一次，别每重连一次刷一行
+        self.qn_names: dict[int, str] = {}
         self._danmaku: _LiveDanmakuClient | None = None
         self._lock = threading.Lock()
         self._finish_lock = threading.Lock()
@@ -2983,9 +3000,11 @@ class LiveRecorder:
         end = self.finished_at or time.monotonic()
         return max(0.0, end - self.started_at)
 
+    qn_names: dict[int, str]
+
     def qn_label(self, qn: int | None = None) -> str:
         value = int(self._qn_now if qn is None else qn)
-        return live_qn_label(value)
+        return live_qn_label(value, self.qn_names)
 
     # ---- 生命周期 ----
 
@@ -3008,7 +3027,7 @@ class LiveRecorder:
             return
         self._want_qn = int(qn)
         self._switch.set()
-        self.log(f"[直播] 画质切换为 {self.qn_label(qn)}（当前分段收尾后生效）")
+        self.log(f"[直播] 请求切换到 {self.qn_label(qn)}（当前分段收尾后重新取流，实际以服务端为准）")
 
     def wait(self, timeout: float | None = None) -> bool:
         if self._thread:
@@ -3080,6 +3099,7 @@ class LiveRecorder:
                     self.log(f"[直播] 请求 {self.qn_label(self._want_qn)}"
                              f"（{self._want_qn}），服务端给到 {self.qn_label(got)}"
                              f"（{got}），按后者录制")
+                self.qn_names = {int(k): str(v) for k, v in (play.get("qn_labels") or {}).items()}
                 self.log(f"[直播] 拿到 {len(play.get('urls') or [])} 个播放节点，"
                          f"编码 {str(play.get('codec') or '?').upper()}，"
                          f"实际画质 {self.qn_label(got)}")
@@ -3467,27 +3487,29 @@ def codec_fits_container(codec: str, container: str) -> bool:
 
 VIDEO_SUFFIXES = {".mp4", ".mkv", ".flv", ".mov", ".ts", ".webm", ".avi", ".m4v"}
 
-# 直播画质：界面按分辨率说话，底下对到 B 站的 qn（老接口的档位名不再露给用户）
-LIVE_RESOLUTION_CHOICES: list[tuple[str, int]] = [
-    ("360p", 80),
-    ("480p", 150),
-    ("720p", 250),
-    ("1080p", 400),
-    ("4K", 20000),
-    ("8K", 30000),
-    ("原画（最高）", 10000),
-]
-LIVE_RESOLUTION_BY_QN: dict[int, str] = {qn: label for label, qn in LIVE_RESOLUTION_CHOICES}
-LIVE_QUALITY_HEIGHT: dict[str, int] = {"360p": 360, "480p": 480, "720p": 720,
-                                       "1080p": 1080, "4K": 2160, "8K": 4320}
-LIVE_DEFAULT_LABEL = "原画（最高）"
+# 直播画质：qn 的真实含义是 B 站接口里定的，30000 是「杜比」、20000 是「4K」，
+# 没有 8K 这一档（以前按 8K 写，日志就会说"选为 8K、实际 720P"）。
+# 界面只列这场直播 g_qn_desc / accept_qn 里真的有的档位，没有的不显示。
+LIVE_QN_DESC = {30000: "杜比", 20000: "4K", 15000: "2K", 10000: "原画",
+                400: "蓝光", 250: "超清", 150: "高清", 80: "流畅"}
+LIVE_QN_RESOLUTION = {
+    30000: "杜比", 20000: "4K", 15000: "2K",
+    10000: "1080P 原画", 400: "1080P 蓝光",
+    250: "720P 超清", 150: "高清", 80: "流畅",
+}
+LIVE_QN_HEIGHT = {30000: 2160, 20000: 2160, 15000: 1440, 10000: 1080,
+                  400: 1080, 250: 720, 150: 480, 80: 360}
+LIVE_DEFAULT_LABEL = "1080P 原画"
 
 
-def live_qn_label(qn: int | None) -> str:
-    """qn → 分辨率说法（日志和下拉框都用这套）。"""
+def live_qn_label(qn: int | None, names: dict | None = None) -> str:
+    """qn → 分辨率说法。names 是这场直播 g_qn_desc 带来的标签（含"高帧率"这类）。"""
     if not qn:
         return "未知"
-    return LIVE_RESOLUTION_BY_QN.get(int(qn)) or LIVE_QN_DESC.get(int(qn)) or f"qn={qn}"
+    value = int(qn)
+    if names and value in names:
+        return str(names[value])
+    return LIVE_QN_RESOLUTION.get(value) or LIVE_QN_DESC.get(value) or f"qn={value}"
 
 
 def ffplay_path() -> Path | None:
@@ -5873,7 +5895,11 @@ def run_gui(start_live: bool = False) -> int:
     def live_http() -> tuple[requests.Session, dict]:
         if live_state["session"] is None:
             live_state["session"] = build_session()
-            live_state["headers"] = live_headers(build_headers(load_sessdata()))
+        # 凭证每次都重新读：用户在主界面填了新的 SESSDATA 后，不用关掉录制直播窗口
+        sessdata = load_sessdata()
+        if live_state.get("sessdata") != sessdata or not live_state.get("headers"):
+            live_state["sessdata"] = sessdata
+            live_state["headers"] = live_headers(build_headers(sessdata))
         return live_state["session"], live_state["headers"]
 
     def live_save(**updates) -> None:
@@ -5905,7 +5931,7 @@ def run_gui(start_live: bool = False) -> int:
         win.minsize(min(px(880), screen_w - px(24)), min(px(620), screen_h - px(60)))
 
         stop_requested = live_state["stop_requested"]
-        quality = {"map": {}, "choices": []}
+        quality = {"map": {}, "choices": [], "labels": {}}
         qn_var = tk.StringVar()
         seg_var = tk.StringVar(value=str(live_cfg.get("segment_minutes") or LIVE_SEGMENT_MINUTES))
         out_var_live = tk.StringVar(value=str(live_cfg.get("output") or default_output()))
@@ -5945,21 +5971,26 @@ def run_gui(start_live: bool = False) -> int:
             return int(quality["map"].get(qn_var.get(), LIVE_DEFAULT_QN))
 
         def set_quality_choices(choices=None, granted: int = 0) -> None:
-            """画质下拉框按分辨率说话；默认沿用上次选的，没有就挑最高。"""
-            quality["map"] = {label: qn for label, qn in LIVE_RESOLUTION_CHOICES}
-            quality["choices"] = list(LIVE_RESOLUTION_CHOICES)
-            values = list(quality["map"].keys())
-            qn_combo.configure(values=values)
-            label = None
+            """画质下拉框只放这场直播真的有的档位；默认沿用上次选的，没有就挑最高。"""
+            if not choices:
+                choices = [(qn, live_qn_label(qn)) for qn in sorted(LIVE_QN_DESC, reverse=True)]
+            mapped = [(int(qn), str(label)) for qn, label in choices if int(qn) > 0]
+            quality["choices"] = mapped
+            quality["labels"] = {qn: label for qn, label in mapped}
+            quality["map"] = {label: qn for qn, label in mapped}
+            qn_combo.configure(values=[label for _qn, label in mapped])
             want = int(live_cfg.get("qn") or 0)
-            if want:
-                label = next((key for key, value in quality["map"].items()
-                              if value == want), None)
+            label = next((text for qn, text in mapped if qn == want), None)
+            if label is None and want:
+                fallback = mapped[0][1] if mapped else LIVE_DEFAULT_LABEL
+                append_live_log(f"[直播] 上次选的 {live_qn_label(want)} 这场直播没有，"
+                                f"已改为 {fallback}")
             if label is None and granted:
-                label = next((key for key, value in quality["map"].items()
-                              if value == int(granted)), None)
+                label = next((text for qn, text in mapped if qn == int(granted)), None)
             if label is None:
-                label = LIVE_DEFAULT_LABEL if LIVE_DEFAULT_LABEL in quality["map"] else values[0]
+                label = next((text for qn, text in mapped if qn == LIVE_DEFAULT_QN), None)
+            if label is None:
+                label = mapped[0][1] if mapped else LIVE_DEFAULT_LABEL
             qn_var.set(label)
 
         # ---- 顶部 ----
@@ -5967,7 +5998,7 @@ def run_gui(start_live: bool = False) -> int:
         head.pack(fill="x", padx=px(16), pady=(px(10), px(6)))
         tk.Label(head, text="录制直播", font=title_font, bg=GUI_BG,
                  fg=GUI_TEXT).pack(side="left")
-        tk.Label(head, text="画质按分辨率选（360p~8K）· 实时预览 · 弹幕单独保存 · 预约开播自动录",
+        tk.Label(head, text="画质只列这场直播支持的档位 · 实时预览 · 弹幕单独保存 · 预约开播自动录",
                  font=small_font, bg=GUI_BG, fg=GUI_SUB).pack(side="left", padx=px(12))
 
         body = tk.Frame(win, bg=GUI_BG)
@@ -6003,7 +6034,7 @@ def run_gui(start_live: bool = False) -> int:
         row1.pack(fill="x")
         tk.Label(row1, text="画质", font=small_font, bg=GUI_CARD, fg=GUI_SUB).pack(side="left")
         qn_combo = ttk.Combobox(row1, textvariable=qn_var, state="readonly",
-                                values=[label for label, _qn in LIVE_RESOLUTION_CHOICES],
+                                values=[LIVE_DEFAULT_LABEL],
                                 width=14)
         qn_combo.pack(side="left", padx=(px(6), px(14)))
         qn_combo.bind("<<ComboboxSelected>>", lambda _e: on_quality_change())
@@ -6121,7 +6152,8 @@ def run_gui(start_live: bool = False) -> int:
         def on_quality_change() -> None:
             rec = live_state.get("rec")
             qn = current_qn()
-            append_live_log(f"[直播] 画质选为 {qn_var.get()}（qn={qn}）")
+            append_live_log(f"[直播] 已选 {qn_var.get()}（qn={qn}），"
+                            f"重新取流后以实际画质为准")
             if rec and rec.running:
                 rec.switch_quality(qn)
             live_save(qn=qn)
@@ -6132,17 +6164,37 @@ def run_gui(start_live: bool = False) -> int:
             if play:
                 set_quality_choices(live_quality_choices(play), int(play.get("qn") or 0))
                 got, want = int(play.get("qn") or 0), int(play.get("want_qn") or 0)
+                live_state["stream_qn"] = got
                 if got and want and got < want:
-                    append_live_log(
-                        f"[直播] 请求 {live_qn_label(want)}（qn={want}），"
-                        f"服务端只给到 {live_qn_label(got)}（qn={got}）；"
-                        f"没登录 SESSDATA 或账号权限不够时会被降档")
+                    accept = [int(qn) for qn in (play.get("accept_qn") or [])]
+                    if want not in accept:
+                        append_live_log(
+                            f"[直播] 这场直播没有 {live_qn_label(want, play.get('qn_labels'))} 这一档，"
+                            f"最高 {live_qn_label(got, play.get('qn_labels'))}（qn={got}），按它录制")
+                    else:
+                        append_live_log(
+                            f"[直播] 请求 {live_qn_label(want, play.get('qn_labels'))}（qn={want}），"
+                            f"服务端只给到 {live_qn_label(got, play.get('qn_labels'))}（qn={got}），按后者录制")
+                        account = live_state.get("account") or {}
+                        if account and not account.get("login"):
+                            append_live_log(
+                                "[直播] 当前未登录（SESSDATA 为空或已失效），B 站只放 720P；"
+                                "登录 / 更新凭证后可解锁 1080P 原画（高帧率）")
+                        elif account and not account.get("vip"):
+                            append_live_log(
+                                "[直播] 已登录，但这个档位需要大会员 / 更高权限，"
+                                "服务端最高只给到上面这一档")
             else:
-                set_quality_choices(sorted(((qn, LIVE_QN_DESC.get(qn, str(qn)))
-                                            for qn in LIVE_QN_DESC), reverse=True))
+                set_quality_choices([(qn, live_qn_label(qn))
+                                     for qn in sorted(LIVE_QN_DESC, reverse=True)])
             state_text = {1: "直播中", 2: "轮播中", 0: "未开播"}.get(room["live_status"], "未知")
+            login_text = ""
+            account = live_state.get("account") or {}
+            if account:
+                login_text = "\n已登录" if account.get("login") else "\n未登录（B 站最高只放 720P，填 SESSDATA 可解锁 1080P 原画）"
             info_var.set(f"{room.get('uname') or ''}  ·  {room.get('title') or ''}\n"
-                         f"{state_text}  ·  在线 {room.get('online') or 0}  ·  {room.get('area') or ''}")
+                         f"{state_text}  ·  在线 {room.get('online') or 0}  ·  {room.get('area') or ''}"
+                         f"{login_text}")
             status_var_live.set(f"已读取（{state_text}）")
             append_live_log(f"[房间] {room.get('uname') or '?'} / 房间 {room.get('room_id')}："
                             f"{room.get('title') or '（无标题）'}")
@@ -6152,8 +6204,10 @@ def run_gui(start_live: bool = False) -> int:
                 accept = play.get("accept_qn") or []
                 if accept:
                     append_live_log("[房间] 服务端可用画质：" +
-                                    " / ".join(live_qn_label(int(qn)) for qn in accept))
-                append_live_log(f"[房间] 本次拿到的直播流：{live_qn_label(int(play.get('qn') or 0))}"
+                                    " / ".join(live_qn_label(int(qn), play.get("qn_labels"))
+                                                for qn in accept))
+                append_live_log(f"[房间] 本次拿到的直播流："
+                                f"{live_qn_label(int(play.get('qn') or 0), play.get('qn_labels'))}"
                                 f"，编码 {str(play.get('codec') or '?').upper()}")
             if not live_state.get("out_custom"):
                 # 默认落到 <桌面>/<直播间名称>/，录制时直接建好目录
@@ -6191,6 +6245,7 @@ def run_gui(start_live: bool = False) -> int:
                 try:
                     session, headers = live_http()
                     room = live_room_info(session, headers, room_id)
+                    live_state["account"] = probe_account(session, headers, 5)
                     play = None
                     if room["live_status"] == 1:
                         try:
@@ -6240,6 +6295,7 @@ def run_gui(start_live: bool = False) -> int:
                 messagebox.showerror("无法开始录制", short_error(exc, 300), parent=win)
                 return
             live_state["rec"] = recorder
+            recorder.qn_names = dict(quality.get("labels") or {})
             recorder.start()
             stop_requested["value"] = False
             threading.Thread(target=watch_self_end, args=(recorder,),
@@ -6365,8 +6421,9 @@ def run_gui(start_live: bool = False) -> int:
             preview_hint.configure(text="")
             if player.play(url, width=width, height=height, vf_height=480, volume=0,
                            headers=header_blob(headers)):
-                status_var_live.set(f"实时预览中 · {live_qn_label(got_qn)} → 本地压到 480p")
-                append_live_log(f"[预览] 已接入实时画面：源 {live_qn_label(got_qn)}，"
+                qn_text = quality["labels"].get(int(got_qn)) or live_qn_label(got_qn)
+                status_var_live.set(f"实时预览中 · {qn_text} → 本地压到 480p")
+                append_live_log(f"[预览] 已接入实时画面：源 {qn_text}，"
                                 f"本地压缩到 480p 播放")
             else:
                 preview_hint.configure(text="预览不可用（缺 ffplay）")
@@ -6406,9 +6463,9 @@ def run_gui(start_live: bool = False) -> int:
         live_state.setdefault("big_height", 480)
 
         def record_height_cap() -> int:
-            """录制分辨率上限：选了 1080p 就别拿 4K 去预览。"""
-            label = qn_var.get()
-            return LIVE_QUALITY_HEIGHT.get(label, 2160)
+            """录制分辨率上限：按服务端实际给的 qn 算，别拿 4K 去预览 720P 的流。"""
+            qn_now = int(live_state.get("stream_qn") or 0) or current_qn()
+            return LIVE_QN_HEIGHT.get(qn_now, 1080)
 
         def screen_height_cap() -> int:
             return max(240, screen_h - px(48))
@@ -6524,7 +6581,7 @@ def run_gui(start_live: bool = False) -> int:
             menu.add_cascade(label="预览分辨率", menu=preview_menu)
 
             rec_menu = tk.Menu(menu, tearoff=0, font=small_font)
-            for label, qn in LIVE_RESOLUTION_CHOICES:
+            for qn, label in (quality.get("choices") or []):
                 rec_menu.add_command(
                     label=label,
                     command=lambda text=label, value=qn: (
