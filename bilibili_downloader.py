@@ -408,8 +408,36 @@ def desktop_dir() -> Path:
     return desktop if desktop.is_dir() else Path.home()
 
 
+SETTINGS_NAME = "settings.json"
+
+
+def app_settings_path() -> Path:
+    return user_config_dir() / SETTINGS_NAME
+
+
+def load_app_settings() -> dict:
+    try:
+        data = json.loads(app_settings_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_app_settings(updates: dict) -> None:
+    data = load_app_settings()
+    data.update(updates)
+    path = app_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_text_atomic(path, json.dumps(data, ensure_ascii=False, indent=2))
+
+
 def default_output() -> Path:
-    """默认保存根目录：桌面。"""
+    """默认保存根目录：设置里指定的目录优先，没设置才用桌面。"""
+    configured = str(load_app_settings().get("default_output") or "").strip()
+    if configured:
+        path = Path(os.path.expandvars(configured)).expanduser()
+        if path.is_dir():
+            return path
     return desktop_dir()
 
 
@@ -2197,7 +2225,7 @@ def parse_live_room_id(text: str) -> int:
     if raw.isdigit():
         return int(raw)
     for pattern in (
-        r"live\.bilibili\.com/(?:h5/)?(\d{3,})",
+        r"live\.bilibili\.com/(?:h5/)?(\d+)",
         r"(?:room_?id|roomid|rid)=(\d{3,})",
         r"/(\d{5,})(?:[/?#]|$)",
     ):
@@ -3283,8 +3311,22 @@ class LiveRecorder:
         """
         out = self.base.with_name(f"{self.base.name}.mp4")
         expected = self._expected_seconds()
+        # 切画质切得太快会留下只有 13 字节 FLV 头的空段，ffmpeg 读到它会让整场拼不出来
+        usable = []
+        for item in self.segments:
+            try:
+                if item["path"].exists() and item["path"].stat().st_size > 2048:
+                    usable.append(item)
+                else:
+                    self.log(f"[直播] 跳过空分段：{item['path'].name}")
+            except OSError:
+                pass
+        if not usable:
+            self.log("[直播] 没有可拼接的分段")
+            result["error"] = "没有可拼接的分段"
+            return [item["path"] for item in self.segments]
         choices = []
-        if len(self.segments) == 1:
+        if len(usable) == 1:
             choices.append(("单段封装", self._remux_one))     # 只有一段时没必要转 TS
         choices += [("TS 中转", self._concat_via_ts), ("直接拼接", self._concat)]
         # 断网/强退时最后半截包必然丢掉，容 10 秒；短视频按一半算，
@@ -3295,7 +3337,7 @@ class LiveRecorder:
             tmp = out.with_name(f"{out.stem}.candidate{index}.mp4")
             try:
                 tmp.unlink(missing_ok=True)
-                merge(self.segments, tmp, "拼接直播分段失败")
+                merge(usable, tmp, "拼接直播分段失败")
                 got = probe_timespan_or_none(tmp) or 0.0
                 if expected >= 5 and not (low <= got <= expected * 1.1 + 15):
                     raise DownloadError(f"只拼出 {got:.1f} 秒，应为 {expected:.1f} 秒")
@@ -3323,7 +3365,7 @@ class LiveRecorder:
             size_text = human_size(out.stat().st_size)
         except OSError:
             size_text = "?"
-        self.log(f"[直播] 已合成 {len(self.segments)} 段，时长 {got / 60:.1f} 分钟，"
+        self.log(f"[直播] 已合成 {len(usable)} 段，时长 {got / 60:.1f} 分钟，"
                  f"文件 {size_text}（{out.name}）")
         if not self.keep_segments:
             for item in self.segments:
@@ -3512,6 +3554,44 @@ def live_qn_label(qn: int | None, names: dict | None = None) -> str:
     return LIVE_QN_RESOLUTION.get(value) or LIVE_QN_DESC.get(value) or f"qn={value}"
 
 
+def physical_screen_size() -> tuple[int, int] | None:
+    """真实像素的屏幕尺寸。
+
+    Tk 在显示缩放 150% 时 winfo_screenwidth() 会返回 1280×720（逻辑值），
+    拿它当"屏幕分辨率"就会把 1080p 预览误判成超屏。这里直接问显示模式。
+    """
+    if not IS_WIN:
+        return None
+    try:
+        from ctypes import wintypes
+
+        class _DevMode(_ct.Structure):
+            _fields_ = [
+                ("dmDeviceName", _ct.c_wchar * 32),
+                ("dmSpecVersion", wintypes.WORD), ("dmDriverVersion", wintypes.WORD),
+                ("dmSize", wintypes.WORD), ("dmDriverExtra", wintypes.WORD),
+                ("dmFields", wintypes.DWORD),
+                ("dmPositionX", _ct.c_long), ("dmPositionY", _ct.c_long),
+                ("dmDisplayOrientation", wintypes.DWORD),
+                ("dmDisplayFixedOutput", wintypes.DWORD),
+                ("dmColor", _ct.c_short), ("dmDuplex", _ct.c_short),
+                ("dmYResolution", _ct.c_short), ("dmTTOption", _ct.c_short),
+                ("dmCollate", _ct.c_short), ("dmFormName", _ct.c_wchar * 32),
+                ("dmLogPixels", wintypes.WORD), ("dmBitsPerPel", wintypes.DWORD),
+                ("dmPelsWidth", wintypes.DWORD), ("dmPelsHeight", wintypes.DWORD),
+                ("dmDisplayFlags", wintypes.DWORD), ("dmDisplayFrequency", wintypes.DWORD),
+            ]
+
+        mode = _DevMode()
+        mode.dmSize = _ct.sizeof(mode)
+        if _ct.windll.user32.EnumDisplaySettingsW(None, -1, _ct.byref(mode)):
+            if mode.dmPelsWidth and mode.dmPelsHeight:
+                return int(mode.dmPelsWidth), int(mode.dmPelsHeight)
+    except Exception:
+        pass
+    return None
+
+
 def ffplay_path() -> Path | None:
     """预览要用 ffplay（和 ffmpeg 同一个目录）。找不到就返回 None。"""
     if sys.platform == "win32":
@@ -3648,6 +3728,131 @@ else:
         return False
 
 
+class FlvTailFeeder:
+    """把正在录制的 FLV 文件当直播源喂给 ffplay。
+
+    录制线程收到什么字节、落盘什么字节，这里就原样喂什么：不重新拉流、
+    不单独下载。先送文件头 + 音视频配置标签，再从当前文件尾持续送新增数据。
+    打开预览时已经录了很久也不追旧数据，直接从最新位置开始，等下一个关键帧出画面。
+    """
+
+    def __init__(self, path: Path, log: Callable[[str], None] = lambda _t: None) -> None:
+        self.path = Path(path)
+        self.log = log
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self, stdin) -> None:
+        self._thread = threading.Thread(target=self._run, args=(stdin,),
+                                        name="live-feed", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=0.5)
+
+    def _run(self, stdin) -> None:
+        header = b""
+        deadline = time.monotonic() + 30
+        while not self._stop.is_set() and time.monotonic() < deadline:
+            try:
+                if self.path.exists() and self.path.stat().st_size >= 13:
+                    with open(self.path, "rb") as fp:
+                        header = fp.read(13)
+                    if header[:3] == b"FLV":
+                        break
+            except OSError:
+                pass
+            time.sleep(0.05)
+        if not header or header[:3] != b"FLV":
+            return
+        prefix = self._init_prefix()
+        try:
+            stdin.write(prefix)
+            stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            return
+        try:
+            with open(self.path, "rb") as fp:
+                # 从最后一个完整 FLV 标签的开头开始送：文件可能正写到半个标签，
+                # 直接按字节位置接进去会让 ffplay 解复用错位、一直黑屏。
+                fp.seek(self._safe_tail_start())
+                while not self._stop.is_set():
+                    chunk = fp.read(256 * 1024)
+                    if chunk:
+                        stdin.write(chunk)
+                        stdin.flush()
+                        continue
+                    if not self.path.exists():
+                        break
+                    time.sleep(0.03)
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    def _safe_tail_start(self) -> int:
+        """最后一个完整标签的起始偏移；没有完整标签就从文件头后开始。"""
+        try:
+            size = self.path.stat().st_size
+            with open(self.path, "rb") as fp:
+                pos, last = 13, 13
+                while pos + 11 <= size:
+                    fp.seek(pos)
+                    tag = fp.read(11)
+                    if len(tag) < 11:
+                        break
+                    data_size = int.from_bytes(tag[1:4], "big")
+                    end = pos + 11 + data_size + 4
+                    if end > size:
+                        break
+                    last, pos = pos, end
+                return last
+        except OSError:
+            return 13
+
+    def _init_prefix(self) -> bytes:
+        """FLV 头 + 元数据 + 首个视频/音频配置标签。"""
+        try:
+            size = self.path.stat().st_size
+            with open(self.path, "rb") as fp:
+                head = fp.read(13)
+                if head[:3] != b"FLV":
+                    return b""
+                out = bytearray(head)
+                pos = 13
+                got_video = got_audio = got_meta = False
+                limit = min(size, 13 + 2 * 1024 * 1024)
+                while pos + 11 <= limit:
+                    fp.seek(pos)
+                    tag = fp.read(11)
+                    if len(tag) < 11:
+                        break
+                    kind = tag[0]
+                    data_size = int.from_bytes(tag[1:4], "big")
+                    body = fp.read(min(data_size, 64))
+                    end = pos + 11 + data_size + 4
+                    take = False
+                    if kind == 18 and not got_meta:
+                        take = got_meta = True
+                    elif kind == 9 and not got_video:
+                        # AVCPacketType=0 才是 sequence header（1 是普通帧，2 是结束）
+                        if data_size >= 2 and body[1:2] == b"\x00":
+                            take = got_video = True
+                    elif kind == 8 and not got_audio:
+                        if data_size >= 2 and body[1:2] == b"\x00":
+                            take = got_audio = True
+                    if take:
+                        fp.seek(pos)
+                        out += fp.read(end - pos)
+                    pos = end
+                    if got_video and got_audio:
+                        break
+                return bytes(out)
+        except OSError:
+            return b""
+
+
 class EmbeddedPlayer:
     """把 ffplay 的窗口塞进 Tk 控件：真视频、真声音、真直播，不逐帧转图片。
 
@@ -3666,6 +3871,7 @@ class EmbeddedPlayer:
         self.vf_height: int | None = None
         self.volume = 0
         self.headers = ""
+        self.feeder: "FlvTailFeeder | None" = None
         self._stamp = 0
 
     @property
@@ -3726,6 +3932,60 @@ class EmbeddedPlayer:
         threading.Thread(target=waiter, name="live-preview-attach", daemon=True).start()
         return True
 
+    def play_feed(self, path: Path, *, width: int, height: int,
+                  vf_height: int | None = None, volume: int = 0) -> bool:
+        """播放正在录制的 FLV 文件（只读录制接收的数据，不再单独拉流）。"""
+        self.stop()
+        exe = ffplay_path()
+        if exe is None:
+            self.log("[预览] 找不到 ffplay.exe（它和 ffmpeg 在同一个目录），实时预览不可用")
+            return False
+        self.url, self.size, self.vf_height, self.volume = f"feed:{path}", (width, height), vf_height, volume
+        self.headers = ""
+        self._stamp += 1
+        stamp = self._stamp
+        args = [str(exe), "-hide_banner", "-loglevel", "error",
+                "-window_title", self.title, "-noborder",
+                "-x", str(int(width)), "-y", str(int(height)),
+                "-volume", str(int(volume)),
+                "-fflags", "nobuffer", "-flags", "low_delay"]
+        if vf_height:
+            args += ["-vf", f"scale=-2:{int(vf_height)}"]
+        args += ["-f", "flv", "-i", "pipe:0"]
+        env = os.environ.copy()
+        env["SDL_MOUSE_FOCUS_CLICKTHROUGH"] = "1"
+        env["SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH"] = "1"
+        try:
+            self.proc = subprocess.Popen(args, stdin=subprocess.PIPE,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                         env=env, **child_proc_kwargs())
+            _track_player(self.proc)
+        except Exception as exc:
+            self.log(f"[预览] 起播失败：{short_error(exc)}")
+            return False
+        feeder = FlvTailFeeder(path, log=self.log)
+        self.feeder = feeder
+        feeder.start(self.proc.stdin)
+
+        def waiter() -> None:
+            hwnd = None
+            for _ in range(80):
+                if self._stamp != stamp:
+                    return
+                if self.proc is None or self.proc.poll() is not None:
+                    break
+                hwnd = find_window_by_title(self.title)
+                if hwnd:
+                    break
+                time.sleep(0.1)
+            if hwnd is None:
+                self.post(lambda: self.log("[预览] 播放窗口没等出来（可能 ffplay 起不来）"))
+                return
+            self.post(lambda: self._attach(hwnd, stamp))
+
+        threading.Thread(target=waiter, name="live-preview-attach", daemon=True).start()
+        return True
+
     def _attach(self, hwnd: int, stamp: int) -> None:
         if stamp != self._stamp:
             return
@@ -3746,6 +4006,9 @@ class EmbeddedPlayer:
 
     def stop(self) -> None:
         self._stamp += 1
+        feeder, self.feeder = self.feeder, None
+        if feeder is not None:
+            feeder.stop()
         proc, hwnd = self.proc, self.hwnd
         self.proc, self.hwnd = None, None
         if hwnd and sys.platform == "win32":
@@ -3756,6 +4019,7 @@ class EmbeddedPlayer:
         if proc is not None:
             _untrack_player(proc)
             force_kill_process(proc)
+        taskkill_window(self.title)
 
 
 _PLAYER_LOCK = threading.Lock()
@@ -3776,20 +4040,40 @@ def _untrack_player(proc) -> None:
 
 
 def force_kill_process(proc, timeout: float = 3.0) -> None:
-    """ffplay 常常不认普通关闭，直接 TerminateProcess，再补一刀 taskkill /F /PID /T。"""
+    """ffplay 常常不认普通关闭：proc.kill() 之后**无条件**再 taskkill /F /T /PID。
+
+    只靠 Popen.kill() 在部分机器上会留下僵尸 ffplay（窗口关了、声音还在）。
+    """
     if proc is None:
         return
+    pid = getattr(proc, "pid", None)
     try:
         if proc.poll() is None:
             proc.kill()
-        proc.wait(timeout=timeout)
-        return
     except Exception:
         pass
+    if pid:
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=timeout,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception:
+            pass
     try:
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        proc.wait(timeout=timeout)
+    except Exception:
+        pass
+
+
+def taskkill_window(title: str) -> None:
+    """按窗口标题再补一刀：句柄丢了也不会留下孤儿 ffplay。"""
+    if not title:
+        return
+    try:
+        subprocess.run(["taskkill", "/F", "/FI", f"WINDOWTITLE eq {title}"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except Exception:
         pass
 
@@ -5533,6 +5817,8 @@ def run_gui(start_live: bool = False) -> int:
              fg=GUI_TEXT).pack(side="left")
     tk.Label(header, text="DASH 音视频 · 弹幕 · MKV 软字幕 / 烧录", font=small_font,
              bg=GUI_BG, fg=GUI_SUB).pack(side="left", padx=(px(12), 0), pady=(px(7), 0))
+    _RoundedButton(header, "设置", kind="ghost", width=64, height=28,
+                   command=lambda: open_settings()).pack(side="right")
 
     # ---------------- 主体两栏 ----------------
     main = tk.Frame(root, bg=GUI_BG)
@@ -5659,6 +5945,83 @@ def run_gui(start_live: bool = False) -> int:
     tk.Label(ob, text="保存到", font=bold_font, bg=GUI_CARD, fg=GUI_TEXT).grid(
         row=0, column=0, sticky="w", pady=(0, px(8)))
     out_var = tk.StringVar(value=str(default_output()))
+
+    def open_settings() -> None:
+        dlg = tk.Toplevel(root)
+        dlg.title("设置")
+        apply_window_icon(dlg)
+        dlg.configure(bg=GUI_BG)
+        dlg.resizable(False, False)
+        dlg.transient(root)
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+        body = tk.Frame(dlg, bg=GUI_BG, padx=px(18), pady=px(16))
+        body.pack(fill="both", expand=True)
+        tk.Label(body, text="默认保存位置", font=bold_font, bg=GUI_BG,
+                 fg=GUI_TEXT).pack(anchor="w")
+        tk.Label(body, text="视频、直播录像、MP3 默认都放这里；具体任务里仍可临时改。",
+                 font=small_font, bg=GUI_BG, fg=GUI_SUB).pack(anchor="w", pady=(px(4), px(10)))
+        path_var = tk.StringVar(value=str(default_output()))
+        row = tk.Frame(body, bg=GUI_BG)
+        row.pack(fill="x")
+        tk.Entry(row, textvariable=path_var, font=small_font, relief="flat",
+                 bg="#FAFAFA", fg=GUI_TEXT, insertbackground=GUI_TEXT, width=42,
+                 highlightthickness=1, highlightbackground=GUI_BORDER,
+                 highlightcolor=GUI_ACCENT).pack(side="left", fill="x", expand=True,
+                                               ipady=px(4), padx=(0, px(8)))
+
+        def pick() -> None:
+            chosen = filedialog.askdirectory(parent=dlg,
+                                              initialdir=path_var.get() or str(desktop_dir()))
+            if chosen:
+                path_var.set(chosen)
+
+        _RoundedButton(row, "浏览", kind="secondary", width=58, height=28,
+                       command=pick).pack(side="left")
+
+        def use_desktop() -> None:
+            path_var.set(str(desktop_dir()))
+
+        def save() -> None:
+            value = path_var.get().strip()
+            if not value:
+                messagebox.showwarning("默认保存位置", "路径不能为空。", parent=dlg)
+                return
+            target = Path(os.path.expandvars(value)).expanduser()
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                messagebox.showerror("默认保存位置", f"这个目录不能用：\n{short_error(exc, 200)}",
+                                     parent=dlg)
+                return
+            try:
+                save_app_settings({"default_output": str(target)})
+            except OSError as exc:
+                messagebox.showerror("设置", f"写入设置失败：\n{short_error(exc, 200)}", parent=dlg)
+                return
+            out_var.set(str(target))
+            # 直播窗口没自定义过目录时，也跟着换到新的默认位置
+            try:
+                lw = live_state.get("win")
+                if lw is not None and lw.winfo_exists() and not live_state.get("out_custom"):
+                    out_var_live.set(str(target))
+            except Exception:
+                pass
+            dlg.destroy()
+            messagebox.showinfo("设置", f"默认保存位置已改为：\n{target}", parent=root)
+
+        buttons = tk.Frame(body, bg=GUI_BG)
+        buttons.pack(fill="x", pady=(px(14), 0))
+        _RoundedButton(buttons, "恢复桌面", kind="ghost", width=86, height=30,
+                       command=use_desktop).pack(side="left")
+        _RoundedButton(buttons, "取消", kind="ghost", width=64, height=30,
+                       command=dlg.destroy).pack(side="right")
+        _RoundedButton(buttons, "保存", kind="accent", width=72, height=30,
+                       command=save).pack(side="right", padx=(0, px(8)))
+        dlg.update_idletasks()
+        dlg.geometry(f"+{root.winfo_rootx() + px(220)}+{root.winfo_rooty() + px(160)}")
     out_row = tk.Frame(ob, bg=GUI_CARD)
     out_row.grid(row=0, column=1, columnspan=5, sticky="ew", pady=(0, px(8)))
     tk.Entry(out_row, textvariable=out_var, font=small_font, relief="flat",
@@ -6076,7 +6439,7 @@ def run_gui(start_live: bool = False) -> int:
                        command=lambda: open_folder(out_var_live.get())).pack(side="left")
 
         # ---- 预览（实时画面：ffplay 直接嵌进来，本地压到 480p） ----
-        prev_panel = make_panel(right, "预览（实时 · 本地压到 480p）")
+        prev_panel = make_panel(right, "预览（实时 · 录制时同步录制流）")
         prev_row = tk.Frame(prev_panel, bg=GUI_CARD)
         prev_row.pack(fill="both", expand=True)
         holder = tk.Frame(prev_row, bg="#101418", width=px(236), height=px(133))
@@ -6302,7 +6665,7 @@ def run_gui(start_live: bool = False) -> int:
                              name="live-self-end", daemon=True).start()
             start_btn_live.set_enabled(False)
             stop_btn.set_enabled(True)
-            stop_preview("录制中，预览已暂停（省带宽，避免和录制抢流）")
+            start_record_preview()
             append_live_log(
                 f"[直播] 开始录制：{room.get('title') or room.get('ref_id')}  "
                 f"画质 {qn_var.get()}  分段 {minutes} 分钟  目录 {dest_dir}")
@@ -6322,6 +6685,10 @@ def run_gui(start_live: bool = False) -> int:
             if stop_requested["value"] or live_state.get("rec") is not recorder:
                 return                        # 用户点了停止，收尾由 stop_record 那条路负责
             try:
+                pause_preview_for_finish()
+            except Exception:
+                pass
+            try:
                 result = recorder.finish()
             except Exception as exc:
                 text = f"[直播] 中断后收尾失败：{short_error(exc)}\n（分段保留在原处，可用「合并视频」手动拼）"
@@ -6331,6 +6698,7 @@ def run_gui(start_live: bool = False) -> int:
 
         def after_stop(result: dict, note: str = "") -> None:
             live_state["rec"] = None
+            live_state["feed_path"] = ""
             start_btn_live.set_enabled(True)
             stop_btn.set_enabled(False)
             status_var_live.set("已停止")
@@ -6354,10 +6722,26 @@ def run_gui(start_live: bool = False) -> int:
             except tk.TclError:
                 pass
 
+        def pause_preview_for_finish() -> None:
+            """合并分段前先关掉预览：Windows 下 ffplay/读文件线程占着 .flv 就删不掉。"""
+            try:
+                player.stop()
+            except Exception:
+                pass
+            try:
+                bp = live_state.get("big_player")
+                if bp is not None:
+                    bp.stop()
+            except Exception:
+                pass
+            live_state["feed_path"] = ""
+            time.sleep(0.35)   # 等文件句柄真正释放（ffplay 被杀后 feeder 线程才退）
+
         def stop_record() -> None:
             rec = live_state.get("rec")
             if not rec or not rec.running:
                 return
+            pause_preview_for_finish()
             stop_requested["value"] = True
             stop_btn.set_enabled(False)
             status_var_live.set("正在收尾：停弹幕、拼分段…")
@@ -6386,7 +6770,8 @@ def run_gui(start_live: bool = False) -> int:
                 return
             rec = live_state.get("rec")
             if rec and rec.running:
-                return                      # 录制期间不预览：省带宽，别和录制抢流
+                start_record_preview()      # 录制中：预览录制线程收到的同一路数据
+                return
             if live_state.get("preview_starting"):
                 return
             live_state["preview_starting"] = True
@@ -6427,6 +6812,13 @@ def run_gui(start_live: bool = False) -> int:
                                 f"本地压缩到 480p 播放")
             else:
                 preview_hint.configure(text="预览不可用（缺 ffplay）")
+            big = live_state.get("big")
+            if big is not None:
+                try:
+                    if big.winfo_exists():
+                        start_big_stream()
+                except Exception:
+                    pass
 
         def preview_failed(exc: Exception) -> None:
             preview_hint.configure(text="预览失败")
@@ -6439,6 +6831,68 @@ def run_gui(start_live: bool = False) -> int:
             if note:
                 preview_hint.configure(text=note)
                 append_live_log(f"[预览] {note}")
+
+        def record_feed_path() -> "Path | None":
+            rec = live_state.get("rec")
+            if not rec or not getattr(rec, "running", False):
+                return None
+            segments = getattr(rec, "segments", None) or []
+            if not segments:
+                return None
+            return Path(segments[-1]["path"])
+
+        def start_record_preview(reason: str = "") -> None:
+            """预览正在录制的那一路：读录制线程刚写下的 FLV，不另开拉流。"""
+            rec = live_state.get("rec")
+            if not rec or not getattr(rec, "running", False):
+                start_preview()
+                return
+            path = record_feed_path()
+            if path is None:
+                preview_hint.configure(text="录制流准备中…")
+                try:
+                    win.after(800, lambda: start_record_preview(reason))
+                except tk.TclError:
+                    pass
+                return
+            live_state["feed_path"] = str(path)
+            live_state["feed_qn"] = int(getattr(rec, "_qn_now", 0) or 0)
+            width, height = preview_geometry()
+            preview_hint.configure(text="")
+            if player.play_feed(path, width=width, height=height, vf_height=480, volume=0):
+                label = rec.qn_label()
+                status_var_live.set(f"录制同步预览 · {label} → 本地压到 480p（和录制同一路数据）")
+                append_live_log(f"[预览] 播放录制流：{label}；只读录制线程已收到的数据，"
+                                f"不重新拉流{(('（' + reason + '）') if reason else '')}")
+            else:
+                preview_hint.configure(text="预览不可用（缺 ffplay）")
+            big = live_state.get("big")
+            if big is not None:
+                try:
+                    if big.winfo_exists():
+                        start_big_stream()
+                except Exception:
+                    pass
+
+        def feed_watch() -> None:
+            """录制分段切换 / 录完切回实时流，预览跟着换，不用手动关开。"""
+            try:
+                if not win.winfo_exists():
+                    return
+            except Exception:
+                return
+            rec = live_state.get("rec")
+            if rec and getattr(rec, "running", False):
+                path = record_feed_path()
+                if path is not None and str(path) != live_state.get("feed_path"):
+                    start_record_preview("录制分段切换")
+            elif live_state.get("feed_path"):
+                live_state["feed_path"] = ""
+                start_preview()
+            try:
+                win.after(3000, feed_watch)
+            except tk.TclError:
+                pass
 
         def preview_watch() -> None:
             """播放器自己挂了（地址过期 / 网络断）就自动重连，不回到"每 12 秒一张图"。"""
@@ -6462,13 +6916,23 @@ def run_gui(start_live: bool = False) -> int:
         live_state.setdefault("big_volume", 60)
         live_state.setdefault("big_height", 480)
 
+        big_screen_w, big_screen_h = physical_screen_size() or (screen_w, screen_h)
+
         def record_height_cap() -> int:
-            """录制分辨率上限：按服务端实际给的 qn 算，别拿 4K 去预览 720P 的流。"""
-            qn_now = int(live_state.get("stream_qn") or 0) or current_qn()
+            """录制分辨率上限：录制中按录制线程实际拿到的 qn，平时按预览实际拿到的 qn。"""
+            rec = live_state.get("rec")
+            qn_now = 0
+            if rec is not None and getattr(rec, "running", False):
+                qn_now = int(getattr(rec, "_qn_now", 0) or 0)
+            if not qn_now:
+                qn_now = int(live_state.get("stream_qn") or 0)
+            if not qn_now:
+                qn_now = current_qn()
             return LIVE_QN_HEIGHT.get(qn_now, 1080)
 
         def screen_height_cap() -> int:
-            return max(240, screen_h - px(48))
+            # 预览分辨率不能超过屏幕：1080P 屏就应该能选 1080p，别先扣掉 48px
+            return max(240, big_screen_h)
 
         def allowed_preview_heights() -> list[tuple[int, str]]:
             cap = min(record_height_cap(), screen_height_cap())
@@ -6477,9 +6941,10 @@ def run_gui(start_live: bool = False) -> int:
             return [(h, label) for h, label in items if h <= cap]
 
         def big_geometry(height: int) -> tuple[int, int]:
+            # 不超屏：宽度最多等于屏幕宽（1080p 屏正好 1920×1080），不再留 20px 边距导致 1080 被挤成 1063
             width = int(round(height * 16 / 9))
-            if width > screen_w - px(20):
-                width = max(320, screen_w - px(20))
+            if width > big_screen_w:
+                width = max(320, big_screen_w)
                 height = int(round(width * 9 / 16))
             return width, height
 
@@ -6506,17 +6971,23 @@ def run_gui(start_live: bool = False) -> int:
                 return
             width, height = big_geometry(height)
             live_state["big_height"] = height
-            big.geometry(f"{width}x{height}+{(screen_w - width) // 2}+"
-                         f"{max(0, (screen_h - height) // 2 - px(20))}")
+            big.geometry(f"{width}x{height}+{(big_screen_w - width) // 2}+"
+                         f"{max(0, (big_screen_h - height) // 2)}")
             holder2 = live_state.get("big_holder")
             if holder2 is not None:
                 holder2.configure(width=width, height=height)
             player2.resize(width, height)
-            url = live_state.get("preview_url") or ""
-            if url:
-                player2.play(url, width=width, height=height, vf_height=height,
-                             volume=int(live_state.get("big_volume") or 0),
-                             headers=header_blob(live_state.get("preview_headers") or {}))
+            rec = live_state.get("rec")
+            path = live_state.get("feed_path") or record_feed_path()
+            if rec and getattr(rec, "running", False) and path:
+                player2.play_feed(Path(path), width=width, height=height, vf_height=height,
+                                  volume=int(live_state.get("big_volume") or 0))
+            else:
+                url = live_state.get("preview_url") or ""
+                if url:
+                    player2.play(url, width=width, height=height, vf_height=height,
+                                 volume=int(live_state.get("big_volume") or 0),
+                                 headers=header_blob(live_state.get("preview_headers") or {}))
             append_live_log(f"[预览] 放大窗口改为 {width}×{height}")
 
         def start_big_stream() -> None:
@@ -6530,18 +7001,32 @@ def run_gui(start_live: bool = False) -> int:
                 if hint2 is not None:
                     hint2.configure(text="直播间没开播")
                 return
+            height = int(live_state.get("big_height") or 480)
+            width, height = big_geometry(height)
             if rec and rec.running:
+                path = live_state.get("feed_path") or record_feed_path()
+                if path is None:
+                    if hint2 is not None:
+                        hint2.configure(text="录制流准备中…")
+                    try:
+                        win.after(800, start_big_stream)
+                    except tk.TclError:
+                        pass
+                    return
                 if hint2 is not None:
-                    hint2.configure(text="录制中，预览已暂停")
+                    hint2.configure(text="")
+                player2 = live_state.get("big_player")
+                if player2 is not None:
+                    player2.play_feed(Path(path), width=width, height=height, vf_height=height,
+                                      volume=int(live_state.get("big_volume") or 0))
+                append_live_log(f"[预览] 放大窗口播放录制流（{rec.qn_label()}）")
                 return
             url = live_state.get("preview_url") or ""
-            height = int(live_state.get("big_height") or 480)
             if url:
                 if hint2 is not None:
                     hint2.configure(text="")
                 player2 = live_state.get("big_player")
                 if player2 is not None:
-                    width, height = big_geometry(height)
                     player2.play(url, width=width, height=height, vf_height=height,
                                  volume=int(live_state.get("big_volume") or 0),
                                  headers=header_blob(live_state.get("preview_headers") or {}))
@@ -6574,7 +7059,7 @@ def run_gui(start_live: bool = False) -> int:
             heights = allowed_preview_heights()
             for value, label in heights:
                 preview_menu.add_command(
-                    label=f"{label}（{value}p）",
+                    label=label,
                     command=lambda h=value: apply_big_layout(h))
             if not heights:
                 preview_menu.add_command(label="（没有可用档位）", state="disabled")
@@ -6634,8 +7119,8 @@ def run_gui(start_live: bool = False) -> int:
             big = tk.Toplevel(win)
             big.overrideredirect(True)
             big.configure(bg="#000000")
-            big.geometry(f"{width}x{height}+{(screen_w - width) // 2}+"
-                         f"{max(0, (screen_h - height) // 2 - px(20))}")
+            big.geometry(f"{width}x{height}+{(big_screen_w - width) // 2}+"
+                         f"{max(0, (big_screen_h - height) // 2)}")
             big.resizable(False, False)
             try:
                 big.attributes("-topmost", True)
@@ -6783,11 +7268,28 @@ def run_gui(start_live: bool = False) -> int:
                 if scheduler:
                     scheduler.set_tasks(tasks)
 
+        def pause_previews_for_hide(note: str) -> None:
+            """窗口收进托盘时把预览/声音一起停掉；录制线程不受影响。"""
+            try:
+                player.stop()
+            except Exception:
+                pass
+            try:
+                close_big_preview()
+            except Exception:
+                pass
+            live_state["feed_path"] = ""
+            if note:
+                append_live_log(f"[预览] {note}")
+
+        live_state["pause_previews"] = pause_previews_for_hide
+
         def close_live_window() -> None:
             if live_state.get("rec") and live_state["rec"].running:
                 if not messagebox.askyesno("正在录制", "录制还在进行，关掉窗口会隐藏到托盘继续录。\n"
                                                           "要停止录制请先点「停止」。继续？", parent=win):
                     return
+                pause_previews_for_hide("窗口收进托盘，预览和声音已暂停（录制继续）")
                 win.withdraw()
                 if tray:
                     tray.notify("直播录制中", "窗口已隐藏到托盘，录制继续。")
@@ -6795,6 +7297,7 @@ def run_gui(start_live: bool = False) -> int:
             live_state["win"] = None
             stop_preview()
             close_big_preview()
+            kill_all_players()
             win.destroy()
             if start_live_only:
                 quit_app()
@@ -6830,11 +7333,43 @@ def run_gui(start_live: bool = False) -> int:
         # 打开窗口时的初始状态：有保存过的房间就顺手读一次
         set_quality_choices()
         preview_watch()
+        try:
+            win.after(3000, feed_watch)
+        except Exception:
+            pass
         refresh_tasks()
         win.protocol("WM_DELETE_WINDOW", close_live_window)
-        win.bind("<Unmap>", lambda _e: (win.after(30, lambda: win.state() == "iconic"
-                                         and (win.withdraw(), tray and tray.notify(
-                                             "B 站下载器", "直播窗口已最小化到托盘。")))))
+        def on_live_unmap(_event=None) -> None:
+            def check() -> None:
+                try:
+                    if win.state() == "iconic":
+                        pause_previews_for_hide("窗口最小化，预览和声音已暂停")
+                        win.withdraw()
+                        if tray:
+                            tray.notify("B 站下载器", "直播窗口已最小化到托盘。")
+                except Exception:
+                    pass
+            try:
+                win.after(30, check)
+            except tk.TclError:
+                pass
+
+        def on_live_map(_event=None) -> None:
+            def resume() -> None:
+                try:
+                    room = live_state.get("room")
+                    if (win.state() == "normal" and room
+                            and int(room.get("live_status") or 0) == 1):
+                        start_preview()
+                except Exception:
+                    pass
+            try:
+                win.after(500, resume)
+            except tk.TclError:
+                pass
+
+        win.bind("<Unmap>", on_live_unmap)
+        win.bind("<Map>", on_live_map)
         live_tick()
         if room_var.get().strip():
             win.after(300, lambda: read_room())
@@ -8219,6 +8754,12 @@ def run_gui(start_live: bool = False) -> int:
         tray.notify("B 站视频下载器", "已最小化到托盘；右键托盘图标可以显示窗口或退出。")
 
     def quit_app() -> None:
+        pause = live_state.get("pause_previews")
+        if callable(pause):
+            try:
+                pause("退出程序，先停止预览和声音")
+            except Exception:
+                pass
         rec = live_state.get("rec")
         if rec and rec.running:
             if not messagebox.askyesno(
@@ -8235,6 +8776,7 @@ def run_gui(start_live: bool = False) -> int:
                     scheduler.stop()
                 if tray:
                     tray.stop()
+                kill_all_players()
                 root.destroy()
 
             def finish_then_exit() -> None:
@@ -8255,6 +8797,7 @@ def run_gui(start_live: bool = False) -> int:
             scheduler.stop()
         if tray:
             tray.stop()
+        kill_all_players()
         root.destroy()
 
     def maybe_minimize() -> None:
