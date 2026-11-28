@@ -2168,7 +2168,7 @@ LIVE_CONFIG_NAME = "live_record.json"
 LIVE_DEFAULT_QN = 10000                 # 原画（默认最高画质）
 LIVE_MAX_QN = 10000                     # 读取房间时固定按这一档问，才看得到真实的最高画质
 LIVE_STANDARD_QN = (10000, 400, 250, 150, 80)   # accept_qn 只给一档时的兜底选项
-LIVE_READ_CHUNK = 256 * 1024            # 单次写入的分块大小，和点播一致
+LIVE_READ_CHUNK = 64 * 1024            # 单次写入的分块大小，和点播一致
 LIVE_QN_DESC = {30000: "杜比", 20000: "4K", 15000: "2K", 10000: "原画",
                 400: "蓝光", 250: "超清", 150: "高清", 80: "流畅"}
 LIVE_SEGMENT_MINUTES = 10               # 默认 10 分钟一段
@@ -2354,6 +2354,60 @@ def probe_media_size_or_none(video: Path) -> tuple[int, int] | None:
 def probe_media_size(video: Path) -> tuple[int, int]:
     """给弹幕排版用的分辨率；测不到就按 1920×1080（ASS 会按 PlayRes 缩放）。"""
     return probe_media_size_or_none(video) or (1920, 1080)
+
+
+def probe_timespan_or_none(video: Path) -> float | None:
+    """取"这段文件实际有多长"（秒）。
+
+    B 站直播 FLV 的时间戳是开播以来的绝对值，`format=duration` 因此可能是 9000 多秒
+    （开始时间也是 9000 多），两相一减才是真实长度。MP4 的 start_time 通常是 0。
+    """
+    try:
+        ffmpeg = find_ffmpeg()
+        probe = Path(ffmpeg).with_name("ffprobe.exe" if IS_WIN else "ffprobe")
+        if probe.is_file():
+            proc = subprocess.run(
+                [str(probe), "-v", "error", "-show_entries", "format=duration:format=start_time",
+                 "-of", "default=nw=1", str(video)],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=120,
+                **child_proc_kwargs(),
+            )
+            values = {}
+            for line in (proc.stdout or "").strip().splitlines():
+                if "=" in line:
+                    key, _, value = line.partition("=")
+                    try:
+                        values[key.strip()] = float(value.strip())
+                    except ValueError:
+                        pass
+            if "duration" in values:
+                start = values.get("start_time", 0.0)
+                return max(0.0, values["duration"] - (start if start > 1 else 0.0))
+    except Exception:
+        pass
+    return None
+
+
+def probe_duration_or_none(video: Path) -> float | None:
+    """取时长（秒）；取不到返回 None。拼接完要拿它核对"是不是整段都进来了"。"""
+    try:
+        ffmpeg = find_ffmpeg()
+        probe = Path(ffmpeg).with_name("ffprobe.exe" if IS_WIN else "ffprobe")
+        if probe.is_file():
+            proc = subprocess.run(
+                [str(probe), "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", str(video)],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=120,
+                **child_proc_kwargs(),
+            )
+            text = (proc.stdout or "").strip()
+            if text:
+                return float(text)
+    except Exception:
+        pass
+    return None
 
 
 # ---- 直播配置（和 sessdata.txt 一样放在程序目录，便携、不写注册表）----
@@ -2807,13 +2861,75 @@ def _write_danmaku_xml(lines: Iterable[dict], dest: Path, cid: int) -> int:
     return count
 
 
+class _FlvStreamWriter:
+    """写 FLV 并跟踪标签边界——分段只在完整标签处收尾，文件尾巴不会是半截包。
+
+    为什么非这样不可：FLV 是"9 字节文件头 + PreviousTagSize(4) + Tag(11 字节头 + 数据 +
+    PreviousTagSize(4))"的流水，从中间任意字节切断，该段尾部就坏了。ffmpeg 的 concat
+    解复用读到这里会直接停下，**退出码仍然是 0**，于是"拼接成功"的产物只剩第一段。
+
+    状态机：head(9) → prev(4) → taghead(11) → body(数据长度) → tail(4) → taghead …
+    当状态停在 taghead 且一个字节都还没吃时，就是安全切点。
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.handle = open(path, "ab", buffering=0)
+        self.bytes = 0
+        self._state = "head"
+        self._need = 9
+        self._head = bytearray()
+
+    def write(self, data: bytes, stop_at_boundary: bool = False) -> bytes:
+        """写数据；要求停在边界时返回没写完的尾巴（调用方决定丢弃还是续写）。"""
+        pos = 0
+        total = len(data)
+        while pos < total:
+            if (stop_at_boundary and self._state == "taghead"
+                    and self._need == 11 and not self._head):
+                break
+            take = min(self._need, total - pos)
+            piece = data[pos:pos + take]
+            self.handle.write(piece)
+            self.bytes += take
+            pos += take
+            self._need -= take
+            if self._state == "taghead":
+                self._head += piece
+            if self._need:
+                continue
+            if self._state == "head":
+                self._state, self._need = "prev", 4
+            elif self._state == "prev":
+                self._state, self._need = "taghead", 11
+                self._head = bytearray()
+            elif self._state == "taghead":
+                body = int.from_bytes(self._head[1:4], "big")
+                self._head = bytearray()
+                self._state, self._need = "body", max(1, body)
+            elif self._state == "body":
+                self._state, self._need = "tail", 4
+            elif self._state == "tail":
+                self._state, self._need = "taghead", 11
+                self._head = bytearray()
+        return data[pos:]
+
+    def close(self) -> None:
+        try:
+            self.handle.close()
+        except OSError:
+            pass
+
+
 class LiveRecorder:
     """一次直播录制：录制线程 + 弹幕线程 + 结束时的拼接 / 弹幕导出。
 
-    内存模型：录制只持有一块读缓冲（256 KB）直接落盘；结束时用 ffmpeg concat -c copy 拼段，
+    内存模型：录制只持有一块读缓冲（64 KB）直接落盘；结束时用 ffmpeg 拼段，
     ffmpeg 自己也是流式读写的，所以录 10 小时和录 10 分钟占的内存一样。
-    画质中途切换 = 关掉当前段、用新 qn 重开一段：各段参数不同就直接拼会失败，
-    这时按画质分组分别封装成 MP4，绝不把几个小时的直播偷偷重编码一遍。
+    分段只在 FLV 标签边界收尾（_FlvStreamWriter），停止时也一样——切在包中间会让该段
+    尾巴坏掉，ffmpeg 读到这里安静截断、退出码还是 0，整场就只剩第一段。
+    拼接先走"逐段转 TS 再拼"（时间戳归零、容忍残包），再试直接 concat；拼完核对
+    实际时长，对不上就保留原始 .flv，绝不悄悄丢掉几小时。
     """
 
     def __init__(self, session: requests.Session, headers: dict, room: dict, *,
@@ -2970,13 +3086,13 @@ class LiveRecorder:
         except Exception:
             return False
 
-    def _open_segment(self) -> tuple[Path, object]:
+    def _open_segment(self) -> tuple[Path, _FlvStreamWriter]:
         with self._lock:
             index = len(self.segments) + 1
             path = self.base.with_name(f"{self.base.name}_{index:04d}.flv")
-            handle = open(path, "ab", buffering=0)
+            writer = _FlvStreamWriter(path)
             self.segments.append({"path": path, "qn": self._qn_now})
-        return path, handle
+        return path, writer
 
     def _stream(self, play: dict) -> None:
         last_error: Exception | None = None
@@ -2989,21 +3105,32 @@ class LiveRecorder:
                                         stream=True, timeout=(10, 35))
                 if resp.status_code != 200:
                     raise DownloadError(f"HTTP {resp.status_code}")
-                path, handle = self._open_segment()
+                path, writer = self._open_segment()
                 self.log(f"[直播] 录制中：{path.name}（{self.qn_label()} / {play['codec'].upper()}）")
                 started = time.monotonic()
+                cutting = False
+                overshoot = 0
                 try:
                     for chunk in resp.iter_content(LIVE_READ_CHUNK):
-                        if self._stop.is_set() or self._switch.is_set():
-                            break
                         if not chunk:
                             continue
-                        handle.write(chunk)
-                        self.total_bytes += len(chunk)
-                        if time.monotonic() - started >= self.segment_seconds:
+                        if not cutting:
+                            if (self._stop.is_set() or self._switch.is_set()
+                                    or time.monotonic() - started >= self.segment_seconds):
+                                # 停止和分段都等一个完整标签再收尾，避免最后半截包
+                                cutting = True
+                        leftover = writer.write(chunk, stop_at_boundary=cutting)
+                        self.total_bytes += len(chunk) - len(leftover)
+                        if leftover:
+                            # 已经停在完整标签处：这一段到此为止，尾巴跟着重连进下一段
                             break
+                        if cutting:
+                            # 兜底：标签解析异常时最多再多写 2 MB 就走，别卡住停止按钮
+                            overshoot += len(chunk)
+                            if overshoot > 2 * 1024 * 1024:
+                                break
                 finally:
-                    handle.close()
+                    writer.close()
                 if self._switch.is_set():
                     self._switch.clear()
                 return
@@ -3023,6 +3150,12 @@ class LiveRecorder:
 
     # ---- 结束处理 ----
 
+    def _expected_seconds(self) -> float:
+        total = 0.0
+        for item in self.segments:
+            total += probe_timespan_or_none(item["path"]) or 0.0
+        return total
+
     def _concat(self, segments: list[dict], out: Path, err_msg: str) -> None:
         list_file = self.base.with_name(f"{self.base.name}.concat.txt")
         lines = []
@@ -3041,42 +3174,69 @@ class LiveRecorder:
             except OSError:
                 pass
 
-    def _merge_segments(self, result: dict) -> list[Path]:
-        out = self.base.with_name(f"{self.base.name}.mp4")
+    def _remux_one(self, segments: list[dict], out: Path, err_msg: str) -> None:
+        """单段直接封进 MP4（不转 TS、不重编码）。"""
+        run_ffmpeg(["-fflags", "+discardcorrupt", "-err_detect", "ignore_err",
+                    "-i", str(segments[0]["path"]), "-c", "copy",
+                    "-movflags", "+faststart", str(out)], err_msg)
+        if not out.exists() or out.stat().st_size == 0:
+            raise DownloadError(f"{err_msg}：输出为空")
+
+    def _concat_via_ts(self, segments: list[dict], out: Path, err_msg: str) -> None:
+        """逐段转 TS 再按位拼：TS 的拼接是字节级的，容得下每段头部的 FLV 头和时间戳重来。"""
+        work = self.base.with_name(f"{self.base.name}.tswork")
+        work.mkdir(exist_ok=True)
         try:
-            self._concat(self.segments, out, "拼接直播分段失败")
-            if not self.keep_segments:
-                for item in self.segments:
-                    try:
-                        item["path"].unlink()
-                    except OSError:
-                        pass
-            return [out]
-        except Exception as exc:
-            self.log(f"[直播] 合成一条失败（{short_error(exc)}），改按画质分段保存，不重编码")
-        groups: list[list[dict]] = []
-        for item in self.segments:
-            if groups and groups[-1][-1]["qn"] == item["qn"]:
-                groups[-1].append(item)
-            else:
-                groups.append([item])
-        videos: list[Path] = []
-        for index, group in enumerate(groups, 1):
-            path = self.base.with_name(
-                f"{self.base.name}.part{index}_{self.qn_label(group[0]['qn'])}.mp4")
+            parts = []
+            for index, item in enumerate(segments, 1):
+                part = work / f"{index:04d}.ts"
+                # 断流 / 手动停止的残包不该让整场都拼不起来：容忍损坏包，只丢最后几帧
+                run_ffmpeg(["-fflags", "+discardcorrupt", "-err_detect", "ignore_err",
+                            "-i", str(item["path"]), "-c", "copy", "-f", "mpegts", str(part)],
+                           "分段转 TS 失败")
+                if part.exists() and part.stat().st_size > 0:
+                    parts.append(part)
+            if not parts:
+                raise DownloadError(f"{err_msg}：没有可用的分段")
+            list_file = work / "concat.txt"
+            list_file.write_text(
+                "\n".join(f"file '{part.as_posix()}'" for part in parts) + "\n", encoding="utf-8")
+            run_ffmpeg(["-f", "concat", "-safe", "0", "-i", str(list_file),
+                        "-c", "copy", "-movflags", "+faststart", str(out)], err_msg)
+            if not out.exists() or out.stat().st_size == 0:
+                raise DownloadError(f"{err_msg}：输出为空")
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def _merge_segments(self, result: dict) -> list[Path]:
+        """拼段必须核对时长：ffmpeg 碰到坏尾巴会安静截断并返回 0，只看"文件非空"会丢整场。"""
+        out = self.base.with_name(f"{self.base.name}.mp4")
+        expected = self._expected_seconds()
+        choices = []
+        if len(self.segments) == 1:
+            choices.append(("单段封装", self._remux_one))     # 只有一段时没必要转 TS
+        choices += [("TS 中转", self._concat_via_ts), ("直接拼接", self._concat)]
+        for label, merge in choices:
             try:
-                self._concat(group, path, "拼接直播分段失败")
-                videos.append(path)
+                out.unlink(missing_ok=True)
+                merge(self.segments, out, "拼接直播分段失败")
+                got = probe_timespan_or_none(out) or 0.0
+                if expected >= 5 and not (expected * 0.92 <= got <= expected * 1.1 + 15):
+                    raise DownloadError(f"只拼出 {got:.1f} 秒，应为 {expected:.1f} 秒")
+                if expected <= 0:
+                    self.log("[直播] 分段时间没测出来，拼接结果未经核对")
+                if got:
+                    self.log(f"[直播] 已合成 {len(self.segments)} 段，时长 {got / 60:.1f} 分钟")
+                if not self.keep_segments:
+                    for item in self.segments:
+                        item["path"].unlink(missing_ok=True)
+                return [out]
             except Exception as exc:
-                self.log(f"[直播] 第 {index} 段封装失败：{short_error(exc)}（原 .flv 分段已保留）")
-                result["error"] = "部分分段未能封装，已保留原始 .flv"
-        if videos and not self.keep_segments and not result["error"]:
-            for item in self.segments:
-                try:
-                    item["path"].unlink()
-                except OSError:
-                    pass
-        return videos
+                self.log(f"[直播] {label}没成（{short_error(exc)}）")
+        out.unlink(missing_ok=True)
+        self.log(f"[直播] 分段没能合成一条，{len(self.segments)} 个原始 .flv 分段全部保留")
+        result["error"] = "分段没能合成一条，已保留原始 .flv 分段"
+        return [item["path"] for item in self.segments]
 
 
 class LiveScheduler(threading.Thread):
