@@ -143,8 +143,10 @@ Three windows: main, live recording and help. Every window carries the app icon 
 ffmpeg, where credentials live, what happens when you minimise.
 
 **Minimising**: on Windows the window goes to the system tray (double-click the pink B tray icon or right-click
-"Show window" to bring it back; notifications use the same icon). macOS / Linux have no tray here, so the
-button falls back to a normal minimise and the window never disappears.
+"Show window" to bring it back; notifications use the same icon). The right-click menu is
+"Show window / Record live / Merge danmaku / Quit", and the middle two open only their own window without
+raising the main one. macOS / Linux have no tray here, so the button falls back to a normal minimise and the
+window never disappears.
 
 ## CLI
 

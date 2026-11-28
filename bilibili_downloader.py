@@ -123,6 +123,23 @@ MONO_FONT_FAMILY = "Consolas" if IS_WIN else ("Menlo" if IS_MAC else "DejaVu San
 GUI_FONT_FALLBACK = "Arial" if IS_WIN else ("Helvetica Neue" if IS_MAC else "DejaVu Sans")
 
 
+def child_proc_kwargs() -> dict:
+    """起子进程时统一加上"别开控制台"的参数。
+
+    打包后的程序是窗口程序（没有自己的控制台），每调一次 ffmpeg / ffprobe，
+    Windows 都会给子进程新建一个控制台窗口——预览刷新、探测分辨率、合并时就会
+    一闪一闪。CREATE_NO_WINDOW + STARTF_USESHOWWINDOW 让子进程完全没有窗口；
+    其他系统没有这个概念，直接返回空字典。
+    """
+    if not IS_WIN:
+        return {}
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    info = subprocess.STARTUPINFO()
+    info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    info.wShowWindow = 0                       # SW_HIDE
+    return {"creationflags": flags, "startupinfo": info}
+
+
 def user_config_dir() -> Path:
     """用户配置目录：Windows 用 %APPDATA%，macOS / Linux 用 ~/.config。
 
@@ -1737,7 +1754,8 @@ def install_ffmpeg(target: Path | None = None, source: str | None = None) -> str
     version = ""
     try:
         proc = subprocess.run([str(exe_path), "-version"], capture_output=True,
-                              text=True, encoding="utf-8", errors="replace", timeout=20)
+                              text=True, encoding="utf-8", errors="replace", timeout=20,
+                              **child_proc_kwargs())
         version = (proc.stdout or "").splitlines()[0].strip()
     except Exception:
         pass
@@ -1750,6 +1768,7 @@ def run_ffmpeg(args: list, err_msg: str, *, cwd: Path | None = None) -> None:
         cmd, stdin=subprocess.DEVNULL, capture_output=True,
         text=True, encoding="utf-8", errors="replace",
         cwd=str(cwd) if cwd else None,
+        **child_proc_kwargs(),
     )
     if proc.returncode != 0:
         raise DownloadError(f"{err_msg}：{(proc.stderr or '').strip()[:800]}")
@@ -2147,11 +2166,13 @@ LIVE_DANMU_API = "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmu
 LIVE_HOME = "https://live.bilibili.com/"
 LIVE_CONFIG_NAME = "live_record.json"
 LIVE_DEFAULT_QN = 10000                 # 原画（默认最高画质）
+LIVE_MAX_QN = 10000                     # 读取房间时固定按这一档问，才看得到真实的最高画质
+LIVE_STANDARD_QN = (10000, 400, 250, 150, 80)   # accept_qn 只给一档时的兜底选项
 LIVE_READ_CHUNK = 256 * 1024            # 单次写入的分块大小，和点播一致
 LIVE_QN_DESC = {30000: "杜比", 20000: "4K", 15000: "2K", 10000: "原画",
                 400: "蓝光", 250: "超清", 150: "高清", 80: "流畅"}
 LIVE_SEGMENT_MINUTES = 10               # 默认 10 分钟一段
-LIVE_POLL_SECONDS = 60                  # 预约任务轮询间隔
+LIVE_POLL_SECONDS = 20                  # 预约任务轮询间隔（开播后最迟 20 秒开始录）
 LIVE_WS_HOST_FALLBACK = "broadcastlv.chat.bilibili.com"
 
 
@@ -2249,16 +2270,25 @@ def live_play_info(session: requests.Session, headers: dict, room_id: int,
     best["qn_desc"] = desc
     if not best["accept_qn"]:
         best["accept_qn"] = [item[0] for item in desc]
+    best["want_qn"] = int(qn)               # 我们请求的那一档，用来判断服务端有没有降档
     return best
 
 
 def live_quality_choices(play: dict) -> list[tuple[int, str]]:
-    """可切换的画质清单（按返回的 accept_qn 和 g_qn_desc 配对，从高到低）。"""
-    desc = dict(play.get("qn_desc") or {})
-    choices = []
-    for qn in sorted(set(play.get("accept_qn") or []), reverse=True):
-        choices.append((qn, desc.get(qn) or LIVE_QN_DESC.get(qn) or str(qn)))
-    return choices
+    """可切换的画质清单（从高到低）。
+
+    accept_qn 只有一档时（游客最常见：只有原画）不能拿它当菜单，否则下拉框里
+    永远只有一项；这时退回标准五档。名字优先用 g_qn_desc 里的（原画 / 蓝光 / 超清 /
+    高清 / 流畅），服务端真给了 4K / 2K 就照实列出来。
+    """
+    desc = {int(item[0]): str(item[1]) for item in (play.get("qn_desc") or [])}
+    accepted = [int(q) for q in (play.get("accept_qn") or []) if q]
+    pool = set(accepted) if len(set(accepted)) > 1 else set(LIVE_STANDARD_QN)
+    granted = int(play.get("qn") or 0)
+    if granted:
+        pool.add(granted)
+    return [(qn, desc.get(qn) or LIVE_QN_DESC.get(qn) or str(qn))
+            for qn in sorted(pool, reverse=True) if qn > 0]
 
 
 def live_snapshot(session: requests.Session, headers: dict, room_id: int, qn: int,
@@ -2299,8 +2329,8 @@ def live_sample_clip(session: requests.Session, headers: dict, room_id: int, qn:
     raise DownloadError(short_error(last) if last else "录制试看片段失败")
 
 
-def probe_media_size(video: Path) -> tuple[int, int]:
-    """取视频分辨率给弹幕排版用；取不到就按 1920×1080（ASS 会按 PlayRes 缩放）。"""
+def probe_media_size_or_none(video: Path) -> tuple[int, int] | None:
+    """取视频分辨率；取不到返回 None（想区分"真的是 1920×1080"和"没测出来"时用）。"""
     try:
         ffmpeg = find_ffmpeg()
         probe = Path(ffmpeg).with_name("ffprobe.exe" if IS_WIN else "ffprobe")
@@ -2310,6 +2340,7 @@ def probe_media_size(video: Path) -> tuple[int, int]:
                  "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", str(video)],
                 stdin=subprocess.DEVNULL, capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=30,
+                **child_proc_kwargs(),
             )
             first = (proc.stdout or "").strip().splitlines()
             if first and "x" in first[0]:
@@ -2317,7 +2348,12 @@ def probe_media_size(video: Path) -> tuple[int, int]:
                 return int(width), int(height)
     except Exception:
         pass
-    return 1920, 1080
+    return None
+
+
+def probe_media_size(video: Path) -> tuple[int, int]:
+    """给弹幕排版用的分辨率；测不到就按 1920×1080（ASS 会按 PlayRes 缩放）。"""
+    return probe_media_size_or_none(video) or (1920, 1080)
 
 
 # ---- 直播配置（和 sessdata.txt 一样放在程序目录，便携、不写注册表）----
@@ -2811,6 +2847,7 @@ class LiveRecorder:
         self._stop = threading.Event()
         self._switch = threading.Event()
         self._thread: threading.Thread | None = None
+        self._qn_notice: set[int] = set()      # 同一次降档只提示一次，别每重连一次刷一行
         self._danmaku: _LiveDanmakuClient | None = None
         self._lock = threading.Lock()
 
@@ -2893,6 +2930,10 @@ class LiveRecorder:
                     self.log(f"[弹幕] 导出{mode}失败：{short_error(exc)}")
         if self.segments:
             result["videos"] = self._merge_segments(result)
+            size = probe_media_size_or_none(self.segments[0]["path"])
+            if size:
+                # 画质到底是不是原画，用录下来的文件自己说话
+                self.log(f"[直播] 实际画面 {size[0]}×{size[1]}")
         return result
 
     # ---- 录制 ----
@@ -2901,7 +2942,13 @@ class LiveRecorder:
         while not self._stop.is_set():
             try:
                 play = live_play_info(self.session, self.headers, self.room["ref_id"], self._want_qn)
-                self._qn_now = int(play["qn"])
+                got = int(play["qn"])
+                self._qn_now = got
+                if got != self._want_qn and got not in self._qn_notice:
+                    self._qn_notice.add(got)
+                    self.log(f"[直播] 请求 {self.qn_label(self._want_qn)}"
+                             f"（{self._want_qn}），服务端给到 {self.qn_label(got)}"
+                             f"（{got}），按后者录制")
                 self._stream(play)
                 self.failures = 0
             except Aborted:
@@ -3154,7 +3201,7 @@ def merge_subtitle(video: Path, subtitle: Path, mode: str, out: Path | None = No
 # ---- 系统托盘（仅 Windows；零依赖，用 ctypes 直接调 Shell_NotifyIcon）----
 
 class _TrayIcon:
-    """最小化到托盘：图标 + 右键菜单（显示主界面 / 录制直播 / 退出）。
+    """最小化到托盘：图标 + 右键菜单（显示主界面 / 录制直播 / 合并弹幕 / 退出）。
 
     Tk 没有托盘 API，pystray 又要多带 Pillow，安装包会胖一圈；这里用 ctypes 起一个隐藏窗口
     接 Shell_NotifyIcon 的消息，回调统一丢回 Tk 主线程的队列里处理。
@@ -3235,6 +3282,7 @@ class _TrayIcon:
         menu = user32.CreatePopupMenu()
         user32.AppendMenuW(menu, 0x0000, 1, "显示主界面")
         user32.AppendMenuW(menu, 0x0000, 2, "录制直播")
+        user32.AppendMenuW(menu, 0x0000, 4, "合并弹幕")
         user32.AppendMenuW(menu, 0x0800, 0, None)
         user32.AppendMenuW(menu, 0x0000, 3, "退出")
         user32.SetForegroundWindow(hwnd)
@@ -3248,6 +3296,8 @@ class _TrayIcon:
             self.post("show")
         elif command == 2:
             self.post("live")
+        elif command == 4:
+            self.post("merge")
         elif command == 3:
             self.post("quit")
 
@@ -4909,13 +4959,19 @@ def run_gui(start_live: bool = False) -> int:
         def current_qn() -> int:
             return int(quality["map"].get(qn_var.get(), LIVE_DEFAULT_QN))
 
-        def set_quality_choices(choices: list[tuple[int, str]]) -> None:
+        def set_quality_choices(choices: list[tuple[int, str]], granted: int = 0) -> None:
+            """填画质下拉框。默认选"服务端这次真给到的那一档"，也就是最高可用画质。"""
             quality["map"] = {f"{desc}（{qn}）": qn for qn, desc in choices}
             quality["choices"] = list(choices)
             values = list(quality["map"].keys())
             qn_combo.configure(values=values)
-            want = int(live_cfg.get("qn") or LIVE_DEFAULT_QN)
-            label = next((key for key, value in quality["map"].items() if value == want), None)
+            label = None
+            if granted:
+                label = next((key for key, value in quality["map"].items()
+                              if value == int(granted)), None)
+            if label is None:
+                want = int(live_cfg.get("qn") or LIVE_DEFAULT_QN)
+                label = next((key for key, value in quality["map"].items() if value == want), None)
             if label is None and values:
                 label = values[0]
             if label:
@@ -5085,7 +5141,13 @@ def run_gui(start_live: bool = False) -> int:
             read_btn.set_enabled(True)
             live_state["room"] = room
             if play:
-                set_quality_choices(live_quality_choices(play))
+                set_quality_choices(live_quality_choices(play), int(play.get("qn") or 0))
+                got, want = int(play.get("qn") or 0), int(play.get("want_qn") or 0)
+                if got and want and got < want:
+                    append_live_log(
+                        f"[直播] 请求 {want}（{LIVE_QN_DESC.get(want, want)}），"
+                        f"服务端只给到 {got}（{LIVE_QN_DESC.get(got, got)}）；"
+                        f"没登录 SESSDATA 或账号权限不够时会被降档")
             else:
                 set_quality_choices(sorted(((qn, LIVE_QN_DESC.get(qn, str(qn)))
                                             for qn in LIVE_QN_DESC), reverse=True))
@@ -5130,7 +5192,8 @@ def run_gui(start_live: bool = False) -> int:
                     play = None
                     if room["live_status"] == 1:
                         try:
-                            play = live_play_info(session, headers, room_id, current_qn())
+                            # 固定按最高档问一句：服务端给的 current_qn 才是这个账号能拿到的最高画质
+                            play = live_play_info(session, headers, room_id, LIVE_MAX_QN)
                         except Exception:
                             play = None
                     ui_jobs.put(lambda: apply_room(room, play))
@@ -5183,7 +5246,7 @@ def run_gui(start_live: bool = False) -> int:
                       segment_minutes=minutes, output=str(out_var_live.get()),
                       danmaku_light=light_var.get(), danmaku_full=full_var.get(),
                       keep_segments=keep_var.get())
-            win.after(1200, lambda: refresh_preview(auto=True))
+            # 录制期间不取预览（见 refresh_preview）：省带宽，也不闪控制台
 
         def after_stop(result: dict) -> None:
             live_state["rec"] = None
@@ -5200,6 +5263,11 @@ def run_gui(start_live: bool = False) -> int:
             body = "\n".join(lines) if lines else "没有产物（可能录得太短）"
             append_live_log("[直播] 录制结束\n" + body)
             messagebox.showinfo("录制结束", "已保存：\n" + body, parent=win)
+            try:
+                if win.winfo_exists():
+                    win.after(600, lambda: refresh_preview(auto=True))   # 停录后恢复定时预览
+            except tk.TclError:
+                pass
 
         def stop_record() -> None:
             rec = live_state.get("rec")
@@ -5236,6 +5304,13 @@ def run_gui(start_live: bool = False) -> int:
             room = live_state.get("room")
             if not room or int(room.get("live_status") or 0) != 1:
                 return
+            if auto:
+                rec = live_state.get("rec")
+                if rec and rec.running:
+                    # 录制中不做定时预览：每 12 秒起 1~3 个 ffmpeg 只为抓一帧，
+                    # 既抢带宽又会在窗口模式下闪控制台；停录后自动恢复
+                    live_state["preview_auto"] = False
+                    return
             if live_state["preview_busy"]:
                 return
             live_state["preview_busy"] = True
@@ -5412,8 +5487,11 @@ def run_gui(start_live: bool = False) -> int:
         apply_window_icon(dlg)
         dlg.configure(bg=GUI_BG)
         dlg.geometry(f"{px(760)}x{px(430)}+{px(80)}+{px(80)}")
-        dlg.transient(root)
+        if root.winfo_viewable():
+            # transient 窗口会跟着主窗口一起隐藏：主界面在托盘里时设了它，对话框就永远不出现
+            dlg.transient(root)
         dlg.resizable(False, False)
+        dlg.deiconify()
 
         tk.Label(dlg, text="把弹幕 / 字幕合进视频（产物另存，绝不覆盖原视频）",
                  font=bold_font, bg=GUI_BG, fg=GUI_TEXT).pack(anchor="w", padx=px(18),
@@ -5531,7 +5609,8 @@ def run_gui(start_live: bool = False) -> int:
             recorder = LiveRecorder(
                 session, headers, info,
                 out_dir=Path(str(live_cfg.get("output") or default_output())),
-                qn=int(live_cfg.get("qn") or LIVE_DEFAULT_QN),
+                # 预约自动录不要沿用上次手选的档位（可能是 150=720P），一律按最高可用画质问
+                qn=LIVE_MAX_QN,
                 segment_minutes=int(live_cfg.get("segment_minutes") or LIVE_SEGMENT_MINUTES),
                 danmaku_light=bool(live_cfg.get("danmaku_light", True)),
                 danmaku_full=bool(live_cfg.get("danmaku_full", True)),
@@ -6244,8 +6323,11 @@ def run_gui(start_live: bool = False) -> int:
                     root.state("normal")
                     root.lift()
                 elif action == "live":
-                    root.deiconify()
+                    # 只开直播窗口：主界面留在托盘里，不再跟着弹出来
                     open_live_window()
+                elif action == "merge":
+                    # 同理，只开合并弹幕窗口
+                    open_merge_dialog()
                 elif action == "quit":
                     quit_app()
         except queue.Empty:
@@ -6279,15 +6361,27 @@ def run_gui(start_live: bool = False) -> int:
     tray.start()
 
     # 预约任务：无论有没有任务都起一个线程，之后添加任务直接生效
+    def auto_record_from_scheduler(info: dict) -> None:
+        """预约任务开播时自动开录。直播窗口还没建过就先建（收在托盘里时不弹出来）。"""
+        if live_state.get("auto_start") is None:
+            open_live_window()
+            window = live_state.get("win")
+            if window is not None and not root.winfo_viewable():
+                window.withdraw()
+        callback = live_state.get("auto_start")
+        if callback:
+            callback(info)
+
     scheduler: LiveScheduler | None = None
     try:
         session_now, headers_now = live_http()
         scheduler = LiveScheduler(
             session_now, headers_now, list(live_cfg.get("tasks") or []),
             on_live=lambda info, task: ui_jobs.put(
-                lambda: live_state.get("auto_start") and live_state["auto_start"](info)),
+                lambda value=info: auto_record_from_scheduler(value)),
             log=lambda text: ui_jobs.put(lambda value=text: append_log(value + "\n")),
-            interval=int(live_cfg.get("poll_seconds") or LIVE_POLL_SECONDS),
+            interval=min(int(live_cfg.get("poll_seconds") or LIVE_POLL_SECONDS),
+                         LIVE_POLL_SECONDS),
         )
         scheduler.start()
     except Exception:
